@@ -39,18 +39,22 @@ and fully logged.
 ### 2.2. Python environment
 
 ```bash
-python3.11 -m venv venv
+# 1) create and activate a virtual-environment (any Python ≥3.10)
+python3 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install astrobatch     # from source for now
+
+# 2) install runtime dependencies directly from the source tree
+pip install -r requirements.txt
+
+# 3) (optional, for development) install the package in *editable* mode so the
+#    `astrobatch` command is available and live-reloads your changes
+pip install -e .
 ```
 
-**pySiril** is not on PyPI – install the wheel provided by the Siril
-team:
-
-```bash
-pip install https://gitlab.com/-/project/20510105/uploads/8224707c29669f255ad43da3b93bc5ec/pysiril-0.0.15-py3-none-any.whl
-```
+> A future `pip install astrobatch` will be available once the project is
+> published on PyPI. For now you must work from the cloned repository as shown
+> above.
 
 ### 2.3. Astrometry index catalogues
 Download the 4200–4210 series (2–8° FOV) into the directory listed in
