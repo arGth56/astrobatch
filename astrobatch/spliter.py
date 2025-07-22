@@ -56,9 +56,11 @@ directory   = DATA_ROOT
 siril_script_path = SIRIL_SCRIPT_NAME
 
 # API Configuration
+# Token is only needed for the *upload* step; the rest of the pipeline (split,
+# calibrate, plate-solve, analyse, mosaic) can run without it.  Upload helper
+# functions will raise a clear error if the variable is missing when required.
 API_TOKEN = os.getenv("STDWEB_API_TOKEN")
-if not API_TOKEN:
-    raise RuntimeError("Environment variable STDWEB_API_TOKEN not set – please export your photometry server token or add it to a .env file excluded from git")
+
 # Base URL of the photometry server – can be overridden via the SPLITER_API_BASE_URL
 # environment variable if needed.
 API_BASE_URL = os.getenv("SPLITER_API_BASE_URL", "http://86.253.141.183:7000")
@@ -369,6 +371,8 @@ def get_target_name(hdr):
     return name
 
 def upload_for_inspection(file_path, object_name, date_str):
+    if not API_TOKEN:
+        raise RuntimeError("STDWEB_API_TOKEN environment variable not set – required for --upload step")
     """
     Step 1: Upload a FITS file without processing
     Returns task_id if successful, None if failed
