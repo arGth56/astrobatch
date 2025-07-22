@@ -84,10 +84,24 @@ def _main(argv: list[str] | None = None) -> None:
                 _sys.argv = _old
 
     if args.calibrate:
-        if args.dry_run:
-            print("• calibrate via Siril")
+        # ------------------------------------------------------------------
+        # Early check: ensure either pySiril is installed or a usable siril-cli
+        # binary is available.  This prevents cryptic errors on systems that
+        # ship an old Siril version.
+        # ------------------------------------------------------------------
+        import shutil, importlib.util
+
+        has_pysiril = importlib.util.find_spec("pysiril") is not None
+        has_siril_cli = shutil.which("siril-cli") is not None or shutil.which("siril") is not None
+
+        if not has_pysiril and not has_siril_cli:
+            print("⚠️  Neither pySiril nor siril-cli found – skipping calibration.\n"
+                  "    Install Siril ≥1.2 and pySiril, or run without --calibrate.")
         else:
-            spliter.calibrate_folders_pysiril({})  # fallback to internal logic
+            if args.dry_run:
+                print("• calibrate via Siril")
+            else:
+                spliter.calibrate_folders_pysiril({})  # fallback to internal logic
 
     if args.plate_solve:
         if args.dry_run:
