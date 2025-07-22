@@ -72,12 +72,30 @@ astrobatch --split --root /data/2025-07-16/LIGHT
 # Calibrate via Siril (server mode)
 astrobatch --calibrate --root /data/2025-07-16/LIGHT
 
-# Upload to STDWeb using token in $STDWEB_TOKEN
+# Upload to STDWeb using token in $STDWEB_API_TOKEN
 astrobatch --upload --root /data/2025-07-16/LIGHT
 
 # Analyse results (transient search, sky maps)
 astrobatch --analyse --root /data/2025-07-16/LIGHT
 ```
+
+---
+
+## 3.1. Authentication / secrets
+
+STDWeb requires an **API token** for uploads and automation.  Create one in your
+STDWeb user profile (‣ *Settings → API Tokens → New*).  The pipeline expects it
+in the environment variable `STDWEB_API_TOKEN`:
+
+```bash
+export STDWEB_API_TOKEN="<paste-your-token-here>"
+```
+
+For convenience you can store it in a `.env` file or in your shell’s start-up
+script (`~/.zprofile`, `~/.bashrc`, …).  **.env files are already excluded from
+Git via `.gitignore`, so the secret will never be committed.**
+
+If the variable is missing `astrobatch` aborts with a clear error message.
 
 ---
 

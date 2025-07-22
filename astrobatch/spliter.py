@@ -56,7 +56,9 @@ directory   = DATA_ROOT
 siril_script_path = SIRIL_SCRIPT_NAME
 
 # API Configuration
-API_TOKEN = "1e296ddd6738af45467b7bc6558c00a9524447ab"
+API_TOKEN = os.getenv("STDWEB_API_TOKEN")
+if not API_TOKEN:
+    raise RuntimeError("Environment variable STDWEB_API_TOKEN not set – please export your photometry server token or add it to a .env file excluded from git")
 # Base URL of the photometry server – can be overridden via the SPLITER_API_BASE_URL
 # environment variable if needed.
 API_BASE_URL = os.getenv("SPLITER_API_BASE_URL", "http://86.253.141.183:7000")
