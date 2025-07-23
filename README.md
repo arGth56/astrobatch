@@ -90,6 +90,18 @@ The **calibration** stage needs Siril. There are two supported ways:
    If neither pySiril nor a recent Siril CLI is detected the pipeline prints a
    warning and skips the calibration step when you pass `--calibrate`.
 
+#### 2.3.1 Platform notes
+
+| Platform | Recommended install | Notes |
+|----------|---------------------|-------|
+| **macOS** | `brew install --cask siril`<br/>then install pySiril wheel | Home-brew ships the up-to-date GUI build. The first pySiril call will bounce Siril in the Dock for a second, then run head-less. |
+| **Windows** | Download the MSI from the [official site](https://siril.org/download/) and run the installer.<br/>Then:<br/>`pip install pysiril-0.0.15-py3-none-any.whl` | pySiril looks for `C:\Program Files\Siril\bin\siril.exe` automatically. No extra display configuration needed. |
+| **Linux (Debian/Ubuntu)** | **Option A (recommended)** – AppImage:<br/>`wget https://free-astro.org/download/siril-1.2.1-linux64.appimage -O /usr/local/bin/siril`<br/>`chmod +x /usr/local/bin/siril`<br/>Install pySiril wheel.<br/><br/>**Option B** – PPA / distro package:<br/>`sudo add-apt-repository ppa:lock042/siril && sudo apt update && sudo apt install siril siril-cli` | On head-less servers you either need:<br/>• `siril-cli` (no X needed), **or**<br/>• Xvfb: `sudo apt install xvfb` and run `xvfb-run python -m astrobatch.cli --calibrate …` |
+
+> Tip: To make Xvfb permanent add `export DISPLAY=:99` in your shell profile and
+> start `Xvfb :99 -screen 0 1024x768x24 -nolisten tcp -ac &` on boot (systemd
+> service or rc.local).
+
 ### 2.4. Astrometry index catalogues
 
 ---
