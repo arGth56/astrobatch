@@ -78,22 +78,38 @@ calibrated_folders: set[str] = set()
 # Paths are derived relative to this file so the script is portable.
 # CALIB_DIR defined in PATH CONFIGURATION above (duplicate removed)
 
-# Dark masters organised by exposure time (seconds)
-_darks_root = CALIB_DIR / "darks" 
-darks = {
-    "10" : str(_darks_root / "dark_10s.fit"),
-    "60" : str(_darks_root / "dark_60s.fit"),
-    "120": str(_darks_root / "dark_120s.fit"),
-}
+# ------------------------------------------------------------------
+#  Automatic calibration-frame discovery
+# ------------------------------------------------------------------
+_darks_root  = CALIB_DIR / "darks"
+_flats_root  = CALIB_DIR / "flats"
 
-# Flat masters are single FITS files in calib/flats/
-_flats_root = CALIB_DIR / "flats"
-flats = {
-    "G":       str(_flats_root / "flat_G.fit"),
-    "RP":      str(_flats_root / "flat_Grp.fit"),
-    "BP":      str(_flats_root / "flat_Gbp.fit"),
-    "grating": str(_flats_root / "flat_grating.fit"),  # may be absent
-}
+import re
+
+def _discover_cal_frames():
+    """Scan calib/darks and calib/flats and build mapping dicts."""
+    _d = {}
+    for p in _darks_root.glob("dark_*s.fit"):
+        m = re.match(r"dark_(\d+)s\.fit", p.name, re.IGNORECASE)
+        if m:
+            _d[m.group(1)] = str(p)
+
+    _f = {}
+    for p in _flats_root.glob("flat_*.fit"):
+        m = re.match(r"flat_([A-Za-z0-9]+)\.fit", p.name, re.IGNORECASE)
+        if m:
+            _f[m.group(1).upper()] = str(p)
+
+    return _d, _f
+
+# Populate dictionaries at import time
+darks, flats = _discover_cal_frames()
+
+# Provide informative message if none found
+if not darks:
+    print(f"⚠️  No dark masters found in {_darks_root}. Calibration will skip exposure folders.")
+if not flats:
+    print(f"⚠️  No flat masters found in {_flats_root}. Calibration will skip filter folders.")
 
 # Mosaic configuration
 MOSAIC_CONFIG = {

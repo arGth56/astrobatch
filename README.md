@@ -261,18 +261,17 @@ The mapping is defined in `astrobatch/spliter.py`:
 
 A folder is calibrated **only** if _both_ a matching dark **and** flat exist. Missing frames print a warning and the folder is skipped (the rest of the night still runs).
 
+> Frames are discovered automatically: every file named `dark_<n>s.fit` (in `calib/darks/`) or `flat_<FILTER>.fit` (in `calib/flats/`) is picked up at launch – no code edits needed. The mapping tables are built on-the-fly.
+
 #### Adding a new filter or exposure
 
-1. Drop the master(s) into the same directories, e.g.
-   ```bash
-   calib/flats/flat_R.fit       # new filter R
-   calib/darks/dark_30s.fit     # new 30-second exposure
-   ```
-2. Edit `spliter.py`:
-   ```python
-   darks["30"] = str(_darks_root / "dark_30s.fit")
-   flats["R"]  = str(_flats_root / "flat_R.fit")
-   ```
-3. Re-run the pipeline – folders with filter **R** or 30 s exposures are now processed.
+Simply drop the master file with the correct name:
+
+```bash
+calib/darks/dark_30s.fit     # new exposure time
+calib/flats/flat_R.fit       # new filter
+```
+
+Re-run the pipeline; the new frames are detected automatically.
 
 No other code modifications are required. 
