@@ -3550,7 +3550,7 @@ def calibrate_folders_pysiril(folders: dict):
 
         try:
             print(f"🚀 Launching Siril CLI: {cli_bin} -s {script_path} -q …")
-            subprocess.run([cli_bin, "-s", script_path, "-q"], check=True)
+            subprocess.run([cli_bin, "-s", script_path], check=True)
             print("✅ Siril CLI calibration done")
         except subprocess.CalledProcessError as cli_err:
             raise RuntimeError(f"Siril CLI failed: {cli_err}") from cli_err
