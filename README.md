@@ -27,6 +27,16 @@ and fully logged.
 
 ## 2. Installation
 
+Choose your platform:
+
+| OS | Quick path |
+|----|------------|
+| **macOS** | `brew install --cask siril` then follow Python steps below (section “Siril & pySiril” has details). |
+| **Windows** | Install Siril MSI, then continue with Python/pySiril (see platform notes). |
+| **Debian / Ubuntu** | `chmod u+x scripts/install_debian.sh && ./scripts/install_debian.sh` – sets up everything automatically. |
+
+If you prefer manual setup continue with the generic instructions below, then consult section 2.3.1 for per-OS specifics.
+
 ### 2.1. System prerequisites
 
 | Component | macOS (Homebrew) | Ubuntu / Debian |
