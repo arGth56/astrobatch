@@ -41,7 +41,15 @@ def _main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Show steps without executing")
     parser.add_argument("--start-server", action="store_true", help="Launch Flask candidate review server")
     parser.add_argument("--port", type=int, default=None, help="Port for --start-server (default 5100 or $PORT)")
+    parser.add_argument("--cli-only", action="store_true", help="Force Siril CLI mode; skip pySiril and second script run")
     args = parser.parse_args(argv)
+
+    # ------------------------------------------------------------------
+    # Expose the choice globally so spliter.py can adapt without tight
+    # coupling. Any non-zero value enables CLI-only mode.
+    # ------------------------------------------------------------------
+    if args.cli_only:
+        os.environ["ASTROBATCH_CLI_ONLY"] = "1"
 
     # Ensure at least one action selected
     if not any((args.split, args.calibrate, args.upload, args.analyse, args.plate_solve, args.start_server, args.mosaic)):

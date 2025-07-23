@@ -1290,6 +1290,12 @@ def main():
 
     def _run_siril_with_pysiril(script_path: str):
         """Prefer running Siril through the pySiril wrapper (server mode)."""
+        # User requested CLI-only mode – do not attempt pySiril nor a second
+        # CLI execution (the folder-level calibration already ran).
+        if os.getenv("ASTROBATCH_CLI_ONLY") == "1":
+            print("ℹ️  CLI-only mode – skipping pySiril/script pass")
+            return False
+
         try:
             import pysiril.siril as sr
         except ImportError:
@@ -3542,6 +3548,10 @@ def calibrate_folders_pysiril(folders: dict):
         print(f"⚠️  pySiril failed ({e}) – switching to CLI fallback")
         # Run entire Siril script via CLI (head-less)
         script_path = os.path.join(DATA_ROOT, SIRIL_SCRIPT_NAME)
+        from pathlib import Path as _P
+        if not _P(script_path).exists():
+            print(f"ℹ️  Siril script {script_path} not yet generated – deferring CLI calibration step.")
+            return
 
         import shutil, subprocess
         cli_bin = shutil.which("siril-cli") or shutil.which("siril")
@@ -3573,6 +3583,17 @@ def calibrate_folders_pysiril(folders: dict):
                 continue
 
             print(f"📂 Calibrating {folder}  ({nimg} image{'s' if nimg>1 else ''})")
+            # Clean up leftovers from previous runs to avoid mixed-dimension
+            # sequences that crash Siril (e.g. 3008×3008 raw + 1504×1504
+            # binned). Raw files never start with "i_", so removing the
+            # patterns below is safe.
+            from pathlib import Path as _P
+            for _pat in ("i_*.fit", "pp_i_*.fit", "r_pp_i*.fit", "*.seq", "res.fit"):
+                for _fp in _P(folder).glob(_pat):
+                    try:
+                        _fp.unlink()
+                    except Exception:
+                        pass
             sr.run(f"cd {folder}")
             if nimg == 1:
                 # Single image – work on the raw FITS directly (skip sequence conversion)
@@ -3604,7 +3625,7 @@ def calibrate_folders_pysiril(folders: dict):
             sr.run("cd ..")  # return to parent just in case
 
             # ------------------------------------------------------------------
-            # Mark this folder as successfully calibrated so that we don't do it
+            # Mark this folder as calibrated so that we don't do it
             # again later in the workflow.
             # ------------------------------------------------------------------
             calibrated_folders.add(folder)
