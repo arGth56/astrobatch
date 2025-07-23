@@ -3508,38 +3508,42 @@ def calibrate_folders_pysiril(folders: dict):
     # Detect pySiril API version (wrapper vs legacy)
     API = None
     try:
-        import pysiril.wrapper as sr
-        API = 'wrapper'
-        if hasattr(sr, 'start'):
-            sr.start()
-        else:
-            # Extremely old wrapper that only exposes the Wrapper class – create our own helper
-            import pysiril.siril as _ps
-            _pipe = _ps.Siril()
-            if not _pipe.Open():
-                raise RuntimeError("Failed to open Siril via wrapper fallback")
-
-            _wrapper = sr.Wrapper(_pipe)
-
-            # Dynamically create minimal interface expected later (run & stop)
-            class _DynSR:
-                def __init__(self, wrapper, pipe):
-                    self._w = wrapper
-                    self._p = pipe
-                def run(self, cmd):
-                    self._p.Execute(cmd)
-                def stop(self):
-                    self._p.Close()
-
-            sr = _DynSR(_wrapper, _pipe)
-    except ImportError:
         try:
-            import pysiril.siril as sr
-            API = 'legacy'
-            sr.init()
+            import pysiril.wrapper as sr  # type: ignore
+            API = "wrapper"
+            if hasattr(sr, "start"):
+                sr.start()
+            else:
+                # Very old wrapper exposing only Wrapper class
+                import pysiril.siril as _ps  # type: ignore
+                _pipe = _ps.Siril()
+                if not _pipe.Open():
+                    raise RuntimeError("cannot open Siril pipe")
+
+                _wrapper = sr.Wrapper(_pipe)  # type: ignore
+
+                class _DynSR:
+                    def __init__(self, wrapper, pipe):
+                        self._w = wrapper
+                        self._p = pipe
+
+                    def run(self, cmd):
+                        self._p.Execute(cmd)
+
+                    def stop(self):
+                        self._p.Close()
+
+                sr = _DynSR(_wrapper, _pipe)  # type: ignore
         except ImportError:
-            print("⚠️  pySiril not installed – per-folder calibration skipped")
-            return
+            import pysiril.siril as sr  # type: ignore
+            API = "legacy"
+            sr.init()
+    except Exception as e:
+        print(f"⚠️  pySiril failed ({e}) – switching to CLI fallback")
+        # Run entire Siril script via CLI (head-less)
+        script_path = os.path.join(DATA_ROOT, SIRIL_SCRIPT_NAME)
+        _run_siril_script_cli(script_path)
+        return
 
     # Locate Siril.app on macOS if not configured
     os.environ.setdefault("SIRIL_APP", "/Applications/Siril.app")
