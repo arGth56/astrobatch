@@ -141,10 +141,15 @@ You can still follow the manual steps below if you prefer full control.
 # Split raw images (night automatically detected from path)
 astrobatch --split --root /data/2025-07-16/LIGHT
 
-# Calibrate via Siril (server mode)
+# Calibrate via Siril (GUI/pySiril)
 astrobatch --calibrate --root /data/2025-07-16/LIGHT
 
-# Upload to STDWeb using token in $STDWEB_API_TOKEN
+# Calibrate via **CLI-only** mode (head-less servers)
+astrobatch --calibrate --cli-only --root /data/2025-07-16/LIGHT
+
+# Upload to STDWeb (requires API token)
+#
+#   export STDWEB_API_TOKEN="<your-token>"
 astrobatch --upload --root /data/2025-07-16/LIGHT
 
 # Analyse results (transient search, sky maps)
