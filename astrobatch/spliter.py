@@ -1757,8 +1757,12 @@ class PlateSolver:
     """Real plate solving using astrometry.net solve-field"""
     
     def __init__(self):
-        # Hard-wired path to solve-field (reported by `which solve-field`)
-        self.solve_field_cmd = '/opt/homebrew/opt/astrometry-net/bin/solve-field'
+        # Auto-detect solve-field path instead of hardcoding macOS location
+        import shutil
+        self.solve_field_cmd = shutil.which('solve-field')
+        if not self.solve_field_cmd:
+            raise RuntimeError("solve-field not found in PATH. Install astrometry.net package.")
+        
         # Ensure its directory is on PATH for any sub-calls that rely on other
         # astrometry.net helper binaries located in the same folder.
         import os
