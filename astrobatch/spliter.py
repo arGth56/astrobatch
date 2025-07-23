@@ -157,7 +157,7 @@ COLIBRI_ENDPOINT = "https://astro-colibri.science/api/v1/events"  # base REST en
 # user did not move the file.
 # ---------------------------------------------------------------------------
 
-_PKG_CATALOG_DIR = Path(__file__).resolve().parent / "astrobatch" / "catalog"
+_PKG_CATALOG_DIR = Path(__file__).resolve().parent / "catalog"
 _PKG_CATALOG_DIR.mkdir(parents=True, exist_ok=True)
 NGC_CSV_LOCAL = _PKG_CATALOG_DIR / "NGC.csv"
 
