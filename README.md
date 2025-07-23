@@ -206,3 +206,73 @@ type hints and numpy-style docstrings.
 
 ## 7. License
 MIT License © 2025 – contribute back improvements! 
+
+## 3. How it works  
+
+1. **`--root` night directory**  
+   Pass the LIGHT directory of a night. All FITS files _inside that tree_ are processed; nothing outside is touched.
+
+2. **Splitting (`--split`)**  
+   Each raw FITS is read for its `TARGET`, `FILTER`, and `EXPOSURE` header keywords. Files are organised as:
+
+   ```text
+   $ROOT/
+   └── <TARGET>/
+       └── <FILTER>/
+           └── <EXPOSURE>/   # seconds
+               └── raw FITS …
+   ```
+
+3. **Calibration (`--calibrate`) — Siril CLI**  
+   For every exposure folder the pipeline:
+   - Converts raw → sequence (`convert i`)
+   - Applies `dark` + `flat` masters that match the folder’s exposure / filter
+   - Stacks (or calibrates–single) and 2×2 bins the result → `res.fit`
+   - Stores the Siril commands in `auto_cli.ssf` for transparency.
+
+4. **Output**  
+   Each calibrated folder contains:
+   - `raw.fit` (unchanged original)  
+   - `pp_i_00001.fit` (pre-processed)  
+   - `res.fit` (final image, 2×2 binned)  
+   - `auto_cli.ssf` (script that produced the result)
+
+### 3.1 Calibration-frame layout  
+
+```
+calib/
+├── darks/
+│   ├── dark_10s.fit
+│   ├── dark_60s.fit
+│   └── dark_120s.fit
+└── flats/
+    ├── flat_G.fit
+    ├── flat_R.fit
+    ├── flat_B.fit
+    └── flat_grating.fit
+```
+
+The mapping is defined in `astrobatch/spliter.py`:
+
+```python
+# darks[exposure_seconds] → filepath
+# flats[filter_name]      → filepath
+```
+
+A folder is calibrated **only** if _both_ a matching dark **and** flat exist. Missing frames print a warning and the folder is skipped (the rest of the night still runs).
+
+#### Adding a new filter or exposure
+
+1. Drop the master(s) into the same directories, e.g.
+   ```bash
+   calib/flats/flat_R.fit       # new filter R
+   calib/darks/dark_30s.fit     # new 30-second exposure
+   ```
+2. Edit `spliter.py`:
+   ```python
+   darks["30"] = str(_darks_root / "dark_30s.fit")
+   flats["R"]  = str(_flats_root / "flat_R.fit")
+   ```
+3. Re-run the pipeline – folders with filter **R** or 30 s exposures are now processed.
+
+No other code modifications are required. 
