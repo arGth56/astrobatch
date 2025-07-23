@@ -561,7 +561,7 @@ def trigger_template_subtraction(task_id):
     # Request subtraction using ZTF DR7 reference templates
     payload = json.dumps({
         "action": "subtraction",
-        "template_source": "ZTF_DR7"
+        "template_catalog": "ZTF_DR7"
     })
     curl_command = [
         "curl", "-s", "-X", "POST", action_url,
