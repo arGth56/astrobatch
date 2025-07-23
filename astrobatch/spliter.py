@@ -3513,6 +3513,67 @@ def calibrate_folders_pysiril(folders: dict):
     # Make the global set available so we can mark folders as processed
     global calibrated_folders
 
+    # ------------------------------------------------------------------
+    # CLI-ONLY FAST PATH: Skip all pySiril and run per-folder auto_cli.ssf
+    # ------------------------------------------------------------------
+    if os.getenv("ASTROBATCH_CLI_ONLY") == "1":
+        import subprocess, shutil
+        from pathlib import Path as _P
+
+        cli_bin = shutil.which("siril-cli") or shutil.which("siril")
+        if not cli_bin:
+            raise RuntimeError("CLI-only mode requested but neither 'siril-cli' nor 'siril' found in PATH")
+
+        print(f"🚀 CLI-only calibration using {cli_bin} …")
+
+        for folder, info in tqdm(folders.items(), desc="Calibrating", unit="folder"):
+            folder = str(folder)
+            _filter   = info["filter"]
+            _exposure = info["exposure"]
+            nimg      = info["num_images"]
+
+            if _filter not in flats or _exposure not in darks:
+                print(f"⚠️  Skipping {folder}: missing cal frames (filter={_filter}, exp={_exposure}s)")
+                continue
+
+            # --- Cleanup leftovers ------------------------------------------------
+            for pat in ("i_*.fit", "pp_i_*.fit", "r_pp_i*.fit", "*.seq", "res.fit"):
+                for fp in _P(folder).glob(pat):
+                    fp.unlink(missing_ok=True)
+
+            # --- Build minimal .ssf inside the folder for transparency -----------
+            script_path = _P(folder) / "auto_cli.ssf"
+            flat_arg = f" -flat={flats[_filter]}" if _filter in flats else ""
+            dark_arg = f" -dark={darks[_exposure]}" if _exposure in darks else ""
+
+            with open(script_path, "w", encoding="utf-8") as sf:
+                sf.write("requires 1.2.0\n")
+                sf.write(f"cd {folder}\n")
+                sf.write("convert i\n")
+                if nimg == 1:
+                    sf.write(f"calibrate_single i_00001.fit{flat_arg}{dark_arg}\n")
+                    sf.write("load pp_i_00001\n")
+                else:
+                    sf.write(f"calibrate i{flat_arg}{dark_arg}\n")
+                    sf.write("register pp_i -2pass -interp=cu\n")
+                    sf.write("seqapplyreg pp_i -framing=min\n")
+                    sf.write("stack r_pp_i rej w 3 3 -nonorm -filter-fwhm=80% -filter-round=80%\n")
+                    sf.write("load r_pp_i_stacked\n")
+                sf.write("binxy 2\n")
+                sf.write("save res\n")
+
+            # --- Execute -----------------------------------------------------------
+            print(f"📂 Calibrating {folder} via siril-cli …")
+            try:
+                subprocess.run([cli_bin, "-s", str(script_path)], check=True)
+                calibrated_folders.add(folder)
+                print(f"✅ {folder} calibrated successfully")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Siril CLI failed in {folder} (exit {e.returncode})")
+
+        print(f"✅ CLI-only calibration complete ({len(calibrated_folders)} folders processed)")
+        return  # Skip all pySiril paths
+
     # Detect pySiril API version (wrapper vs legacy)
     API = None
     try:
@@ -3548,6 +3609,12 @@ def calibrate_folders_pysiril(folders: dict):
             sr.init()
     except Exception as e:
         print(f"⚠️  pySiril failed ({e}) – switching to CLI fallback")
+        
+        # Skip CLI fallback in CLI-only mode
+        if os.getenv("ASTROBATCH_CLI_ONLY") == "1":
+            print("ℹ️  CLI-only mode: skipping global script fallback")
+            return
+        
         # Run entire Siril script via CLI (head-less)
         script_path = os.path.join(DATA_ROOT, SIRIL_SCRIPT_NAME)
         from pathlib import Path as _P
