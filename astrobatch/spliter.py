@@ -3542,7 +3542,19 @@ def calibrate_folders_pysiril(folders: dict):
         print(f"⚠️  pySiril failed ({e}) – switching to CLI fallback")
         # Run entire Siril script via CLI (head-less)
         script_path = os.path.join(DATA_ROOT, SIRIL_SCRIPT_NAME)
-        _run_siril_script_cli(script_path)
+
+        import shutil, subprocess
+        cli_bin = shutil.which("siril-cli") or shutil.which("siril")
+        if not cli_bin:
+            raise RuntimeError("CLI fallback requested but neither 'siril-cli' nor 'siril' found in PATH")
+
+        try:
+            print(f"🚀 Launching Siril CLI: {cli_bin} -s {script_path} -q …")
+            subprocess.run([cli_bin, "-s", script_path, "-q"], check=True)
+            print("✅ Siril CLI calibration done")
+        except subprocess.CalledProcessError as cli_err:
+            raise RuntimeError(f"Siril CLI failed: {cli_err}") from cli_err
+
         return
 
     # Locate Siril.app on macOS if not configured
