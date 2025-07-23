@@ -1199,73 +1199,75 @@ def main():
         print("ℹ️  No footprints available for sky coverage map")
 
     # ------------------------------------------------------------------
-    # Build Siril script (same as previous behaviour, useful for manual batch)
+    # Build Siril script (manual batch) – skip in CLI-only mode
     # ------------------------------------------------------------------
-    print("🔧 Building Siril script...")
-    with open(os.path.join(init_path, "script.ssf"), "w") as f:
-        f.write("requires 1.2.0\n")
-        
-        # Use Path.iterdir() which is faster than os.listdir()
-        for target_path in Path(init_path).iterdir():
-            if not target_path.is_dir():
-                continue
-                
-            _target = target_path.name
-            print(f"Processing target: {_target}")
+    if os.getenv("ASTROBATCH_CLI_ONLY") != "1":
+        print("🔧 Building Siril script...")
+        with open(os.path.join(init_path, "script.ssf"), "w") as f:
+            f.write("requires 1.2.0\n")
             
-            for filter_path in target_path.iterdir():
-                if not filter_path.is_dir():
+            # Use Path.iterdir() which is faster than os.listdir()
+            for target_path in Path(init_path).iterdir():
+                if not target_path.is_dir():
                     continue
                     
-                _filter = filter_path.name
+                _target = target_path.name
+                print(f"Processing target: {_target}")
                 
-                for exposure_path in filter_path.iterdir():
-                    if not exposure_path.is_dir():
+                for filter_path in target_path.iterdir():
+                    if not filter_path.is_dir():
                         continue
                         
-                    _exposure = exposure_path.name
-                    print(f"  {_filter}/{_exposure}")
+                    _filter = filter_path.name
                     
-                    current_folder = str(exposure_path)
-                    
-                    # Count FITS files more efficiently
-                    fits_files = list(exposure_path.glob('*.[fF][iI][tT]*'))
-                    num_images = len(fits_files)
-                    
-                    print(f"    Found {num_images} image(s)")
-                    
-                    f.write(f"cd {current_folder}\n")
-                    f.write("convert i\n")
-                    
-                    # Build calibration argument string based on available frames
-                    flat_arg  = f" -flat={flats[_filter]}"  if _filter in flats else ""
-                    dark_arg  = f" -dark={darks[_exposure]}" if _exposure in darks else ""
-                    cal_args  = flat_arg + dark_arg
+                    for exposure_path in filter_path.iterdir():
+                        if not exposure_path.is_dir():
+                            continue
+                            
+                        _exposure = exposure_path.name
+                        print(f"  {_filter}/{_exposure}")
+                        
+                        current_folder = str(exposure_path)
+                        
+                        # Count FITS files more efficiently
+                        fits_files = list(exposure_path.glob('*.[fF][iI][tT]*'))
+                        num_images = len(fits_files)
+                        
+                        print(f"    Found {num_images} image(s)")
+                        
+                        f.write(f"cd {current_folder}\n")
+                        f.write("convert i\n")
+                        
+                        # Build calibration argument string based on available frames
+                        flat_arg  = f" -flat={flats[_filter]}"  if _filter in flats else ""
+                        dark_arg  = f" -dark={darks[_exposure]}" if _exposure in darks else ""
+                        cal_args  = flat_arg + dark_arg
 
-                    if num_images == 1:
-                        # Single image workflow
-                        print("    Using single image workflow")
-                        f.write(f"calibrate_single i_00001.fit{cal_args}\n")
-                        f.write("load pp_i_00001\n")
-                        f.write("binxy 2\n")
-                        f.write("save res\n")
-                    else:
-                        # Multiple images workflow
-                        f.write(f"calibrate i{cal_args}\n")
-                        f.write("register pp_i -2pass -interp=cu\n")
-                        f.write("seqapplyreg pp_i -framing=min\n")
-                        f.write("stack r_pp_i rej w 3 3 -nonorm -filter-fwhm=80% -filter-round=80%\n")
-                        f.write("load r_pp_i_stacked\n")
-                        f.write("binxy 2\n")
-                        f.write("save res\n")
+                        if num_images == 1:
+                            # Single image workflow
+                            print("    Using single image workflow")
+                            f.write(f"calibrate_single i_00001.fit{cal_args}\n")
+                            f.write("load pp_i_00001\n")
+                            f.write("binxy 2\n")
+                            f.write("save res\n")
+                        else:
+                            # Multiple images workflow
+                            f.write(f"calibrate i{cal_args}\n")
+                            f.write("register pp_i -2pass -interp=cu\n")
+                            f.write("seqapplyreg pp_i -framing=min\n")
+                            f.write("stack r_pp_i rej w 3 3 -nonorm -filter-fwhm=80% -filter-round=80%\n")
+                            f.write("load r_pp_i_stacked\n")
+                            f.write("binxy 2\n")
+                            f.write("save res\n")
 
     # ------------------------------------------------------------------
     # Fallback: any folder that, for some reason, wasn't calibrated during the
     # splitting loop (e.g. empty, or pySiril missing) is handled here.
     # ------------------------------------------------------------------
-    remaining = {k:v for k,v in folder_info.items() if k not in calibrated_folders}
-    if remaining:
-        calibrate_folders_pysiril(remaining)
+    if os.getenv("ASTROBATCH_CLI_ONLY") != "1":
+        remaining = {k:v for k,v in folder_info.items() if k not in calibrated_folders}
+        if remaining:
+            calibrate_folders_pysiril(remaining)
 
     # ---------------------------------------------------------------------------
     # Siril integration helpers
