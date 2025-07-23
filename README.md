@@ -56,15 +56,41 @@ pip install -e .
 > published on PyPI. For now you must work from the cloned repository as shown
 > above.
 
-### 2.3. Astrometry index catalogues
-Download the 4200–4210 series (2–8° FOV) into the directory listed in
-`astrometry.cfg` (`/opt/homebrew/Cellar/astrometry-net/*/data` on macOS).
+### 2.3. Siril & pySiril
 
-Example one-liner (4200 only):
-```bash
-cd /opt/homebrew/Cellar/astrometry-net/0.97/data
-for n in {00..47}; do curl -O http://data.astrometry.net/4200/index-4200-$n.fits; done
-```
+The **calibration** stage needs Siril. There are two supported ways:
+
+1. **Preferred – pySiril (server mode)**  
+   Works with any modern Siril (≥ 1.2).  The Python wrapper starts Siril in
+   the background and communicates over a pipe – it’s faster and avoids the
+   quirks of the old CLI.
+
+   ```bash
+   # inside your virtual-env
+   pip install \
+     https://gitlab.com/-/project/20510105/uploads/8224707c29669f255ad43da3b93bc5ec/pysiril-0.0.15-py3-none-any.whl
+   ```
+
+   Keep the `siril` binary (or AppImage) somewhere in `$PATH`; pySiril finds it
+   automatically. On first launch it will open a window briefly, then operate
+   head-less.
+
+2. **Fallback – Siril CLI only**  
+   If *pySiril* is not available the pipeline falls back to `siril-cli`. Make
+   sure your Siril version is **≥ 1.2**.  Older distro packages (1.0.x) miss
+   the `-q` flag and will exit with “`Option inconnue -q`”.  The official
+   AppImage works on any Linux:
+
+   ```bash
+   wget https://free-astro.org/download/siril-1.2.1-linux64.appimage -O siril.appimage
+   chmod +x siril.appimage
+   sudo mv siril.appimage /usr/local/bin/siril   # or keep it anywhere in PATH
+   ```
+
+   If neither pySiril nor a recent Siril CLI is detected the pipeline prints a
+   warning and skips the calibration step when you pass `--calibrate`.
+
+### 2.4. Astrometry index catalogues
 
 ---
 
