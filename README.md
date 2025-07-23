@@ -106,6 +106,26 @@ The **calibration** stage needs Siril. There are two supported ways:
 
 ---
 
+### 2.0. Debian/Ubuntu quick installer
+
+If you’re on Debian or Ubuntu, the repository ships a convenience script that
+sets up everything (system packages, virtual-env, Siril, pySiril):
+
+```bash
+chmod u+x scripts/install_debian.sh
+./scripts/install_debian.sh
+```
+
+After it finishes:
+```bash
+source .venv/bin/activate
+python -m astrobatch.cli --help
+```
+
+You can still follow the manual steps below if you prefer full control.
+
+---
+
 ## 3. Quick-start
 ```bash
 # Split raw images (night automatically detected from path)
