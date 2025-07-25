@@ -944,6 +944,17 @@ def process_single_image(file_path, object_name, date_str, footprints=None, max_
     if footprints is not None and ra_val is not None and dec_val is not None:
         _append_footprint_from_center(footprints, ra_val, dec_val, radius_deg)
 
+    # ---------------------------------------------------------------
+    # Record task ID for later report generation
+    # ---------------------------------------------------------------
+    try:
+        if task_id is not None:
+            tasks_file = Path(init_path) / "stdweb_tasks.txt"
+            with tasks_file.open("a") as tf:
+                tf.write(f"{task_id}\n")
+    except Exception as _e:
+        print(f"⚠️  Could not write task list: {_e}")
+
     return True
 
 def upload_processed_images():
@@ -1202,9 +1213,11 @@ def main():
     # ------------------------------------------------------------------
     # Calibrate all folders now using pySiril (one batch)
     # ------------------------------------------------------------------
-    if folder_info:
+    if folder_info and os.getenv("ASTROBATCH_SKIP_CALIBRATE") != "1":
         print("🚀 Calibrating all exposure folders with Siril …")
         calibrate_folders_pysiril(folder_info)
+    elif folder_info:
+        print("ℹ️  Calibration skipped by CLI (no --calibrate flag)")
 
     # ------------------------------------------------------------------
     # After calibration, create the sky-coverage map (approximate)

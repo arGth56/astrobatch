@@ -85,7 +85,11 @@ def _main(argv: list[str] | None = None) -> None:
             _old = _sys.argv[:]
             _sys.argv = ["spliter"]
             try:
+                import os as _os
+                if not args.calibrate:
+                    _os.environ["ASTROBATCH_SKIP_CALIBRATE"] = "1"
                 spliter.main()
+                _os.environ.pop("ASTROBATCH_SKIP_CALIBRATE", None)
             finally:
                 _sys.argv = _old
 
