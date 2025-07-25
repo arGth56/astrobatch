@@ -41,7 +41,7 @@ def _main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Show steps without executing")
     parser.add_argument("--start-server", action="store_true", help="Launch Flask candidate review server")
     parser.add_argument("--port", type=int, default=None, help="Port for --start-server (default 5100 or $PORT)")
-    args = parser.parse_args(argv)
+    args, extra = parser.parse_known_args(argv)
 
     # ------------------------------------------------------------------
     # Always use CLI-only calibration (pySiril disabled).  The environment
@@ -151,7 +151,7 @@ def _main(argv: list[str] | None = None) -> None:
         else:
             try:
                 analyse = _lazy_import("astrobatch.analyse")
-                analyse.main([])
+                analyse.main(extra)
             except ModuleNotFoundError:
                 print("⚠️  analyse.py not found – skipping analysis step")
 
