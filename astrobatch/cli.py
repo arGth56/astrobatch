@@ -151,7 +151,7 @@ def _main(argv: list[str] | None = None) -> None:
         else:
             try:
                 analyse = _lazy_import("astrobatch.analyse")
-                analyse.main()
+                analyse.main([])
             except ModuleNotFoundError:
                 print("⚠️  analyse.py not found – skipping analysis step")
 
