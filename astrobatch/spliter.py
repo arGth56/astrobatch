@@ -561,7 +561,8 @@ def trigger_template_subtraction(task_id):
     # Request subtraction using ZTF DR7 reference templates
     payload = json.dumps({
         "action": "subtraction",
-        "template_catalog": "ZTF_DR7"
+        "template_catalog": "ZTF_DR7",   # new API (2024-12+)
+        "template_source":  "ZTF_DR7"    # legacy key for older servers
     })
     curl_command = [
         "curl", "-s", "-X", "POST", action_url,
