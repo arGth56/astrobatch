@@ -31,7 +31,7 @@ Choose your platform:
 
 | OS | Quick path |
 |----|------------|
-| **macOS** | `brew install --cask siril` then follow Python steps below (section “Siril & pySiril” has details). |
+| **macOS** | `brew install --cask siril` then follow Python steps below (section “Siril & pySiril” has details).<br/>Create CLI link: `sudo ln -s /Applications/Siril.app/Contents/MacOS/siril-cli /usr/local/bin/siril-cli` |
 | **Windows** | Install Siril MSI, then continue with Python/pySiril (see platform notes). |
 | **Debian / Ubuntu** | `chmod u+x scripts/install_debian.sh && ./scripts/install_debian.sh` – sets up everything automatically. |
 
