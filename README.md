@@ -119,9 +119,10 @@ You can still follow the manual steps below if you prefer full control.
 ## 3. Quick-start
 ```bash
 # Split raw images (night automatically detected from path)
-astrobatch --split --root /data/2025-07-16/LIGHT
+astrobatch --process --root /data/2025-07-16/LIGHT   # split + calibrate in one go
 
-# Calibrate via Siril CLI (head-less servers)
+# Or run steps separately
+astrobatch --split --root /data/2025-07-16/LIGHT
 astrobatch --calibrate --root /data/2025-07-16/LIGHT
 
 # Upload to STDWeb (requires API token)
@@ -159,6 +160,7 @@ If the variable is missing `astrobatch` aborts with a clear error message.
 astrobatch [OPTIONS]
 
 Options:
+  --process         Shortcut for --split + --calibrate (recommended)
   --split           Organise raw FITS into folder tree
   --calibrate       Run Siril calibration/stacking
   --upload          Upload res.fit to STDWeb (photometry S/N=10, ZTF DR7)
