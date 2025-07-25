@@ -34,6 +34,7 @@ def _main(argv: list[str] | None = None) -> None:
     parser.add_argument("--root", type=Path, required=True, help="Night LIGHT directory root")
     parser.add_argument("--split", action="store_true", help="Split raw FITS into folder tree")
     parser.add_argument("--calibrate", action="store_true", help="Calibrate/stack via Siril (pySiril)")
+    parser.add_argument("--process", action="store_true", help="Shortcut for --split --calibrate")
     parser.add_argument("--upload", action="store_true", help="Upload stacked images to STDWeb")
     parser.add_argument("--mosaic", action="store_true", help="Create sky mosaic from res.fit files in night root")
     parser.add_argument("--analyse", action="store_true", help="Analyse STDWeb results & transients")
@@ -42,6 +43,11 @@ def _main(argv: list[str] | None = None) -> None:
     parser.add_argument("--start-server", action="store_true", help="Launch Flask candidate review server")
     parser.add_argument("--port", type=int, default=None, help="Port for --start-server (default 5100 or $PORT)")
     args, extra = parser.parse_known_args(argv)
+
+    # --process implies both split and calibrate
+    if args.process:
+        args.split = True
+        args.calibrate = True
 
     # ------------------------------------------------------------------
     # Always use CLI-only calibration (pySiril disabled).  The environment
