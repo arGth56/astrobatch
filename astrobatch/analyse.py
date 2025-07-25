@@ -47,14 +47,26 @@ except Exception:
 def main(argv=None):  # type: ignore
     import sys as _sys
     argv_in = list(_sys.argv[1:] if argv is None else argv)
-    if "--db" not in argv_in and not any(arg.startswith("--db=") for arg in argv_in):
-        # Prefer .sqlite, fall back to .db if it exists
-        db_path = _PKG_DIR / "candidates.sqlite"
-        if not db_path.exists():
-            alt = _PKG_DIR / "candidates.db"
-            if alt.exists():
-                db_path = alt
-        argv_in.extend(["--db", str(db_path)])
+
+    # ------------------------------------------------------------------
+    # Auto-fill --begin / --end from stdweb_tasks.txt if user omitted them
+    # ------------------------------------------------------------------
+    if "--begin" not in argv_in and "--end" not in argv_in:
+        try:
+            # Detect --root <path> in argv (we ignore its value here)
+            if "--root" in argv_in:
+                root_idx = argv_in.index("--root")
+                night_root = _Path(argv_in[root_idx + 1])
+            else:
+                night_root = _Path.cwd()
+
+            tasks_file = night_root / "stdweb_tasks.txt"
+            if tasks_file.exists():
+                ids = sorted({int(line.strip()) for line in tasks_file.read_text().split() if line.strip().isdigit()})
+                if ids:
+                    argv_in.extend(["--begin", str(ids[0]), "--end", str(ids[-1])])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Default locations for CSV/HTML reports (Output/)
@@ -71,6 +83,15 @@ def main(argv=None):  # type: ignore
         argv_in.extend(["--csv", str(_out_dir / f"candidates_{stamp}.csv")])
     if not _has_flag("--html"):
         argv_in.extend(["--html", str(_out_dir / f"report_{stamp}.html")])
+
+    # existing db default logic moved here
+    if "--db" not in argv_in and not any(arg.startswith("--db=") for arg in argv_in):
+        db_path = _PKG_DIR / "candidates.sqlite"
+        if not db_path.exists():
+            alt = _PKG_DIR / "candidates.db"
+            if alt.exists():
+                db_path = alt
+        argv_in.extend(["--db", str(db_path)])
 
     _sys.argv = ["analyse"] + argv_in
     return _legacy.main()
