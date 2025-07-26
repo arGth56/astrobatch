@@ -502,7 +502,7 @@ def get_task_state(task_id):
 
 def wait_for_state(task_id, desired_states, timeout=600, poll_interval=10):
     """Block until task.state is in desired_states list. Returns True when reached, False on timeout, None on failure state."""
-    fail_states = {"failed", "error"}
+    fail_states = {"failed", "error", "photometry_failed"}
     start_time = time.time()
     while time.time() - start_time < timeout:
         state = get_task_state(task_id)
