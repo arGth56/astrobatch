@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NINA Control Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>NINA Control Dashboard</h1>
+
+      <section class="panel">
+        <h2>1) Connect to NINA API</h2>
+        <form id="config-form">
+          <label>
+            Host
+            <input id="host" name="host" type="text" placeholder="192.168.1.174" value="192.168.1.174" required />
+          </label>
+          <label>
+            Port
+            <input id="port" name="port" type="number" min="1" max="65535" placeholder="1888" required />
+          </label>
+          <label>
+            Protocol
+            <select id="protocol" name="protocol">
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </label>
+          <div class="buttons">
+            <button type="submit">Test Connection</button>
+          </div>
+        </form>
+        <p id="connection-status" class="status">Not tested yet.</p>
+      </section>
+
+      <section class="panel">
+        <div class="tab-buttons">
+          <button id="tab-devices" class="tab-button active" type="button">Devices</button>
+          <button id="tab-actions" class="tab-button" type="button">Actions</button>
+          <button id="tab-dome" class="tab-button" type="button">Dome</button>
+          <button id="tab-target" class="tab-button" type="button">Target</button>
+          <button id="tab-todo" class="tab-button" type="button">ToDo</button>
+          <button id="tab-pipeline" class="tab-button" type="button">Pipeline</button>
+          <button id="tab-nightplan" class="tab-button" type="button">Night Plan</button>
+        </div>
+
+        <div id="panel-devices" class="tab-panel active">
+          <h2>Devices</h2>
+          <p>List all devices and connection status.</p>
+          <div class="buttons">
+            <button data-device="all" type="button">Connect All</button>
+            <button data-device="mount" type="button">Connect Mount</button>
+            <button data-device="camera" type="button">Connect Camera</button>
+            <button data-device="filterwheel" type="button">Connect Filterwheel</button>
+            <button data-device="focuser" type="button">Connect Focuser</button>
+            <button id="refresh-status" type="button">Refresh Status</button>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Device</th>
+                <th>Status</th>
+                <th>Info</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Mount</td><td id="status-mount" class="offline">Unknown</td><td></td></tr>
+              <tr><td>Camera</td><td id="status-camera" class="offline">Unknown</td><td id="detail-camera"></td></tr>
+              <tr><td>Filterwheel</td><td id="status-filterwheel" class="offline">Unknown</td><td id="detail-filterwheel"></td></tr>
+              <tr><td>Focuser</td><td id="status-focuser" class="offline">Unknown</td><td id="detail-focuser"></td></tr>
+              <tr><td>Dome <small class="source-label">OCS</small></td><td id="status-dome" class="offline">Unknown</td><td id="detail-dome"></td></tr>
+              <tr><td>Safety Monitor <small class="source-label">OCS</small></td><td id="status-safetymonitor" class="offline">Unknown</td><td id="detail-safetymonitor"></td></tr>
+              <tr><td>Guider</td><td id="status-guider" class="offline">Unknown</td><td></td></tr>
+              <tr><td>Rotator</td><td id="status-rotator" class="offline">Unknown</td><td></td></tr>
+              <tr><td>FlatDevice</td><td id="status-flatdevice" class="offline">Unknown</td><td></td></tr>
+              <tr><td>Switch</td><td id="status-switch" class="offline">Unknown</td><td></td></tr>
+              <tr><td>Weather</td><td id="status-weather" class="offline">Unknown</td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div id="panel-actions" class="tab-panel">
+          <h2>Actions</h2>
+
+          <div class="action-group">
+            <h3>Mount</h3>
+            <div class="buttons">
+              <button id="mount-park" type="button">Park</button>
+              <button id="mount-unpark" type="button">Unpark</button>
+              <button id="mount-home" type="button">Home</button>
+            </div>
+          </div>
+
+          <div class="action-group">
+            <h3>Camera Capture</h3>
+            <form id="camera-capture-form" class="inline-form">
+              <label>
+                Exposure (s)
+                <input id="camera-duration" type="number" min="0.001" step="0.001" value="2" required />
+              </label>
+              <label>
+                Gain
+                <input id="camera-gain" type="number" min="0" step="1" value="10" required />
+              </label>
+              <label class="wide">
+                Save Path (optional, updates profile path)
+                <input id="camera-save-path" type="text" placeholder="C:\\Users\\pyl\\Documents\\N.I.N.A" />
+              </label>
+              <button type="submit">Capture</button>
+            </form>
+          </div>
+
+          <div class="action-group">
+            <h3>Filter Wheel</h3>
+            <form id="filterwheel-form" class="inline-form">
+              <label>
+                Filter
+                <select id="filterwheel-filter-id"></select>
+              </label>
+              <button type="submit">Change Filter</button>
+            </form>
+          </div>
+
+          <div class="action-group">
+            <h3>Autofocus (Focuser)</h3>
+            <form id="focuser-form" class="inline-form">
+              <label>
+                Step Size
+                <input id="focuser-steps" type="number" min="1" step="1" value="50" required />
+              </label>
+              <div class="buttons">
+                <button id="focuser-in" type="button">Move In</button>
+                <button id="focuser-out" type="button">Move Out</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div id="panel-dome" class="tab-panel">
+          <h2>Dome / Roof (OCS)</h2>
+
+          <form id="dome-ocs-config-form" class="inline-form">
+            <label>
+              OCS Host
+              <input id="dome-ocs-host" type="text" placeholder="ocs.local" required />
+            </label>
+            <button type="submit">Refresh Status</button>
+          </form>
+
+          <table style="margin-top:12px;">
+            <tbody>
+              <tr><td>Roof</td><td id="dome-roof-status" class="offline">Unknown</td></tr>
+              <tr><td>Safety</td><td id="dome-safe" class="offline">Unknown</td></tr>
+              <tr><td>Rain</td><td id="dome-rain">–</td></tr>
+              <tr><td>Temperature</td><td id="dome-temp">–</td></tr>
+              <tr><td>Humidity</td><td id="dome-humidity">–</td></tr>
+              <tr><td>Pressure</td><td id="dome-pressure">–</td></tr>
+            </tbody>
+          </table>
+
+          <div class="buttons" style="margin-top:16px;">
+            <button id="dome-open" type="button" class="btn-danger">Open Roof</button>
+            <button id="dome-close" type="button" class="btn-danger">Close Roof</button>
+            <button id="dome-stop" type="button" class="btn-stop">Stop!</button>
+          </div>
+        </div>
+
+        <div id="panel-target" class="tab-panel">
+          <h2>Target Lookup</h2>
+
+          <details class="tns-creds">
+            <summary>TNS Credentials</summary>
+            <div class="inline-form" style="margin-top:10px;">
+              <label>Bot ID<input id="tns-bot-id" type="text" placeholder="12345" /></label>
+              <label>Bot Name<input id="tns-bot-name" type="text" placeholder="MY_BOT" /></label>
+              <label class="wide">API Key<input id="tns-api-key" type="password" placeholder="••••••••••••••••" /></label>
+            </div>
+            <p class="hint">Get your credentials at <a href="https://www.wis-tns.org/bots" target="_blank">wis-tns.org/bots</a>. Stored only in your browser tab.</p>
+          </details>
+
+          <details id="history-details" class="tns-creds" style="margin-top:12px;">
+            <summary>History <span id="history-count" style="color:#6b7280;font-size:12px;margin-left:6px;"></span></summary>
+            <div style="margin-top:10px;">
+              <div id="history-empty" style="color:#6b7280;font-style:italic;font-size:13px;padding:8px 0;">No lookups yet.</div>
+              <table id="history-table" style="display:none;">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>RA (deg)</th>
+                    <th>Dec (deg)</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="history-tbody"></tbody>
+              </table>
+              <div class="buttons" style="margin-top:8px;">
+                <button id="history-clear" type="button" class="btn-small" style="color:#fca5a5;border-color:#7f1d1d;">Clear History</button>
+              </div>
+            </div>
+          </details>
+
+          <form id="target-lookup-form" class="inline-form" style="margin-top:16px;">
+            <label class="wide">
+              Target Name (e.g. AT 2026fuh)
+              <input id="target-name" type="text" placeholder="AT 2026fuh" required />
+            </label>
+            <button type="submit">Lookup on TNS</button>
+          </form>
+
+          <div id="target-result" style="display:none; margin-top:16px;">
+            <div class="target-header">
+              <span id="target-full-name" class="target-title"></span>
+              <a id="target-tns-link" href="#" target="_blank" class="tns-link">View on TNS</a>
+              <button id="add-to-todo" type="button" class="btn-add-todo">+ Add to ToDo</button>
+            </div>
+
+            <table class="target-table">
+              <tbody>
+                <tr><td>Type</td><td id="t-type">–</td></tr>
+                <tr><td>RA</td><td id="t-ra">–</td></tr>
+                <tr><td>Dec</td><td id="t-dec">–</td></tr>
+                <tr><td>Constellation</td><td id="t-constellation">–</td></tr>
+                <tr><td>Redshift (z)</td><td id="t-redshift">–</td></tr>
+                <tr><td>Discovery Date</td><td id="t-disc-date">–</td></tr>
+                <tr><td>Discovery Mag</td><td id="t-disc-mag">–</td></tr>
+                <tr><td>Filter</td><td id="t-disc-filter">–</td></tr>
+                <tr><td>Host Galaxy</td><td id="t-host">–</td></tr>
+                <tr><td>Host z</td><td id="t-host-z">–</td></tr>
+                <tr><td>Reporters</td><td id="t-reporters">–</td></tr>
+                <tr><td>Reporting Group</td><td id="t-group">–</td></tr>
+                <tr><td>Internal Names</td><td id="t-internal">–</td></tr>
+              </tbody>
+            </table>
+
+            <!-- Sky visibility charts -->
+            <div id="target-visibility" style="display:none; margin-top:20px;">
+              <div class="vis-header">
+                <h3 style="margin:0; font-size:15px; color:#93c5fd;">Sky Position &amp; Visibility</h3>
+                <div class="obs-location-row">
+                  <span class="obs-location-label">Observer:</span>
+                  <span id="obs-location-text" class="obs-location-text">—</span>
+                  <button id="toggle-obs-form" type="button" class="btn-small">Edit</button>
+                </div>
+              </div>
+
+              <div id="obs-form" style="display:none;" class="inline-form obs-form">
+                <label>Lat (°)<input id="obs-lat" type="number" step="0.0001" placeholder="-23.5" /></label>
+                <label>Lon (°)<input id="obs-lon" type="number" step="0.0001" placeholder="-46.6" /></label>
+                <label>Elev (m)<input id="obs-elev" type="number" step="1" placeholder="850" /></label>
+                <button id="apply-obs-location" type="button">Apply</button>
+              </div>
+
+              <div class="vis-charts">
+                <canvas id="sky-dome" width="260" height="260"></canvas>
+                <div class="vis-right">
+                  <canvas id="alt-chart" height="200"></canvas>
+                  <div class="vis-legend">
+                    <span style="color:#60a5fa">●</span> Altitude
+                    <span style="color:#fbbf24; margin-left:10px">│</span> Now
+                    <span style="color:#4ade80; margin-left:10px">- -</span> 30° threshold
+                    <span style="margin-left:10px; color:#6b7280; font-size:11px">■ day / twilight shading</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ToDo / Observation Queue tab -->
+        <div id="panel-todo" class="tab-panel">
+          <h2>Observation Queue</h2>
+
+          <details class="seq-config">
+            <summary>Sequence Parameters</summary>
+            <div class="inline-form seq-config-form" style="margin-top:10px;">
+              <label>Exposure (s)<input id="seq-duration" type="number" min="1" step="1" value="120" /></label>
+              <label>Gain<input id="seq-gain" type="number" min="0" step="1" value="10" /></label>
+              <label>Frames / filter<input id="seq-count" type="number" min="1" step="1" value="10" /></label>
+              <label class="wide">Filters (comma-separated)<input id="seq-filters" type="text" value="G,BP,RP" /></label>
+            </div>
+            <div class="seq-config-divider">Plate Solve &amp; Center</div>
+            <div class="inline-form seq-config-form">
+              <label class="seq-toggle-label">
+                <input id="seq-solve-enable" type="checkbox" checked />
+                Enable plate solve + center
+              </label>
+              <label>PS exposure (s)<input id="seq-solve-exp" type="number" min="1" step="1" value="5" /></label>
+              <label>Accuracy (&quot;)<input id="seq-solve-threshold" type="number" min="5" step="5" value="60" /></label>
+            </div>
+            <div class="seq-config-divider">Execution Mode</div>
+            <div class="inline-form seq-config-form">
+              <label class="seq-toggle-label">
+                <input id="seq-manual-mode" type="checkbox" />
+                Manual step mode <small style="color:#6b7280;">(confirm each step before continuing)</small>
+              </label>
+            </div>
+          </details>
+
+          <div id="seq-queue-empty" class="seq-empty">
+            Queue is empty — look up a target in the Target tab and press "+ Add to ToDo"
+          </div>
+          <ol id="seq-queue-list" class="seq-queue"></ol>
+
+          <div class="buttons" style="margin-top:12px;">
+            <button id="seq-run" type="button">▶ Run Sequence</button>
+            <button id="seq-abort" type="button" class="btn-danger" disabled>■ Abort</button>
+            <button id="seq-restart" type="button">↺ Restart</button>
+            <button id="seq-clear" type="button">Clear All</button>
+            <button id="seq-reset-af" type="button" class="btn-small">Reset AF Timer</button>
+          </div>
+
+          <!-- Status box -->
+          <div id="seq-status-box" class="seq-status-box">
+            <div class="seq-status-row">
+              <span id="seq-status-dot" class="seq-dot seq-dot-idle"></span>
+              <span id="seq-status-label">Idle</span>
+            </div>
+            <div id="seq-status-target" class="seq-status-target" style="display:none;"></div>
+            <div id="seq-status-step" class="seq-status-step" style="display:none;"></div>
+
+            <!-- Manual-mode confirmation bar (shown only when paused) -->
+            <div id="seq-confirm-row" class="seq-confirm-row" style="display:none;">
+              <span id="seq-confirm-step" class="seq-confirm-step"></span>
+              <button id="seq-next" type="button" class="btn-next">▶ Next Step</button>
+            </div>
+
+            <div id="seq-progress-wrap" class="seq-progress-wrap" style="display:none;">
+              <div id="seq-progress-bar" class="seq-progress-bar"></div>
+            </div>
+          </div>
+
+          <!-- Log -->
+          <div class="seq-log-header">Sequence Log</div>
+          <div id="seq-log" class="seq-log"></div>
+        </div>
+
+        <!-- Pipeline tab -->
+        <div id="panel-pipeline" class="tab-panel">
+          <h2>Processing Pipeline</h2>
+
+          <form id="pipeline-trigger-form" class="inline-form" style="margin-bottom:16px;">
+            <label>
+              Date
+              <select id="pipeline-date-select" style="min-width:130px;">
+                <option value="">Loading…</option>
+              </select>
+            </label>
+            <label id="pipeline-target-label">
+              Target folder
+              <select id="pipeline-target-select" style="min-width:160px;display:none;">
+                <option value="">— pick a target —</option>
+              </select>
+            </label>
+            <label class="wide">
+              FITS path
+              <input id="pipeline-fits-dir" type="text" placeholder="auto-filled from above" required />
+            </label>
+            <label>
+              Target name
+              <input id="pipeline-target" type="text" placeholder="AT 2026abc" />
+            </label>
+            <button type="submit" id="pipeline-trigger-btn">&#9654; Trigger</button>
+          </form>
+          <p style="font-size:12px;color:#6b7280;margin:-8px 0 12px;">
+            In NINA sequences, set your image path to include <code>$$TARGETNAME$$</code> to get per-target folders instead of SNAPSHOT.
+          </p>
+
+          <div id="pipeline-status-bar" style="display:none; margin-bottom:10px; padding:8px 12px;
+               background:#1e3a5f; border-radius:6px; font-size:13px; color:#93c5fd;">
+            <span id="pipeline-status-text"></span>
+            <button id="pipeline-log-btn" type="button" class="btn-small"
+                    style="float:right;margin-top:-2px;">View Log</button>
+          </div>
+
+          <div id="pipeline-log-modal" style="display:none; position:fixed; inset:0;
+               background:rgba(0,0,0,.7); z-index:1000; overflow:auto; padding:20px;">
+            <div style="max-width:860px; margin:0 auto; background:#111827; border-radius:8px;
+                        padding:20px; position:relative;">
+              <button id="pipeline-log-close" type="button" style="position:absolute;top:12px;right:16px;
+                      background:none;border:none;color:#9ca3af;font-size:20px;cursor:pointer;">✕</button>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                <h3 style="margin:0;color:#f9fafb;">Job Log</h3>
+                <button id="pipeline-log-copy" type="button" class="btn-small"
+                        style="font-size:11px;padding:3px 10px;">⎘ Copy</button>
+              </div>
+              <pre id="pipeline-log-content" style="font-size:12px;color:#d1fae5;
+                   white-space:pre-wrap;max-height:60vh;overflow-y:auto;"></pre>
+            </div>
+          </div>
+
+          <div id="pipeline-empty" class="seq-empty" style="display:none;">
+            No pipeline jobs yet.
+          </div>
+
+          <table id="pipeline-table" style="display:none;">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Target</th>
+                <th>Folder</th>
+                <th>Status</th>
+                <th>Filters / STDWeb</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="pipeline-tbody"></tbody>
+          </table>
+
+          <!-- Stacked results browser -->
+          <h3 style="margin-top:28px;">Stacked Results</h3>
+          <table id="results-table" style="display:none;">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Target</th>
+                <th>Filter</th>
+                <th>Exp</th>
+                <th>Size</th>
+                <th>Download</th>
+              </tr>
+            </thead>
+            <tbody id="results-tbody"></tbody>
+          </table>
+          <p id="results-empty" class="seq-empty">No stacked results yet.</p>
+        </div>
+
+        <!-- Night Plan tab -->
+        <div id="panel-nightplan" class="tab-panel">
+          <h2>Night Plan</h2>
+
+          <div id="nightplan-info-bar" class="nightplan-info-bar">Computing night info…</div>
+
+          <details class="seq-config" open>
+            <summary>Overhead &amp; Constraints</summary>
+            <div class="inline-form seq-config-form" style="margin-top:10px;">
+              <label>AF overhead (min)<input id="np-af" type="number" min="0" step="0.5" value="3" /></label>
+              <label>Slew + center (min)<input id="np-slew" type="number" min="0" step="0.5" value="3" /></label>
+              <label>Save overhead (s/frame)<input id="np-save" type="number" min="0" step="1" value="5" /></label>
+              <label>Min altitude (°)<input id="np-minalt" type="number" min="0" max="90" step="5" value="20" /></label>
+            </div>
+            <p style="font-size:12px;color:#6b7280;margin:4px 0 0;">
+              Exposure, filter count and frames per filter are read from the <strong>ToDo</strong> tab's Sequence Parameters.
+            </p>
+          </details>
+
+          <div style="position:relative;margin-top:14px;">
+            <canvas id="nightplan-canvas" style="width:100%;height:480px;border-radius:6px;display:block;background:#090d18;"></canvas>
+          </div>
+
+          <div class="buttons" style="margin-top:12px;">
+            <button id="np-optimize-btn" type="button">⚡ Optimize Order</button>
+            <button id="np-refresh-btn" type="button">↺ Refresh</button>
+          </div>
+
+          <p id="nightplan-empty" class="seq-empty" style="display:none;">
+            No targets in queue with coordinates — add targets via the Target tab → "+ Add to ToDo".
+          </p>
+
+          <table id="nightplan-table" style="margin-top:16px;display:none;">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Target</th>
+                <th>Start</th>
+                <th>End</th>
+                <th>Duration</th>
+                <th>Alt range</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="nightplan-tbody"></tbody>
+          </table>
+        </div>
+
+        <pre id="log" class="log"></pre>
+      </section>
+    </main>
+
+    <script src="/astronomy.js"></script>
+    <script src="/nightplan.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
