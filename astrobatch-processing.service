@@ -1,0 +1,18 @@
+[Unit]
+Description=AstroBatch Processing Service
+After=network.target nina-control.service
+
+[Service]
+Type=simple
+User=pyl
+WorkingDirectory=/home/pyl/Documents/astrobatch
+ExecStart=/home/pyl/Documents/astrobatch/.venv/bin/python3 -m astrobatch.processing_service
+Restart=always
+RestartSec=5
+Environment=DISPLAY=:0
+
+StandardOutput=append:/var/log/astrobatch-processing.log
+StandardError=append:/var/log/astrobatch-processing.log
+
+[Install]
+WantedBy=multi-user.target
