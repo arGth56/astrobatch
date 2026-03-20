@@ -1,0 +1,18 @@
+[Unit]
+Description=NINA Control Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pyl
+WorkingDirectory=/home/pyl/Documents/astrobatch/server
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/var/log/nina-control.log
+StandardError=append:/var/log/nina-control.log
+
+[Install]
+WantedBy=multi-user.target
