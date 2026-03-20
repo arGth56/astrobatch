@@ -449,7 +449,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
         lines = [
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
-            "register pp_i -interp=cu",
+            "register pp_i -interp=cu -framing=min",
             "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
             "load r_pp_i_stacked",
             "save res",
@@ -463,7 +463,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                 # too few frames remain.
                 register_lines = [
                     "requires 1.2.0", f'cd "{folder}"',
-                    "register pp_i -interp=cu",
+                    "register pp_i -interp=cu -framing=min",
                     "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
                     "load r_pp_i_stacked",
                     "save res",
@@ -572,17 +572,24 @@ def plate_solve(res_fit: Path, jlog: JobLogger) -> bool:
 
 # ── STDWeb upload + pipeline ───────────────────────────────────────────────────
 
-def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger) -> str | None:
+def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger,
+                  target: str | None = None) -> str | None:
     """Upload res.fit to STDWeb. Returns task_id or None."""
-    jlog.info(f"  Uploading to STDWeb: {title}")
+    jlog.info(f"  Uploading to STDWeb: {title}" + (f" (target={target})" if target else ""))
     try:
-        result = subprocess.run([
+        cmd = [
             "curl", "-s",
             "-H", f"Authorization: Token {STDWEB_TOKEN}",
             "-F", f"file=@{res_fit}",
             "-F", f"title={title}",
-            f"{STDWEB_URL}/api/tasks/upload/",
-        ], capture_output=True, text=True, timeout=120)
+            "-F", f"gain={STDWEB_GAIN}",
+            "-F", "do_inspect=true",
+            "-F", "do_photometry=true",
+        ]
+        if target:
+            cmd += ["-F", f"target={target}"]
+        cmd.append(f"{STDWEB_URL}/api/tasks/upload/")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
         import json
         data = json.loads(result.stdout)
@@ -765,7 +772,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         update_result(result_id, "uploading")
         jlog.info("Step 5: Uploading to STDWeb...")
         title = f"{obj.replace('_', ' ')} {filt} {exp_str}s {date_str}"
-        task_id = stdweb_upload(res_fit, title, jlog)
+        target_clean = obj.replace('_', '').replace(' ', '')  # e.g. "AT2026FTZ"
+        task_id = stdweb_upload(res_fit, title, jlog, target=target_clean)
 
         if not task_id:
             jlog.error("Upload failed")
