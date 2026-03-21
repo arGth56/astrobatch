@@ -36,6 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CALIB_DIR    = PROJECT_ROOT / "calib"
 DATA_DIR     = PROJECT_ROOT / "data"
 LOG_DIR      = PROJECT_ROOT / "logs"
+NAS_OUTPUT   = Path(os.environ.get("NAS_OUTPUT", "/mnt/nas/input/pyl/astro/output"))
 DB_PATH      = Path(os.environ.get(
     "NIGHTMANAGER_DB",
     PROJECT_ROOT / "server" / "nightmanager.db"
@@ -280,6 +281,52 @@ def prepare_work_dir(target: str, filt: str, exp_str: str, date_str: str,
 
     jlog.info(f"  Work dir: {work_folder}  ({copied} new files, {len(files)} total)")
     return work_folder
+
+def finalise_work_dir(work_dir: Path, date_str: str, target: str,
+                      filt: str, jlog: JobLogger) -> Path | None:
+    """
+    After a successful pipeline run:
+      1. Move res.fit + res_preview.png to NAS_OUTPUT/<date>/<target>/<filter>/
+      2. Delete all Siril intermediary files (i_*, pp_i_*, r_pp_i_*, *.seq, *.ssf)
+         but keep the raw input .fits, _calib/, _previews/ subdirs intact.
+    Returns the NAS destination folder, or None if the move failed.
+    """
+    nas_dest = NAS_OUTPUT / date_str / target / filt
+    try:
+        nas_dest.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        jlog.error(f"  Cannot create NAS output dir {nas_dest}: {exc}")
+        return None
+
+    # Move the two result files
+    moved = 0
+    for fname in ("res.fit", "res_preview.png"):
+        src = work_dir / fname
+        if src.exists():
+            dst = nas_dest / fname
+            shutil.move(str(src), dst)
+            moved += 1
+            jlog.info(f"  Moved {fname} → {dst}")
+
+    if moved == 0:
+        jlog.error("  No result files found to move")
+        return None
+
+    # Clean up Siril intermediaries (keep raw .fits and subdirs)
+    cleanup_patterns = (
+        "i_*.fit", "i_*.fits", "i_conversion.txt",
+        "pp_i_*.fit", "pp_i_*.fits",
+        "r_pp_i_*.fit", "r_pp_i_*.fits",
+        "*.seq", "*.ssf", "*.lst",
+    )
+    removed = 0
+    for pattern in cleanup_patterns:
+        for f in work_dir.glob(pattern):
+            f.unlink(missing_ok=True)
+            removed += 1
+    jlog.info(f"  Cleaned {removed} intermediary file(s) from work dir")
+    return nas_dest
+
 
 # ── Siril calibration + stacking ──────────────────────────────────────────────
 
@@ -589,20 +636,27 @@ def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger,
         if target:
             cmd += ["-F", f"target={target}"]
         cmd.append(f"{STDWEB_URL}/api/tasks/upload/")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        # -w outputs HTTP status code after the body
+        cmd_with_status = cmd[:-1] + ["-w", "\nHTTP_STATUS:%{http_code}", cmd[-1]]
+        result = subprocess.run(cmd_with_status, capture_output=True, text=True, timeout=120)
+
+        raw = result.stdout
+        jlog.info(f"  STDWeb raw response: {raw[:400]}")
 
         import json
-        data = json.loads(result.stdout)
+        # Strip the HTTP_STATUS trailer before parsing JSON
+        body = raw.split("\nHTTP_STATUS:")[0].strip()
+        data = json.loads(body)
         # Response: {"message":"...", "task": {"id": 3446, ...}}
         task_obj = data.get("task") or data
         task_id = str(task_obj.get("id") or task_obj.get("task_id") or "")
         if not task_id:
-            jlog.error(f"Upload response has no task_id: {result.stdout[:200]}")
+            jlog.error(f"Upload response has no task_id: {raw[:400]}")
             return None
         jlog.info(f"  Uploaded → task_id={task_id}")
         return task_id
     except Exception as exc:
-        jlog.error(f"Upload error: {exc}")
+        jlog.error(f"Upload error: {exc} | raw={result.stdout[:400] if 'result' in dir() else 'n/a'}")
         return None
 
 
@@ -815,6 +869,11 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         jlog.info(f"  Subtraction state: {state}")
 
         update_result(result_id, "done", stdweb_task_id=task_id, stdweb_url=task_url)
+
+        # ── Step 9: Move results to NAS, clean intermediaries ─────────────────
+        jlog.info("Step 9: Archiving results to NAS...")
+        finalise_work_dir(work_dir, date_str, obj, filt, jlog)
+
         success_count += 1
 
     # ── Done ──────────────────────────────────────────────────────────────────
