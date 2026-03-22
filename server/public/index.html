@@ -43,6 +43,7 @@
           <button id="tab-target" class="tab-button" type="button">Target</button>
           <button id="tab-todo" class="tab-button" type="button">ToDo</button>
           <button id="tab-pipeline" class="tab-button" type="button">Pipeline</button>
+          <button id="tab-history" class="tab-button" type="button">History</button>
           <button id="tab-nightplan" class="tab-button" type="button">Night Plan</button>
         </div>
 
@@ -379,21 +380,42 @@
           <div id="pipeline-log-modal" style="display:none; position:fixed; inset:0;
                background:rgba(0,0,0,.7); z-index:1000; overflow:auto; padding:20px;">
             <div style="max-width:860px; margin:0 auto; background:#111827; border-radius:8px;
-                        padding:20px; position:relative;">
-              <button id="pipeline-log-close" type="button" style="position:absolute;top:12px;right:16px;
-                      background:none;border:none;color:#9ca3af;font-size:20px;cursor:pointer;">✕</button>
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-                <h3 style="margin:0;color:#f9fafb;">Job Log</h3>
+                        padding:20px;">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+                <h3 style="margin:0;color:#f9fafb;flex:1;">Job Log</h3>
                 <button id="pipeline-log-copy" type="button" class="btn-small"
                         style="font-size:11px;padding:3px 10px;">⎘ Copy</button>
+                <button id="pipeline-log-close" type="button"
+                        style="background:none;border:none;color:#9ca3af;font-size:20px;cursor:pointer;line-height:1;padding:0 4px;">✕</button>
               </div>
               <pre id="pipeline-log-content" style="font-size:12px;color:#d1fae5;
                    white-space:pre-wrap;max-height:60vh;overflow-y:auto;"></pre>
             </div>
           </div>
 
+          <!-- ── Job photometry summary modal ── -->
+          <div id="job-phot-modal" style="display:none; position:fixed; inset:0;
+               background:rgba(0,0,0,.75); z-index:1000; overflow:auto; padding:20px;">
+            <div style="max-width:720px; margin:0 auto; background:#111827; border-radius:8px; padding:24px;">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+                <h3 id="job-phot-modal-title" style="margin:0;color:#f9fafb;flex:1;">📊 All measurements</h3>
+                <button id="job-phot-copy" type="button" class="btn-small"
+                        style="font-size:11px;padding:3px 12px;">⧉ Copy all</button>
+                <button id="job-phot-modal-close" type="button"
+                        style="background:none;border:none;color:#9ca3af;font-size:22px;cursor:pointer;line-height:1;padding:0 4px;">✕</button>
+              </div>
+              <div id="job-phot-modal-body" style="font-size:12px;"></div>
+            </div>
+          </div>
+
           <div id="pipeline-empty" class="seq-empty" style="display:none;">
             No pipeline jobs yet.
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <button id="btn-copy-all-measures" type="button" class="btn-small"
+                    style="display:none;color:#34d399;border-color:#065f46;font-size:12px;"
+                    title="Copy all measurements from all jobs">📊 Copy all measures</button>
           </div>
 
           <table id="pipeline-table" style="display:none;">
@@ -426,6 +448,77 @@
             <tbody id="results-tbody"></tbody>
           </table>
           <p id="results-empty" class="seq-empty">No stacked results yet.</p>
+        </div>
+
+        <!-- History tab -->
+        <div id="panel-history" class="tab-panel">
+          <h2>Measurement History</h2>
+
+          <!-- Search bar -->
+          <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:16px;">
+            <label style="font-size:12px;color:#9ca3af;display:flex;flex-direction:column;gap:4px;">
+              Target
+              <input id="hist-target" type="text" placeholder="e.g. sn_2026fvx"
+                     style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;
+                            border-radius:4px;padding:5px 8px;font-size:13px;width:160px;" />
+            </label>
+            <label style="font-size:12px;color:#9ca3af;display:flex;flex-direction:column;gap:4px;">
+              Filter
+              <select id="hist-filter"
+                      style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;
+                             border-radius:4px;padding:5px 8px;font-size:13px;">
+                <option value="">All</option>
+                <option value="G">G</option>
+                <option value="BP">BP</option>
+                <option value="RP">RP</option>
+                <option value="r">r</option>
+                <option value="i">i</option>
+              </select>
+            </label>
+            <label style="font-size:12px;color:#9ca3af;display:flex;flex-direction:column;gap:4px;">
+              From
+              <input id="hist-date-from" type="date"
+                     style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;
+                            border-radius:4px;padding:5px 8px;font-size:13px;" />
+            </label>
+            <label style="font-size:12px;color:#9ca3af;display:flex;flex-direction:column;gap:4px;">
+              To
+              <input id="hist-date-to" type="date"
+                     style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;
+                            border-radius:4px;padding:5px 8px;font-size:13px;" />
+            </label>
+            <button id="hist-search-btn" type="button"
+                    style="background:#1d4ed8;border:1px solid #3b82f6;color:#fff;
+                           border-radius:4px;padding:6px 16px;font-size:13px;cursor:pointer;">
+              Search
+            </button>
+            <button id="hist-copy-all-btn" type="button"
+                    style="background:none;border:1px solid #065f46;color:#34d399;
+                           border-radius:4px;padding:6px 12px;font-size:13px;cursor:pointer;"
+                    title="Copy all rows as CSV">
+              ⧉ Copy CSV
+            </button>
+          </div>
+
+          <p id="hist-empty" style="color:#6b7280;font-size:13px;">No results yet — run a search.</p>
+
+          <div style="overflow-x:auto;">
+          <table id="hist-table" style="display:none;font-size:12px;border-collapse:collapse;width:100%;">
+            <thead>
+              <tr style="color:#6b7280;border-bottom:1px solid #1e3a5f;">
+                <th style="text-align:left;padding:6px 8px;">Date</th>
+                <th style="text-align:left;padding:6px 8px;">Target</th>
+                <th style="text-align:center;padding:6px 8px;">Filter</th>
+                <th style="text-align:center;padding:6px 8px;">Frames</th>
+                <th style="text-align:right;padding:6px 8px;">MJD</th>
+                <th style="text-align:right;padding:6px 8px;">Aperture mag</th>
+                <th style="text-align:right;padding:6px 8px;">Subtraction mag</th>
+                <th style="text-align:center;padding:6px 8px;">STDWeb</th>
+              </tr>
+            </thead>
+            <tbody id="hist-tbody"></tbody>
+          </table>
+          </div>
         </div>
 
         <!-- Night Plan tab -->

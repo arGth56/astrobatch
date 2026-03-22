@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import queue
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -34,12 +35,12 @@ from flask_cors import CORS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CALIB_DIR    = PROJECT_ROOT / "calib"
-DATA_DIR     = PROJECT_ROOT / "data"
+DATA_DIR     = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 LOG_DIR      = PROJECT_ROOT / "logs"
 NAS_OUTPUT   = Path(os.environ.get("NAS_OUTPUT", "/mnt/nas/input/pyl/astro/output"))
 DB_PATH      = Path(os.environ.get(
     "NIGHTMANAGER_DB",
-    PROJECT_ROOT / "server" / "nightmanager.db"
+    PROJECT_ROOT / "nightmanager.db"
 ))
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -124,14 +125,36 @@ def update_job(job_id: int, status: str, error: str | None = None,
         log.error("DB update_job failed (job=%s status=%s): %s", job_id, status, exc)
 
 
-def create_result(job_id: int, filt: str, exposure: str, n_frames: int, target: str = "") -> int:
+def _ensure_phot_columns():
+    """Add photometry columns to pipeline_results if they don't exist yet."""
+    cols = [
+        ("obs_date",   "TEXT"),
+        ("mjd",        "REAL"),
+        ("mag_ap",     "REAL"),
+        ("magerr_ap",  "REAL"),
+        ("mag_sub",    "REAL"),
+        ("magerr_sub", "REAL"),
+        ("mag_sub_ul", "REAL"),
+    ]
+    with _db() as conn:
+        for col, typ in cols:
+            try:
+                conn.execute(f"ALTER TABLE pipeline_results ADD COLUMN {col} {typ}")
+            except Exception:
+                pass  # already exists
+
+_ensure_phot_columns()
+
+
+def create_result(job_id: int, filt: str, exposure: str, n_frames: int,
+                  target: str = "", obs_date: str | None = None) -> int:
     """Insert a pipeline_results row for one filter/target. Returns the new row id."""
     try:
         with _db() as conn:
             cur = conn.execute(
-                "INSERT INTO pipeline_results (job_id, filter, exposure, n_frames, status, target) "
-                "VALUES (?, ?, ?, ?, 'processing', ?)",
-                (job_id, filt, exposure, n_frames, target)
+                "INSERT INTO pipeline_results (job_id, filter, exposure, n_frames, status, target, obs_date) "
+                "VALUES (?, ?, ?, ?, 'processing', ?, ?)",
+                (job_id, filt, exposure, n_frames, target, obs_date)
             )
             return cur.lastrowid
     except Exception as exc:
@@ -141,7 +164,11 @@ def create_result(job_id: int, filt: str, exposure: str, n_frames: int, target: 
 
 def update_result(result_id: int, status: str, error: str | None = None,
                   stdweb_task_id: str | None = None, stdweb_url: str | None = None,
-                  frame_previews: list | None = None):
+                  frame_previews: list | None = None, stdweb_state: str | None = None,
+                  obs_date: str | None = None, mjd: float | None = None,
+                  mag_ap: float | None = None, magerr_ap: float | None = None,
+                  mag_sub: float | None = None, magerr_sub: float | None = None,
+                  mag_sub_ul: float | None = None):
     """Update a pipeline_results row."""
     import json as _json
     try:
@@ -149,13 +176,29 @@ def update_result(result_id: int, status: str, error: str | None = None,
             fields = ["status = ?", "updated_at = ?"]
             values: list = [status, _now()]
             if error is not None:
-                fields.append("error = ?");         values.append(error)
+                fields.append("error = ?");          values.append(error)
             if stdweb_task_id is not None:
                 fields.append("stdweb_task_id = ?"); values.append(stdweb_task_id)
             if stdweb_url is not None:
-                fields.append("stdweb_url = ?");    values.append(stdweb_url)
+                fields.append("stdweb_url = ?");     values.append(stdweb_url)
             if frame_previews is not None:
                 fields.append("frame_previews = ?"); values.append(_json.dumps(frame_previews))
+            if stdweb_state is not None:
+                fields.append("stdweb_state = ?");   values.append(stdweb_state)
+            if obs_date is not None:
+                fields.append("obs_date = ?");       values.append(obs_date)
+            if mjd is not None:
+                fields.append("mjd = ?");            values.append(mjd)
+            if mag_ap is not None:
+                fields.append("mag_ap = ?");         values.append(mag_ap)
+            if magerr_ap is not None:
+                fields.append("magerr_ap = ?");      values.append(magerr_ap)
+            if mag_sub is not None:
+                fields.append("mag_sub = ?");        values.append(mag_sub)
+            if magerr_sub is not None:
+                fields.append("magerr_sub = ?");     values.append(magerr_sub)
+            if mag_sub_ul is not None:
+                fields.append("mag_sub_ul = ?");     values.append(mag_sub_ul)
             values.append(result_id)
             conn.execute(
                 f"UPDATE pipeline_results SET {', '.join(fields)} WHERE id = ?",
@@ -207,19 +250,32 @@ def discover_cal_frames() -> tuple[dict, dict]:
 
 # ── FITS scanning ─────────────────────────────────────────────────────────────
 
+def _obj_slug(name: str) -> str:
+    """Normalise an object name to a slug for comparison: 'SN 2026fvx' → 'sn_2026fvx'."""
+    return name.strip().lower().replace(" ", "_")
+
+
 def scan_fits(fits_dir: Path, jlog: JobLogger,
-              selected_files: list[str] | None = None) -> dict:
+              selected_files: list[str] | None = None,
+              object_filter: str | None = None) -> tuple[dict, dict]:
     """
-    Scan fits_dir for FITS files grouped by (object, filter, exp_str).
-    If selected_files is provided, those paths are used directly — no rglob,
-    no path-matching: avoids all NFS/SMB path normalisation issues.
-    Returns: { (object_slug, filter, exp_str): [Path, ...] }
+    Scan fits_dir for FITS files grouped by (object_slug, filter, exp_str).
+    If selected_files is provided, those paths are used directly — no rglob.
+    If object_filter is provided (e.g. 'SN 2026fvx'), only groups whose
+    object slug matches are returned — critical for SNAPSHOT dirs with
+    multiple mixed targets.
+    Returns: (groups, raw_names)
+      groups    : { (slug, filter, exp_str): [Path, ...] }
+      raw_names : { slug: original_OBJECT_header }  e.g. 'sn_2026fvx' → 'SN 2026fvx'
     """
     folder_fallback = fits_dir.name
     if folder_fallback.upper() == "SNAPSHOT":
         folder_fallback = "unknown"
 
+    filter_slug = _obj_slug(object_filter) if object_filter else None
+
     groups: dict[tuple, list] = defaultdict(list)
+    raw_names: dict[str, str] = {}       # slug → first raw OBJECT seen
 
     def _classify(f: Path):
         """Read headers and add f to the right group."""
@@ -231,8 +287,12 @@ def scan_fits(fits_dir: Path, jlog: JobLogger,
             raw_obj = str(hdr.get("OBJECT", "")).strip()
             if not raw_obj or raw_obj.lower() in ("snapshot", "unknown", "none", ""):
                 raw_obj = folder_fallback
-            obj = raw_obj.lower().replace(" ", "_")
+            obj = _obj_slug(raw_obj)
+            # Skip if we're filtering to a specific target and this file doesn't match
+            if filter_slug and obj != filter_slug:
+                return
             groups[(obj, filt, exp_str)].append(f)
+            raw_names.setdefault(obj, raw_obj)   # keep first occurrence
         except Exception as exc:
             jlog.error(f"Cannot read {f.name}: {exc}")
 
@@ -247,10 +307,12 @@ def scan_fits(fits_dir: Path, jlog: JobLogger,
             for f in fits_dir.rglob(ext):
                 _classify(f)
 
+    if filter_slug:
+        jlog.info(f"  Object filter: '{object_filter}' (slug={filter_slug})")
     for (obj, filt, exp_str), files in groups.items():
         jlog.info(f"  Found {len(files)} frames  object={obj}  filter={filt}  exp={exp_str}s")
 
-    return dict(groups)
+    return dict(groups), raw_names
 
 # ── Work directory setup ──────────────────────────────────────────────────────
 
@@ -261,25 +323,43 @@ def prepare_work_dir(target: str, filt: str, exp_str: str, date_str: str,
 
     When clean_first=True (re-process a subset), remove existing science FITS
     from the work dir so only the selected files are present for Siril.
+    Uses up to 4 parallel copy threads to saturate NAS bandwidth.
     """
     work_folder = DATA_DIR / date_str / target / filt / f"{exp_str}s"
     work_folder.mkdir(parents=True, exist_ok=True)
 
     if clean_first:
-        # Remove old science files; keep _calib/, _previews/ and other subdirs
         for old in work_folder.glob("*.fit*"):
             old.unlink(missing_ok=True)
         jlog.info(f"  Work dir cleaned for re-processing subset")
 
     existing = {f.name for f in work_folder.glob("*.fit*")}
-    copied = 0
-    for src in files:
-        dst = work_folder / src.name
-        if src.name not in existing:
-            shutil.copy2(src, dst)
-            copied += 1
+    to_copy = [src for src in files if src.name not in existing]
 
-    jlog.info(f"  Work dir: {work_folder}  ({copied} new files, {len(files)} total)")
+    if not to_copy:
+        jlog.info(f"  Work dir: {work_folder}  (all {len(files)} files already present)")
+        return work_folder
+
+    jlog.info(f"  Work dir: {work_folder}")
+    jlog.info(f"  Copying {len(to_copy)} new file(s) of {len(files)} total…")
+
+    done_count = 0
+    lock = threading.Lock()
+
+    def _copy_one(src: Path):
+        nonlocal done_count
+        dst = work_folder / src.name
+        shutil.copy2(src, dst)
+        with lock:
+            done_count += 1
+            if done_count % 10 == 0 or done_count == len(to_copy):
+                jlog.info(f"    Copied {done_count}/{len(to_copy)} files…")
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(_copy_one, to_copy))
+
+    jlog.info(f"  Copy done — {len(to_copy)} file(s) copied to {work_folder}")
     return work_folder
 
 def finalise_work_dir(work_dir: Path, date_str: str, target: str,
@@ -496,7 +576,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
         lines = [
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
-            "register pp_i -interp=cu -framing=min",
+            "register pp_i -interp=cu",
             "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
             "load r_pp_i_stacked",
             "save res",
@@ -510,7 +590,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                 # too few frames remain.
                 register_lines = [
                     "requires 1.2.0", f'cd "{folder}"',
-                    "register pp_i -interp=cu -framing=min",
+                    "register pp_i -interp=cu",
                     "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
                     "load r_pp_i_stacked",
                     "save res",
@@ -599,25 +679,67 @@ def make_preview(fits_path: Path, jlog: JobLogger) -> Path | None:
 # ── Plate solving ─────────────────────────────────────────────────────────────
 
 def plate_solve(res_fit: Path, jlog: JobLogger) -> bool:
-    """Run astrometry.net solve-field on res.fit. Returns True if WCS written."""
+    """Run astrometry.net solve-field on res.fit, write WCS into the file.
+    Returns True if a valid WCS was obtained and written."""
     jlog.info("  Plate solving...")
     try:
         import sys
         if str(PROJECT_ROOT) not in sys.path:
             sys.path.insert(0, str(PROJECT_ROOT))
         from astrobatch.spliter import PlateSolver
+        from astropy.io import fits as _fits
+
         solver = PlateSolver()
-        wcs = solver.solve_field(str(res_fit))
-        if wcs is None:
-            jlog.error("Plate solve failed — no WCS solution")
+        result = solver.solve_field(str(res_fit))
+
+        # solve_field returns (WCS, source_data) or (None, None) on failure
+        solved_wcs = result[0] if isinstance(result, tuple) else result
+
+        if solved_wcs is None:
+            jlog.error("  Plate solve failed — no WCS solution")
             return False
-        jlog.info("  WCS solution written to res.fit")
+
+        # Write the WCS header keywords back into res.fit in-place
+        wcs_header = solved_wcs.to_header(relax=True)
+        with _fits.open(str(res_fit), mode="update") as hdul:
+            hdr = hdul[0].header
+            # Remove old broken WCS keys before writing the new solution
+            for key in ("CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
+                        "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+                        "CDELT1", "CDELT2", "CTYPE1", "CTYPE2",
+                        "CUNIT1", "CUNIT2", "PC1_1", "PC1_2", "PC2_1", "PC2_2"):
+                hdr.remove(key, ignore_missing=True, remove_all=True)
+            hdr.update(wcs_header)
+            hdul.flush()
+
+        jlog.info(f"  WCS written to res.fit (CRVAL1={wcs_header.get('CRVAL1', '?'):.4f}, "
+                  f"CRVAL2={wcs_header.get('CRVAL2', '?'):.4f})")
         return True
     except Exception as exc:
-        jlog.error(f"Plate solve error: {exc}")
+        jlog.error(f"  Plate solve error: {exc}")
         return False
 
 # ── STDWeb upload + pipeline ───────────────────────────────────────────────────
+
+def _read_fits_radec(fits_path: Path) -> tuple[float, float] | tuple[None, None]:
+    """Read telescope pointing RA/DEC from FITS header. Returns (ra_deg, dec_deg) or (None, None)."""
+    try:
+        from astropy.io import fits as _fits
+        h = _fits.getheader(str(fits_path))
+        ra  = h.get("RA")  or h.get("CRVAL1") or h.get("OBJCTRA")
+        dec = h.get("DEC") or h.get("CRVAL2") or h.get("OBJCTDEC")
+        if ra is None or dec is None:
+            return None, None
+        # Convert sexagesimal strings to degrees if needed
+        if isinstance(ra, str):
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            c = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.deg))
+            return float(c.ra.deg), float(c.dec.deg)
+        return float(ra), float(dec)
+    except Exception:
+        return None, None
+
 
 def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger,
                   target: str | None = None) -> str | None:
@@ -635,6 +757,16 @@ def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger,
         ]
         if target:
             cmd += ["-F", f"target={target}"]
+        # Pass telescope pointing as blind-match hint so STDWeb doesn't need
+        # to resolve the target name via external APIs (Fink/TNS SSL issues).
+        ra, dec = _read_fits_radec(res_fit)
+        if ra is not None:
+            center_str = f"{ra:.6f} {dec:+.6f}"
+            cmd += [
+                "-F", f"blind_match_center={center_str}",
+                "-F", "blind_match_sr0=1.0",
+            ]
+            jlog.info(f"  blind_match_center={center_str}")
         cmd.append(f"{STDWEB_URL}/api/tasks/upload/")
         # -w outputs HTTP status code after the body
         cmd_with_status = cmd[:-1] + ["-w", "\nHTTP_STATUS:%{http_code}", cmd[-1]]
@@ -669,7 +801,7 @@ def stdweb_action(task_id: str, action: str, jlog: JobLogger,
     elif action == "photometry":
         payload.update({"sn": 10, "catalog": "gaiadr2"})
     elif action == "subtract":
-        payload.update({"template": "ps1"})
+        payload.update({"template": os.environ.get("STDWEB_TEMPLATE", "ztf")})
     if extra:
         payload.update(extra)
     try:
@@ -717,11 +849,13 @@ def _detect_date(fits_path: Path) -> str:
 
 
 def run_pipeline(job_id: int, fits_dir: str, target: str,
-                 selected_files: list[str] | None = None):
+                 selected_files: list[str] | None = None,
+                 object_filter: str | None = None):
     """Full pipeline — runs in a background thread."""
     jlog = JobLogger(job_id)
     try:
-        _run_pipeline(job_id, fits_dir, target, jlog, selected_files=selected_files)
+        _run_pipeline(job_id, fits_dir, target, jlog,
+                      selected_files=selected_files, object_filter=object_filter)
     except Exception as exc:
         log.exception("Unhandled exception in job %s", job_id)
         jlog.error(f"UNHANDLED EXCEPTION: {exc}")
@@ -730,10 +864,190 @@ def run_pipeline(job_id: int, fits_dir: str, target: str,
         jlog.close()
 
 
+# Steps in order; used by resume to skip already-done work
+PIPELINE_STEP_ORDER = ["calibrate", "solve", "upload", "inspect", "photometry", "subtraction"]
+
+
+def resume_pipeline(result_id: int, from_step: str):
+    """Resume a single pipeline result from a given step, in a background thread."""
+    with sqlite3.connect(str(DB_PATH), timeout=10) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM pipeline_results WHERE id=?", (result_id,))
+        row = cur.fetchone()
+        result = dict(row) if row else None
+
+    if not result:
+        log.error("resume_pipeline: result %s not found", result_id)
+        return
+
+    job_id = result["job_id"]
+    with sqlite3.connect(str(DB_PATH), timeout=10) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute("SELECT * FROM pipeline_jobs WHERE id=?", (job_id,))
+        row = cur.fetchone()
+        job = dict(row) if row else None
+
+    if not job:
+        log.error("resume_pipeline: job %s not found", job_id)
+        return
+
+    jlog = JobLogger(job_id)
+    try:
+        _resume_pipeline(result, job, from_step, jlog)
+    except Exception as exc:
+        log.exception("Unhandled exception resuming result %s from %s", result_id, from_step)
+        jlog.error(f"UNHANDLED EXCEPTION: {exc}")
+        update_result(result_id, "error", error=str(exc))
+    finally:
+        jlog.close()
+
+
+def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
+    result_id = result["id"]
+    job_id    = result["job_id"]
+    filt      = result["filter"] or "?"
+    exp_str   = result["exposure"] or "?"
+    obj       = result["target"] or job["target"] or "unknown"
+    date_str  = result.get("obs_date") or _detect_date(Path(job["fits_dir"]))
+
+    jlog.info(f"=== Resuming result {result_id} from step '{from_step}' ===")
+    jlog.info(f"  object={obj}  filter={filt}  exp={exp_str}s")
+
+    # Clear previous error explicitly and reset job to running
+    try:
+        with _db() as conn:
+            conn.execute("UPDATE pipeline_results SET status='processing', error=NULL, updated_at=? WHERE id=?",
+                         (_now(), result_id))
+            conn.execute("UPDATE pipeline_jobs SET status='uploading', error=NULL, updated_at=? WHERE id=?",
+                         (_now(), job_id))
+    except Exception as exc:
+        log.error("resume clear error failed: %s", exc)
+
+    step_idx = PIPELINE_STEP_ORDER.index(from_step) if from_step in PIPELINE_STEP_ORDER else 0
+
+    # ── calibrate ─────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("calibrate"):
+        fits_path = Path(job["fits_dir"])
+        groups, raw_names = scan_fits(fits_path, jlog, object_filter=obj)
+        key = next((k for k in groups if k[0] == obj and k[1] == filt), None)
+        if not key:
+            update_result(result_id, "error", error="No matching FITS files found for re-calibration")
+            update_job(job_id, "error", error="No matching FITS files found for re-calibration")
+            return
+        files = groups[key]
+
+        darks, flats = discover_cal_frames()
+        work_dir = prepare_work_dir(obj, filt, exp_str, date_str, files, jlog)
+
+        flat_key  = FILTER_FLAT_MAP.get(filt.upper(), filt.upper())
+        flat_path = flats.get(flat_key)
+        dark_path = darks.get(exp_str)
+
+        update_result(result_id, "calibrating")
+        update_job(job_id, "calibrating")
+        ok, frame_previews = run_siril(work_dir, flat_path, dark_path, len(files), jlog,
+                                       source_files=files)
+        if not ok:
+            err_msg = "No stars found — see frame previews" if frame_previews else "Siril calibration failed"
+            update_result(result_id, "error", error=err_msg,
+                          frame_previews=frame_previews if frame_previews else None)
+            update_job(job_id, "error", error=err_msg)
+            return
+
+        res_fit = work_dir / "res.fit"
+        make_preview(res_fit, jlog)
+        from_step = "solve"
+        step_idx  = PIPELINE_STEP_ORDER.index("solve")
+    else:
+        # Work dir must already exist
+        work_dir = DATA_DIR / date_str / obj / filt / f"{exp_str}s"
+        res_fit  = work_dir / "res.fit"
+        if not res_fit.exists():
+            update_result(result_id, "error", error=f"Stacked file missing: {res_fit}")
+            update_job(job_id, "error", error=f"Stacked file missing: {res_fit}")
+            return
+
+    # ── solve ─────────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("solve"):
+        update_result(result_id, "solving")
+        update_job(job_id, "solving")
+        jlog.info("Plate solving…")
+        solve_ok = plate_solve(res_fit, jlog)
+        if not solve_ok:
+            jlog.info("  Plate solve failed — continuing without WCS")
+        from_step = "upload"
+        step_idx  = PIPELINE_STEP_ORDER.index("upload")
+
+    # ── upload ────────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("upload"):
+        update_result(result_id, "uploading")
+        update_job(job_id, "uploading")
+        jlog.info("Uploading to STDWeb…")
+        fits_path  = Path(job["fits_dir"])
+        _, raw_names = scan_fits(fits_path, jlog, object_filter=obj)
+        raw_obj     = raw_names.get(obj, obj.replace('_', ' ').title())
+        target_clean = raw_obj.replace(' ', '')
+        title        = f"{raw_obj} {filt} {exp_str}s {date_str}"
+        jlog.info(f"  STDWeb target: '{target_clean}'")
+        task_id = stdweb_upload(res_fit, title, jlog, target=target_clean)
+        if not task_id:
+            update_result(result_id, "error", error="STDWeb upload failed")
+            update_job(job_id, "error", error="STDWeb upload failed")
+            return
+        task_url = f"{STDWEB_URL}/tasks/{task_id}"
+        update_result(result_id, "uploaded", stdweb_task_id=task_id, stdweb_url=task_url)
+        from_step = "inspect"
+        step_idx  = PIPELINE_STEP_ORDER.index("inspect")
+    else:
+        task_id  = result.get("stdweb_task_id")
+        task_url = result.get("stdweb_url") or (f"{STDWEB_URL}/tasks/{task_id}" if task_id else None)
+        if not task_id:
+            update_result(result_id, "error", error="No STDWeb task ID — re-run from upload")
+            update_job(job_id, "error", error="No STDWeb task ID — re-run from upload")
+            return
+
+    # ── inspect ───────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("inspect"):
+        update_result(result_id, "inspecting")
+        jlog.info("Triggering inspection…")
+        stdweb_action(task_id, "inspect", jlog)
+        state = wait_state(task_id, ["inspect_done", "inspect_failed", "failed", "error"], jlog, timeout=300)
+        jlog.info(f"  Inspection state: {state}")
+        if state in ("inspect_failed", "failed", "error", "timeout"):
+            update_result(result_id, "error", error=f"Inspection {state}")
+            update_job(job_id, "error", error=f"Inspection {state}")
+            return
+        from_step = "photometry"
+        step_idx  = PIPELINE_STEP_ORDER.index("photometry")
+
+    # ── photometry ────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("photometry"):
+        update_result(result_id, "photometry")
+        jlog.info("Triggering photometry…")
+        stdweb_action(task_id, "photometry", jlog)
+        wait_state(task_id, ["photometry_done", "done", "completed", "failed", "error"], jlog, timeout=600)
+        from_step = "subtraction"
+        step_idx  = PIPELINE_STEP_ORDER.index("subtraction")
+
+    # ── subtraction ───────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("subtraction"):
+        update_result(result_id, "subtraction")
+        jlog.info("Triggering template subtraction…")
+        stdweb_action(task_id, "subtraction", jlog)
+        wait_state(task_id, ["subtraction_done", "done", "completed", "failed", "error"], jlog, timeout=600)
+
+    update_result(result_id, "done", stdweb_task_id=task_id, stdweb_url=task_url)
+    update_job(job_id, "done")
+    jlog.info(f"=== Resume of result {result_id} complete ===")
+
+
 def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
-                  selected_files: list[str] | None = None):
+                  selected_files: list[str] | None = None,
+                  object_filter: str | None = None):
     jlog.info(f"=== Job {job_id} started ===")
     jlog.info(f"Input dir : {fits_dir}")
+    if object_filter:
+        jlog.info(f"Object    : {object_filter} (filtering to this target only)")
     if selected_files:
         jlog.info(f"Selected  : {len(selected_files)} specific file(s)")
 
@@ -746,7 +1060,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
     # ── Step 1: Scan ──────────────────────────────────────────────────────────
     update_job(job_id, "scanning")
     jlog.info("Step 1: Scanning FITS files...")
-    groups = scan_fits(fits_path, jlog, selected_files=selected_files)
+    groups, raw_names = scan_fits(fits_path, jlog, selected_files=selected_files,
+                                  object_filter=object_filter)
     if not groups:
         update_job(job_id, "error", error="No valid FITS files found")
         jlog.error("No FITS files found")
@@ -762,7 +1077,7 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         jlog.info(f"\n--- Processing object={obj}  filter={filt}  exp={exp_str}s ({len(files)} frames) ---")
 
         # Create a per-result row immediately
-        result_id = create_result(job_id, filt, exp_str, len(files), target=obj)
+        result_id = create_result(job_id, filt, exp_str, len(files), target=obj, obs_date=date_str)
 
         # ── Step 2: Copy to work dir ──────────────────────────────────────────
         update_job(job_id, "splitting")
@@ -825,8 +1140,12 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         update_job(job_id, "uploading")
         update_result(result_id, "uploading")
         jlog.info("Step 5: Uploading to STDWeb...")
-        title = f"{obj.replace('_', ' ')} {filt} {exp_str}s {date_str}"
-        target_clean = obj.replace('_', '').replace(' ', '')  # e.g. "AT2026FTZ"
+        # Use original OBJECT header so STDWeb gets the proper TNS name
+        # e.g. raw "SN 2026fvx" → target "SN2026fvx",  "AT 2026fuh" → "AT2026fuh"
+        raw_obj = raw_names.get(obj, obj.replace('_', ' ').title())
+        title = f"{raw_obj} {filt} {exp_str}s {date_str}"
+        target_clean = raw_obj.replace(' ', '')   # "SN 2026fvx" → "SN2026fvx"
+        jlog.info(f"  STDWeb target: '{target_clean}'")
         task_id = stdweb_upload(res_fit, title, jlog, target=target_clean)
 
         if not task_id:
@@ -834,7 +1153,7 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
             update_result(result_id, "error", error="STDWeb upload failed")
             continue
 
-        task_url = f"{STDWEB_URL}/tasks/{task_id}/"
+        task_url = f"{STDWEB_URL}/tasks/{task_id}"
         update_result(result_id, "uploaded", stdweb_task_id=task_id, stdweb_url=task_url)
         # Keep the job's stdweb fields pointing to the most recent upload
         update_job(job_id, "uploading", stdweb_task_id=task_id, stdweb_url=task_url)
@@ -843,9 +1162,11 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         jlog.info("Step 6: Triggering inspection...")
         update_result(result_id, "inspecting")
         stdweb_action(task_id, "inspect", jlog)
-        state = wait_state(task_id, ["inspect_done", "failed", "error"], jlog, timeout=300)
+        state = wait_state(task_id,
+                           ["inspect_done", "inspect_failed", "failed", "error"],
+                           jlog, timeout=300)
         jlog.info(f"  Inspection state: {state}")
-        if state in ("failed", "error", "timeout"):
+        if state in ("inspect_failed", "failed", "error", "timeout"):
             jlog.error(f"  Inspection did not complete (state={state}) — aborting STDWeb steps")
             update_result(result_id, "error", error=f"Inspection {state}")
             continue
@@ -887,11 +1208,143 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         update_job(job_id, "error", error="All groups failed")
         jlog.error(f"\n=== Job {job_id} failed ===")
 
+# ── Sequential job queue ──────────────────────────────────────────────────────
+# A single worker thread drains this queue so jobs run one at a time.
+# Each item is a callable (no arguments) that runs the full pipeline/resume.
+_job_queue: queue.Queue = queue.Queue()
+_worker_lock = threading.Lock()   # ensures only one worker spawned at a time
+
+
+def _queue_worker():
+    log.info("Pipeline worker thread started")
+    while True:
+        try:
+            task = _job_queue.get(timeout=5)   # timeout so we can check if we should keep running
+        except queue.Empty:
+            continue
+        try:
+            task()
+        except BaseException as exc:           # catch SystemExit / KeyboardInterrupt too
+            log.exception("Unhandled exception in queue worker task: %s", exc)
+        finally:
+            try:
+                _job_queue.task_done()
+            except Exception:
+                pass
+    log.warning("Pipeline worker thread exiting — watchdog will restart")
+
+
+def _ensure_worker():
+    """Start or restart the worker thread if it is not alive."""
+    global _worker_thread
+    with _worker_lock:
+        if not _worker_thread.is_alive():
+            log.warning("Pipeline worker thread is dead — restarting")
+            _worker_thread = threading.Thread(
+                target=_queue_worker, daemon=True, name="pipeline-worker"
+            )
+            _worker_thread.start()
+
+
+def _watchdog():
+    """Periodically check the worker thread is alive and restart if needed."""
+    while True:
+        time.sleep(10)
+        _ensure_worker()
+
+
+_worker_thread = threading.Thread(target=_queue_worker, daemon=True, name="pipeline-worker")
+_worker_thread.start()
+threading.Thread(target=_watchdog, daemon=True, name="pipeline-watchdog").start()
+
+
+def _recover_queued_jobs():
+    """On startup, re-enqueue any jobs that were left in a running/queued state
+    because the service was restarted mid-execution.
+    
+    - 'queued': waiting to start → re-enqueue as-is
+    - 'scanning'/'splitting'/'calibrating'/'solving'/'uploading'/'inspecting'/
+      'photometrizing'/'subtracting': were running when service crashed → re-enqueue
+      (they will restart from scratch; this is safe because prepare_work_dir skips
+       already-copied files)
+    """
+    RECOVERABLE = {'queued', 'scanning', 'splitting', 'calibrating', 'solving',
+                   'uploading', 'inspecting', 'photometrizing', 'subtracting'}
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT id, fits_dir, target, target_filter, status FROM pipeline_jobs "
+                "WHERE status IN ({}) ORDER BY id ASC".format(
+                    ",".join("?" * len(RECOVERABLE))),
+                tuple(RECOVERABLE)
+            ).fetchall()
+        if not rows:
+            return
+        log.info("Recovering %d interrupted job(s) from DB", len(rows))
+        for row in rows:
+            job_id, fits_dir, target, target_filter, old_status = row
+            if not fits_dir or not Path(fits_dir).exists():
+                log.warning("Skipping job %s — fits_dir missing: %s", job_id, fits_dir)
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE pipeline_jobs SET status='error', error='Directory not found on recovery' WHERE id=?",
+                        (job_id,)
+                    )
+                continue
+            # Don't re-run jobs that already have all results done
+            with _db() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM pipeline_results WHERE job_id=?", (job_id,)
+                ).fetchone()[0]
+                done  = conn.execute(
+                    "SELECT COUNT(*) FROM pipeline_results WHERE job_id=? AND status='done'",
+                    (job_id,)
+                ).fetchone()[0]
+            if total > 0 and done == total:
+                log.info("  Skipping job %s — all %d result(s) already done", job_id, done)
+                with _db() as conn:
+                    conn.execute(
+                        "UPDATE pipeline_jobs SET status='done', error=NULL WHERE id=?",
+                        (job_id,)
+                    )
+                continue
+
+            log.info("  Re-queuing job %s (%s) [was: %s]", job_id, target, old_status)
+            # Reset any stuck result rows so the pipeline re-runs them cleanly
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE pipeline_results SET status='queued', error=NULL "
+                    "WHERE job_id=? AND status NOT IN ('done')",
+                    (job_id,)
+                )
+                conn.execute(
+                    "UPDATE pipeline_jobs SET status='queued', error=NULL WHERE id=?",
+                    (job_id,)
+                )
+            # For SNAPSHOT folders, object_filter must match the job's target so we
+            # don't inadvertently process every object in the directory.
+            is_snapshot = fits_dir and Path(fits_dir).name.upper() == "SNAPSHOT"
+            obj_filter = (target_filter or target) if is_snapshot else None
+            _job_queue.put(lambda jid=int(job_id), fd=fits_dir, t=target or "Unknown",
+                                  of=obj_filter:
+                           run_pipeline(jid, fd, t, object_filter=of))
+    except Exception as exc:
+        log.error("Job recovery failed: %s", exc)
+
+
+# Run recovery after a short delay so Flask has fully started
+threading.Timer(2.0, _recover_queued_jobs).start()
+
 # ── Flask routes ───────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "processing_service"})
+    return jsonify({
+        "status": "ok",
+        "service": "processing_service",
+        "queue_depth": _job_queue.qsize(),
+        "worker_alive": _worker_thread.is_alive(),
+    })
 
 
 @app.route("/process", methods=["POST"])
@@ -901,6 +1354,9 @@ def trigger():
     fits_dir       = data.get("fits_dir") or ""
     target         = data.get("target") or (Path(fits_dir).name if fits_dir else "") or "Unknown"
     selected_files = data.get("selected_files") or None  # list of abs paths, or None
+    # object_filter: when set, only FITS files whose OBJECT header matches this
+    # name are processed — prevents SNAPSHOT dirs from processing all targets.
+    object_filter  = data.get("object_filter") or None
 
     if not job_id or not fits_dir:
         return jsonify({"success": False, "error": "job_id and fits_dir are required"}), 400
@@ -908,15 +1364,33 @@ def trigger():
     if not Path(fits_dir).exists():
         return jsonify({"success": False, "error": f"Directory not found: {fits_dir}"}), 400
 
-    thread = threading.Thread(
-        target=run_pipeline,
-        args=(int(job_id), fits_dir, target),
-        kwargs={"selected_files": selected_files},
-        daemon=True,
-    )
-    thread.start()
+    _job_queue.put(lambda jid=int(job_id), fd=fits_dir, t=target,
+                              sf=selected_files, of=object_filter:
+                   run_pipeline(jid, fd, t, selected_files=sf, object_filter=of))
 
-    return jsonify({"success": True, "job_id": job_id, "message": "Pipeline started"})
+    queue_pos = _job_queue.qsize()
+    return jsonify({"success": True, "job_id": job_id,
+                    "message": "Queued" if queue_pos > 1 else "Started",
+                    "queue_position": queue_pos})
+
+
+@app.route("/resume", methods=["POST"])
+def resume():
+    data       = request.json or {}
+    result_id  = data.get("result_id")
+    from_step  = data.get("from_step")
+
+    if not result_id or not from_step:
+        return jsonify({"success": False, "error": "result_id and from_step are required"}), 400
+    if from_step not in PIPELINE_STEP_ORDER:
+        return jsonify({"success": False, "error": f"Invalid step. Valid: {PIPELINE_STEP_ORDER}"}), 400
+
+    _job_queue.put(lambda rid=int(result_id), fs=from_step:
+                   resume_pipeline(rid, fs))
+
+    queue_pos = _job_queue.qsize()
+    return jsonify({"success": True, "result_id": result_id, "from_step": from_step,
+                    "queue_position": queue_pos})
 
 
 @app.route("/jobs/<int:job_id>/log", methods=["GET"])
@@ -927,9 +1401,146 @@ def job_log(job_id: int):
     return jsonify({"success": True, "log": log_path.read_text()})
 
 
+# ── Background STDWeb poller ───────────────────────────────────────────────────
+# Runs independently of pipeline threads — survives service restarts.
+# Every 30 s it fetches the state of every pipeline_result that has a
+# stdweb_task_id and hasn't reached a terminal status yet.
+
+_STDWEB_TERMINAL = {
+    "done", "completed",
+    "subtraction_done",
+    "inspect_failed", "failed", "error",
+}
+
+# Map raw STDWeb state → our pipeline_results.status
+_STDWEB_STATE_MAP = {
+    "inspect_done":     "photometry",
+    "photometry_done":  "subtraction",
+    "subtraction_done": "done",
+    "done":             "done",
+    "completed":        "done",
+    "inspect_failed":   "error",
+    "failed":           "error",
+    "error":            "error",
+}
+
+def _fetch_stdweb_photometry(task_id: str) -> dict:
+    """Scrape MJD and magnitude measurements from a STDWeb task page.
+
+    Returns a dict with keys: filter, mjd, direct (mag/magerr), sub (mag/magerr),
+    sub_ul (ul), target — any of which may be None/absent if not available.
+    """
+    try:
+        task_json = requests.get(
+            f"{STDWEB_URL}/api/tasks/{task_id}/",
+            headers={"Authorization": f"Token {STDWEB_TOKEN}"},
+            timeout=10,
+        ).json()
+    except Exception:
+        task_json = {}
+
+    try:
+        html = requests.get(
+            f"{STDWEB_URL}/tasks/{task_id}",
+            headers={"Authorization": f"Token {STDWEB_TOKEN}"},
+            timeout=20,
+        ).text
+    except Exception:
+        html = ""
+
+    filt   = task_json.get("config", {}).get("filter")
+    target = task_json.get("config", {}).get("target")
+
+    mjd_m     = re.search(r"MJD is ([\d.]+)", html)
+    direct_m  = re.search(r"Primary target magnitude is \w+ = ([\d.]+) \+/- ([\d.]+)", html)
+    sub_m     = re.search(r"Target magnitude is \w+ = ([\d.]+) \+/- ([\d.]+)", html)
+    sub_ul_m  = re.search(r"Target magnitude upper limit is \w+ > ([\d.]+)", html) if not sub_m else None
+
+    return {
+        "filter":  filt,
+        "target":  target,
+        "mjd":     float(mjd_m.group(1))    if mjd_m    else None,
+        "direct":  {"mag": float(direct_m.group(1)), "magerr": float(direct_m.group(2))} if direct_m else None,
+        "sub":     {"mag": float(sub_m.group(1)),    "magerr": float(sub_m.group(2))}    if sub_m    else None,
+        "sub_ul":  float(sub_ul_m.group(1)) if sub_ul_m else None,
+    }
+
+
+def _stdweb_poller_loop():
+    """Background thread: polls STDWeb for all live tasks every 30 s.
+    When a task reaches a terminal state it also fetches photometry measurements
+    and persists them into pipeline_results so history is available offline.
+    """
+    while True:
+        time.sleep(30)
+        try:
+            with _db() as conn:
+                rows = conn.execute(
+                    """SELECT id, stdweb_task_id, status, mjd
+                       FROM pipeline_results
+                       WHERE stdweb_task_id IS NOT NULL
+                         AND status NOT IN ('done', 'error')"""
+                ).fetchall()
+            for (result_id, task_id, cur_status, stored_mjd) in rows:
+                try:
+                    r = requests.get(
+                        f"{STDWEB_URL}/api/tasks/{task_id}/",
+                        headers={"Authorization": f"Token {STDWEB_TOKEN}"},
+                        timeout=10,
+                    )
+                    raw_state = r.json().get("state", "unknown")
+                    new_status = _STDWEB_STATE_MAP.get(raw_state)
+                    reaching_terminal = (
+                        new_status in ("done", "error") and new_status != cur_status
+                    )
+
+                    if new_status and new_status != cur_status:
+                        update_result(result_id, new_status, stdweb_state=raw_state,
+                                      error=(raw_state if new_status == "error" else None))
+                        log.info("[poller] result %s task %s: %s → %s (stdweb=%s)",
+                                 result_id, task_id, cur_status, new_status, raw_state)
+                    elif raw_state not in ("unknown",):
+                        update_result(result_id, cur_status, stdweb_state=raw_state)
+
+                    # Fetch and persist photometry when newly done (and not yet stored)
+                    if raw_state == "subtraction_done" and stored_mjd is None:
+                        try:
+                            phot = _fetch_stdweb_photometry(task_id)
+                            kwargs: dict = {}
+                            if phot.get("mjd"):
+                                kwargs["mjd"] = phot["mjd"]
+                                # Derive obs_date from MJD (approx)
+                                from astropy.time import Time as _ATime
+                                kwargs["obs_date"] = _ATime(phot["mjd"], format="mjd").to_datetime().strftime("%Y-%m-%d")
+                            if phot.get("direct"):
+                                kwargs["mag_ap"]    = phot["direct"]["mag"]
+                                kwargs["magerr_ap"] = phot["direct"]["magerr"]
+                            if phot.get("sub"):
+                                kwargs["mag_sub"]    = phot["sub"]["mag"]
+                                kwargs["magerr_sub"] = phot["sub"]["magerr"]
+                            elif phot.get("sub_ul") is not None:
+                                kwargs["mag_sub_ul"] = phot["sub_ul"]
+                            if kwargs:
+                                update_result(result_id, new_status or cur_status,
+                                              stdweb_state=raw_state, **kwargs)
+                                log.info("[poller] stored photometry for result %s task %s: %s",
+                                         result_id, task_id, kwargs)
+                        except Exception as exc:
+                            log.warning("[poller] photometry fetch failed result %s: %s", result_id, exc)
+                except Exception as exc:
+                    log.warning("[poller] result %s task %s: %s", result_id, task_id, exc)
+        except Exception as exc:
+            log.warning("[poller] DB error: %s", exc)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PROCESSING_PORT", 5200))
     log.info(f"Processing service starting on port {port}")
     log.info(f"DB path : {DB_PATH}")
     log.info(f"STDWeb  : {STDWEB_URL}")
+
+    poller = threading.Thread(target=_stdweb_poller_loop, daemon=True, name="stdweb-poller")
+    poller.start()
+    log.info("STDWeb background poller started")
+
     app.run(host="0.0.0.0", port=port, debug=False)
