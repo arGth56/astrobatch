@@ -10,6 +10,7 @@ const tabDomeBtn     = document.getElementById("tab-dome");
 const tabTargetBtn   = document.getElementById("tab-target");
 const tabTodoBtn     = document.getElementById("tab-todo");
 const tabPipelineBtn  = document.getElementById("tab-pipeline");
+const tabHistoryBtn   = document.getElementById("tab-history");
 const tabNightPlanBtn = document.getElementById("tab-nightplan");
 const panelDevices    = document.getElementById("panel-devices");
 const panelActions    = document.getElementById("panel-actions");
@@ -17,6 +18,7 @@ const panelDome       = document.getElementById("panel-dome");
 const panelTarget     = document.getElementById("panel-target");
 const panelTodo       = document.getElementById("panel-todo");
 const panelPipeline   = document.getElementById("panel-pipeline");
+const panelHistory    = document.getElementById("panel-history");
 const panelNightPlan  = document.getElementById("panel-nightplan");
 
 const cameraCaptureForm = document.getElementById("camera-capture-form");
@@ -70,7 +72,7 @@ function setLog(value) {
 }
 
 function setActiveTab(tab) {
-  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, nightplan: false };
+  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false, nightplan: false };
   tabs[tab] = true;
   tabDevicesBtn.classList.toggle("active",   tabs.devices);
   tabActionsBtn.classList.toggle("active",   tabs.actions);
@@ -78,6 +80,7 @@ function setActiveTab(tab) {
   tabTargetBtn.classList.toggle("active",    tabs.target);
   tabTodoBtn.classList.toggle("active",      tabs.todo);
   tabPipelineBtn.classList.toggle("active",  tabs.pipeline);
+  tabHistoryBtn.classList.toggle("active",   tabs.history);
   tabNightPlanBtn.classList.toggle("active", tabs.nightplan);
   panelDevices.classList.toggle("active",    tabs.devices);
   panelActions.classList.toggle("active",    tabs.actions);
@@ -85,6 +88,7 @@ function setActiveTab(tab) {
   panelTarget.classList.toggle("active",     tabs.target);
   panelTodo.classList.toggle("active",       tabs.todo);
   panelPipeline.classList.toggle("active",   tabs.pipeline);
+  panelHistory.classList.toggle("active",    tabs.history);
   panelNightPlan.classList.toggle("active",  tabs.nightplan);
 
   if (tab === "nightplan") {
@@ -891,6 +895,7 @@ window.addEventListener("resize", () => {
 });
 
 tabPipelineBtn.addEventListener("click",  () => setActiveTab("pipeline"));
+tabHistoryBtn.addEventListener("click",   () => { setActiveTab("history"); loadHistory(); });
 tabNightPlanBtn.addEventListener("click", () => setActiveTab("nightplan"));
 
 // ── Target History ────────────────────────────────────────────────────────────
@@ -1004,70 +1009,96 @@ const JOB_STATUS_STEPS = {
 
 // ── NAS date / target picker ──────────────────────────────────────────────────
 
-let nasTree = [];
-
 async function loadNasDates() {
-  const dateSel   = document.getElementById("pipeline-date-select");
-  const targetSel = document.getElementById("pipeline-target-select");
-  const fitsInput = document.getElementById("pipeline-fits-dir");
+  const dateSel    = document.getElementById("pipeline-date-select");
+  const targetSel  = document.getElementById("pipeline-target-select");
+  const fitsInput  = document.getElementById("pipeline-fits-dir");
   const targetInput = document.getElementById("pipeline-target");
 
-  dateSel.innerHTML = '<option value="">Loading…</option>';
+  // ── Step 1: load the date list (fast — no FITS reading) ──────────────────
+  dateSel.disabled = true;
+  dateSel.innerHTML = '<option value="">⏳ Loading nights…</option>';
+  targetSel.style.display = "none";
 
   try {
     const res  = await fetch("/api/pipeline/nas-dates");
     const data = await res.json();
-    nasTree = data.tree || [];
+    const dates = data.dates || [];
 
-    dateSel.innerHTML = '<option value="">— pick a date —</option>';
-    for (const entry of nasTree) {
+    dateSel.innerHTML = '<option value="">— pick a night —</option>';
+    for (const date of dates) {
       const opt = document.createElement("option");
-      opt.value = entry.date;
-      opt.textContent = entry.date + (entry.targets.length ? ` (${entry.targets.length} target${entry.targets.length > 1 ? "s" : ""})` : "");
+      opt.value = date;
+      opt.textContent = date;
       dateSel.appendChild(opt);
     }
-    if (!nasTree.length) {
+    if (!dates.length) {
       dateSel.innerHTML = '<option value="">No data on NAS</option>';
     }
   } catch {
     dateSel.innerHTML = '<option value="">NAS unavailable</option>';
   }
+  dateSel.disabled = false;
 
-  // When date changes, populate target selector
-  dateSel.addEventListener("change", () => {
-    const entry = nasTree.find((e) => e.date === dateSel.value);
+  // ── Step 2: when a night is chosen, scan that folder for targets ──────────
+  dateSel.addEventListener("change", async () => {
+    const date = dateSel.value;
+    targetSel.innerHTML = '<option value="">⏳ Scanning night…</option>';
+    targetSel.style.display = "";
+    targetSel.disabled = true;
+    fitsInput.value = "";
+
+    if (!date) {
+      targetSel.style.display = "none";
+      targetSel.disabled = false;
+      return;
+    }
+
+    let targets = [];
+    try {
+      const res  = await fetch(`/api/pipeline/nas-dates/${date}`);
+      const data = await res.json();
+      targets = data.targets || [];
+    } catch {
+      targetSel.innerHTML = '<option value="">Scan failed</option>';
+      targetSel.disabled = false;
+      return;
+    }
+
     targetSel.innerHTML = '<option value="">— pick a target —</option>';
-    if (!entry) { targetSel.style.display = "none"; return; }
+    if (!targets.length) {
+      targetSel.innerHTML = '<option value="">No FITS data found</option>';
+      targetSel.disabled = false;
+      return;
+    }
 
-    const hasRealTargets = entry.targets.some((t) => t.name !== "SNAPSHOT");
-    for (const t of entry.targets) {
-      // Hide the SNAPSHOT fallback folder when real per-target folders exist
+    const hasRealTargets = targets.some((t) => t.name !== "SNAPSHOT");
+    for (const t of targets) {
       if (t.name === "SNAPSHOT" && hasRealTargets) continue;
       const opt = document.createElement("option");
       opt.value = t.path;
       opt.dataset.name = t.name;
+      if (t.snapshot) opt.dataset.snapshot = "1";
       opt.textContent = t.name === "SNAPSHOT" ? "SNAPSHOT (unsorted)" : t.name;
       targetSel.appendChild(opt);
     }
-    targetSel.style.display = "";
+    targetSel.disabled = false;
 
     // Auto-select if only one target
-    if (entry.targets.length === 1) {
-      targetSel.value = entry.targets[0].path;
-      fitsInput.value = entry.targets[0].path;
-      if (entry.targets[0].name !== "SNAPSHOT") {
-        targetInput.value = entry.targets[0].name;
-      }
+    if (targets.length === 1) {
+      targetSel.value = targets[0].path;
+      fitsInput.value = targets[0].path;
+      if (targets[0].name !== "SNAPSHOT") targetInput.value = targets[0].name;
     }
   });
 
+  // ── Step 3: when a target is chosen, fill in the path/name fields ─────────
   targetSel.addEventListener("change", () => {
     if (!targetSel.value) return;
     fitsInput.value = targetSel.value;
-    const name = targetSel.selectedOptions[0]?.dataset.name || "";
-    if (name && name !== "SNAPSHOT") {
-      targetInput.value = name;
-    }
+    const selOpt = targetSel.selectedOptions[0];
+    const name = selOpt?.dataset.name || "";
+    if (name && name !== "SNAPSHOT") targetInput.value = name;
   });
 }
 
@@ -1108,14 +1139,286 @@ document.getElementById("pipeline-log-modal")
 
 document.getElementById("pipeline-log-copy").addEventListener("click", () => {
   const text = document.getElementById("pipeline-log-content").textContent;
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = document.getElementById("pipeline-log-copy");
-    btn.textContent = "✓ Copied";
-    setTimeout(() => { btn.textContent = "⎘ Copy"; }, 1500);
-  });
+  const btn  = document.getElementById("pipeline-log-copy");
+  const done = () => { btn.textContent = "✓ Copied"; setTimeout(() => { btn.textContent = "⎘ Copy"; }, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
 });
 
+// ── All-jobs photometry summary modal ────────────────────────────────────────
+
+const _jobPhotModal      = document.getElementById("job-phot-modal");
+const _jobPhotModalTitle = document.getElementById("job-phot-modal-title");
+const _jobPhotModalBody  = document.getElementById("job-phot-modal-body");
+const _jobPhotCopyBtn    = document.getElementById("job-phot-copy");
+const _btnCopyAllMeasures = document.getElementById("btn-copy-all-measures");
+_btnCopyAllMeasures.addEventListener("click", () => openAllPhotModal(_allJobs));
+
+document.getElementById("job-phot-modal-close")
+  .addEventListener("click", () => { _jobPhotModal.style.display = "none"; });
+_jobPhotModal.addEventListener("click", (e) => {
+  if (e.target === _jobPhotModal) _jobPhotModal.style.display = "none";
+});
+
+_jobPhotCopyBtn.addEventListener("click", () => {
+  const text = _jobPhotCopyBtn.dataset.copyText || "";
+  if (!text) return;
+  const done = () => {
+    _jobPhotCopyBtn.textContent = "✓ Copied";
+    setTimeout(() => { _jobPhotCopyBtn.textContent = "⧉ Copy all"; }, 2000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+});
+
+async function openAllPhotModal(jobs) {
+  // Collect all results across ALL jobs that have a STDWeb task
+  const SKIP = new Set(["pending","running","uploading","error","uploaded"]);
+  const photResults = [];
+  for (const job of jobs) {
+    for (const r of (job.results || [])) {
+      if (r.stdweb_task_id && !SKIP.has(r.status)) {
+        photResults.push({ ...r, jobTarget: job.target });
+      }
+    }
+  }
+
+  _jobPhotModalTitle.textContent = `📊 All measurements`;
+  _jobPhotModalBody.innerHTML = `<div style="color:#9ca3af;font-size:12px;">Fetching…</div>`;
+  _jobPhotCopyBtn.dataset.copyText = "";
+  _jobPhotModal.style.display = "block";
+
+  const allLines = [];
+  const rows = [];
+
+  for (const r of photResults) {
+    const taskId = r.stdweb_task_id;
+
+    if (!_photCache[taskId] || (!_photCache[taskId].sub && !_photCache[taskId].sub_ul)) {
+      try {
+        const resp = await fetch(`/api/stdweb/task/${taskId}/photometry`);
+        _photCache[taskId] = await resp.json();
+      } catch (e) {
+        _photCache[taskId] = { error: e.message };
+      }
+    }
+
+    const d      = _photCache[taskId];
+    const mjd    = d.mjd    != null ? d.mjd    : "?";
+    const filter = d.filter || r.filter || "?";
+    const target = d.target || r.jobTarget || r.target || "";
+    const tgt    = target ? target + ", " : "";
+    const stack  = (r.n_frames && r.exposure) ? `, ${r.n_frames}×${r.exposure}s` : "";
+
+    const lines = [];
+    if (d.direct) lines.push(`${tgt}${mjd}, ${filter}${stack}, Aperture photometry, ${d.direct.mag.toFixed(2)}, ${d.direct.magerr.toFixed(2)}`);
+    if (d.sub)    lines.push(`${tgt}${mjd}, ${filter}${stack}, Template substraction aperture photometry, ${d.sub.mag.toFixed(2)}, ${d.sub.magerr.toFixed(2)}`);
+    else if (d.sub_ul) lines.push(`${tgt}${mjd}, ${filter}${stack}, Template substraction aperture photometry, >${d.sub_ul.ul.toFixed(2)}, –`);
+
+    rows.push({ filter, taskId, lines, target, error: d.error || null });
+    allLines.push(...lines);
+  }
+
+  if (!rows.length) {
+    _jobPhotModalBody.innerHTML = `<span style="color:#9ca3af;">No measurements available yet.</span>`;
+    return;
+  }
+
+  const html = rows.map(row => {
+    const tgtLabel = row.target ? `<span style="color:#d1fae5;">${row.target}</span> · ` : "";
+    if (row.error) {
+      return `<div style="margin-bottom:12px;">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">${tgtLabel}${row.filter} · <a href="//${location.host.replace(/:\d+/,'')}:7000/tasks/${row.taskId}" target="_blank" style="color:#60a5fa;">#${row.taskId}</a></div>
+        <div style="color:#f87171;font-size:11px;">Error: ${row.error}</div>
+      </div>`;
+    }
+    if (!row.lines.length) {
+      return `<div style="margin-bottom:12px;">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">${tgtLabel}${row.filter} · <a href="//${location.host.replace(/:\d+/,'')}:7000/tasks/${row.taskId}" target="_blank" style="color:#60a5fa;">#${row.taskId}</a></div>
+        <div style="color:#9ca3af;font-size:11px;">No magnitude found</div>
+      </div>`;
+    }
+    const escaped = row.lines.map(l => l.replace(/</g,"&lt;")).join("<br>");
+    return `<div style="margin-bottom:14px;">
+      <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">${tgtLabel}${row.filter} · <a href="//${location.host.replace(/:\d+/,'')}:7000/tasks/${row.taskId}" target="_blank" style="color:#60a5fa;">#${row.taskId} ↗</a></div>
+      <pre style="margin:0;font-size:12px;color:#a7f3d0;font-family:monospace;line-height:1.7;">${escaped}</pre>
+    </div>`;
+  }).join("");
+
+  _jobPhotModalBody.innerHTML = html;
+  _jobPhotCopyBtn.dataset.copyText = allLines.join("\n");
+}
+
+function fallbackCopy(text, onSuccess) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0;";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); onSuccess(); } catch { /* ignore */ }
+  document.body.removeChild(ta);
+}
+
 // ── Render jobs ───────────────────────────────────────────────────────────────
+// Photometry cache persists across re-renders so the data isn't re-fetched
+// every 4-second poll and open rows stay open.
+const _photCache = {};
+
+// ── Steps definitions ─────────────────────────────────────────────────────────
+const PIPELINE_STEPS = [
+  { key: "calibrate",   label: "Calibrate & Stack",  statuses: ["calibrating"] },
+  { key: "solve",       label: "Plate Solve",         statuses: ["solving"] },
+  { key: "upload",      label: "Upload to STDWeb",    statuses: ["uploading", "uploaded"] },
+  { key: "inspect",     label: "Inspect",             statuses: ["inspecting"] },
+  { key: "photometry",  label: "Photometry",          statuses: ["photometry"] },
+  { key: "subtraction", label: "Subtraction",         statuses: ["subtraction"] },
+];
+
+// Status order for deciding which steps are done vs pending
+const STATUS_ORDER = [
+  "queued","scanning","splitting","calibrating","solving",
+  "uploading","uploaded","inspecting","photometry","subtraction","done","error"
+];
+
+// Map stdweb_state values to which step they belong to
+const STDWEB_STATE_TO_STEP = {
+  inspect_done: "inspect", inspect_failed: "inspect", inspect_error: "inspect",
+  photometry_done: "photometry", photometry_failed: "photometry",
+  subtraction_done: "subtraction", subtraction_failed: "subtraction",
+};
+
+function _getStepState(step, result) {
+  if (result.status === "error") {
+    // Determine which step caused the error
+    let errorStep = null;
+    if (result.stdweb_state) {
+      // Map known terminal stdweb states
+      errorStep = STDWEB_STATE_TO_STEP[result.stdweb_state] || null;
+      // Also handle active states like "inspect_running" -> "inspect"
+      if (!errorStep) {
+        const key = Object.keys(STDWEB_STATE_TO_STEP).find(k =>
+          result.stdweb_state.startsWith(k.split("_")[0]));
+        if (key) errorStep = STDWEB_STATE_TO_STEP[key];
+      }
+    }
+    if (!errorStep && result.error) {
+      // Guess from error text
+      if (/siril|calibrat|stack|registr/i.test(result.error)) errorStep = "calibrate";
+      else if (/solv|astrometr/i.test(result.error)) errorStep = "solve";
+      else if (/upload/i.test(result.error)) errorStep = "upload";
+      else if (/inspect/i.test(result.error)) errorStep = "inspect";
+      else if (/photom/i.test(result.error)) errorStep = "photometry";
+      else if (/subtract/i.test(result.error)) errorStep = "subtraction";
+    }
+    const isError = errorStep === step.key;
+    // Steps before the errored step are done
+    const stepOrderIdx = PIPELINE_STEPS.findIndex(s => s.key === step.key);
+    const errorStepIdx = PIPELINE_STEPS.findIndex(s => s.key === errorStep);
+    const isDone = errorStepIdx > 0 && stepOrderIdx < errorStepIdx;
+    return { isDone, isActive: false, isError };
+  }
+
+  const curIdx  = STATUS_ORDER.indexOf(result.status);
+  const stepIdx = Math.max(...step.statuses.map(s => STATUS_ORDER.indexOf(s)));
+  const isActive = step.statuses.includes(result.status);
+  const isDone   = !isActive && curIdx > stepIdx;
+  return { isDone, isActive, isError: false };
+}
+
+// Steps that can be retried via STDWeb (no local re-run needed)
+const STDWEB_RETRY_STEPS = new Set(["inspect", "photometry", "subtraction"]);
+
+function _renderStepsRow(cell, r) {
+  const stepsHtml = PIPELINE_STEPS.map(step => {
+    const { isDone, isActive, isError } = _getStepState(step, r);
+    let icon, color, cursor = "default";
+    // All errored steps get a retry button; the step key is sent directly to
+    // the /resume endpoint which handles all cases (local and STDWeb steps).
+    const retryIcon = isError ? ` <span class="btn-retry-step" data-result-id="${r.id}" data-step="${step.key}"
+        style="cursor:pointer;color:#f59e0b;font-size:12px;margin-left:3px;" title="Retry from this step">↺</span>` : "";
+
+    if (isDone) {
+      icon = "✓"; color = "#34d399";
+    } else if (isActive) {
+      icon = "⟳"; color = "#60a5fa";
+    } else if (isError) {
+      icon = "✗"; color = "#f87171"; cursor = "pointer";
+    } else {
+      icon = "○"; color = "#4b5563";
+    }
+
+    return `<span style="display:inline-flex;align-items:center;margin-right:14px;font-size:11px;color:${color};cursor:${cursor};">
+      <span style="margin-right:3px;font-size:12px;">${icon}</span>${step.label}${retryIcon}
+    </span>`;
+  }).join("");
+
+  cell.innerHTML = stepsHtml;
+}
+
+function _renderPhotRow(photRow, d, result) {
+  const cell = photRow.querySelector("td");
+  if (d.error) {
+    cell.innerHTML = `<span style="color:#f87171;">Error: ${d.error}</span>`;
+    return;
+  }
+
+  const mjd    = d.mjd    != null ? d.mjd    : "?";
+  const filter = d.filter || "?";
+  const target = d.target || "";
+  const stack  = (result?.n_frames && result?.exposure)
+    ? `, ${result.n_frames}×${result.exposure}s` : "";
+
+  const lines = [];
+  if (d.direct) {
+    lines.push(`${target ? target + ", " : ""}${mjd}, ${filter}${stack}, Aperture photometry, ${d.direct.mag.toFixed(2)}, ${d.direct.magerr.toFixed(2)}`);
+  }
+  if (d.sub) {
+    lines.push(`${target ? target + ", " : ""}${mjd}, ${filter}${stack}, Template substraction aperture photometry, ${d.sub.mag.toFixed(2)}, ${d.sub.magerr.toFixed(2)}`);
+  } else if (d.sub_ul) {
+    lines.push(`${target ? target + ", " : ""}${mjd}, ${filter}${stack}, Template substraction aperture photometry, >${d.sub_ul.ul.toFixed(2)}, –`);
+  }
+
+  if (!lines.length) {
+    cell.innerHTML = `<span style="color:#9ca3af;font-size:11px;">No magnitude measurements found</span>`;
+    return;
+  }
+
+  const text    = lines.join("\n");
+  const escaped = lines.map(l => l.replace(/</g, "&lt;")).join("<br>");
+
+  cell.innerHTML = `
+    <div style="display:flex;align-items:flex-start;gap:10px;">
+      <pre style="margin:0;font-size:11px;color:#a7f3d0;font-family:monospace;line-height:1.6;">${escaped}</pre>
+      <button class="btn-phot-copy" title="Copy to clipboard"
+              style="flex-shrink:0;background:none;border:1px solid #065f46;color:#34d399;
+                     border-radius:4px;padding:2px 7px;cursor:pointer;font-size:14px;line-height:1;"
+              data-text="${text.replace(/"/g, "&quot;")}">⧉</button>
+    </div>`;
+
+  cell.querySelector(".btn-phot-copy").addEventListener("click", (e) => {
+    const copyBtn = e.currentTarget;
+    const done = () => {
+      copyBtn.textContent = "✓";
+      setTimeout(() => { copyBtn.textContent = "⧉"; }, 1500);
+    };
+    const fail = () => {
+      copyBtn.textContent = "✗";
+      setTimeout(() => { copyBtn.textContent = "⧉"; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(copyBtn.dataset.text).then(done).catch(() => fallbackCopy(copyBtn.dataset.text, done));
+    } else {
+      fallbackCopy(copyBtn.dataset.text, done);
+    }
+  });
+}
 
 function renderPipelineJobs(jobs) {
   const tbody   = document.getElementById("pipeline-tbody");
@@ -1130,6 +1433,16 @@ function renderPipelineJobs(jobs) {
       .filter(r => r.style.display !== "none")
       .map(r => r.dataset.framesFor)
   );
+  const openPhotRows = new Set(
+    Array.from(tbody.querySelectorAll("tr[data-phot-for]"))
+      .filter(r => r.style.display !== "none")
+      .map(r => r.dataset.photFor)
+  );
+  const openStepsRows = new Set(
+    Array.from(tbody.querySelectorAll("tr[data-steps-for]"))
+      .filter(r => r.style.display !== "none")
+      .map(r => r.dataset.stepsFor)
+  );
   // Map: resultId → Set of source paths that are UNCHECKED
   const uncheckedSources = {};
   for (const previewRow of tbody.querySelectorAll("tr[data-frames-for]")) {
@@ -1142,14 +1455,21 @@ function renderPipelineJobs(jobs) {
 
   tbody.innerHTML = "";
 
-  // Status bar: show latest running job
-  const running = jobs.find((j) => !["done", "error"].includes(j.status));
-  if (running) {
+  // Status bar: show active job + queue depth
+  const activeJobs = jobs.filter((j) => !["done", "error", "queued"].includes(j.status));
+  const queuedJobs = jobs.filter((j) => j.status === "queued");
+  const running = activeJobs[0];
+  if (running || queuedJobs.length) {
     statBar.style.display = "block";
-    const step = JOB_STATUS_STEPS[running.status] || running.status;
-    statTxt.textContent = `Job #${running.id} — ${step}`;
-    document.getElementById("pipeline-log-btn").dataset.jobId = running.id;
-    document.getElementById("pipeline-log-btn").style.display = "";
+    const step = JOB_STATUS_STEPS[running?.status] || running?.status || "Queued…";
+    const queueSuffix = queuedJobs.length
+      ? ` — ${queuedJobs.length} job${queuedJobs.length > 1 ? "s" : ""} waiting`
+      : "";
+    statTxt.textContent = running
+      ? `Job #${running.id} — ${step}${queueSuffix}`
+      : `${queuedJobs.length} job${queuedJobs.length > 1 ? "s" : ""} queued…`;
+    document.getElementById("pipeline-log-btn").dataset.jobId = running?.id || "";
+    document.getElementById("pipeline-log-btn").style.display = running ? "" : "none";
   } else {
     statBar.style.display = "none";
   }
@@ -1157,10 +1477,16 @@ function renderPipelineJobs(jobs) {
   if (!jobs.length) {
     table.style.display = "none";
     empty.style.display = "block";
+    _btnCopyAllMeasures.style.display = "none";
     return;
   }
   table.style.display = "";
   empty.style.display = "none";
+
+  // Show global 📊 button if any result has STDWeb measurements
+  const SKIP_PHOT = new Set(["pending","running","uploading","error","uploaded"]);
+  const anyPhot = jobs.some(j => (j.results||[]).some(r => r.stdweb_task_id && !SKIP_PHOT.has(r.status)));
+  _btnCopyAllMeasures.style.display = anyPhot ? "" : "none";
 
   const RESULT_STATUS_CLASS = {
     processing:  "job-status-running",
@@ -1196,6 +1522,7 @@ function renderPipelineJobs(jobs) {
     const hasResults = results.length > 0;
 
     // ── Job header row ────────────────────────────────────────────────────────
+
     const tr = document.createElement("tr");
     tr.style.borderTop = "1px solid #374151";
     tr.innerHTML = `
@@ -1206,6 +1533,8 @@ function renderPipelineJobs(jobs) {
       <td style="color:#6b7280;font-size:12px;">${hasResults ? results.length + " filter" + (results.length > 1 ? "s" : "") : "–"}</td>
       <td style="white-space:nowrap;">
         <button class="btn-small btn-job-log" data-id="${j.id}" type="button">Log</button>
+        ${j.status === "error" ? `<button class="btn-small btn-rerun-job" data-id="${j.id}" type="button"
+                style="margin-left:4px;" title="Re-run with same parameters">↺ Re-run</button>` : ""}
         <button class="btn-small btn-del-job" data-id="${j.id}" type="button"
                 style="color:#fca5a5;border-color:#7f1d1d;margin-left:4px;">✕</button>
       </td>
@@ -1231,20 +1560,62 @@ function renderPipelineJobs(jobs) {
              🖼 ${framePreviews.length} frame${framePreviews.length > 1 ? "s" : ""}
            </button>` : "";
 
+      // Show phot button when STDWeb has processed past 'uploaded'
+      const canFetchPhot = r.stdweb_task_id &&
+        !["pending", "running", "uploading", "error", "uploaded"].includes(r.status);
+      const photBtn = canFetchPhot
+        ? `<button class="btn-small btn-phot-toggle" data-task-id="${r.stdweb_task_id}" data-result-id="${r.id}"
+                   data-result-status="${r.status}"
+                   style="margin-left:4px;color:#34d399;border-color:#065f46;" type="button"
+                   title="Fetch photometry from STDWeb">📊</button>` : "";
+
       const rtr = document.createElement("tr");
       rtr.dataset.resultId = r.id;
       rtr.style.background = "#0d1929";
       rtr.innerHTML = `
         <td></td>
-        <td style="font-size:12px;padding-left:20px;color:#93c5fd;">
-          ${r.target ? `<span style="color:#a78bfa;">${r.target}</span> · ` : ""}${r.filter || "?"} · ${r.n_frames || "?"}×${r.exposure || "?"}s
+        <td style="font-size:12px;padding-left:12px;color:#93c5fd;">
+          <button class="btn-steps-toggle" data-result-id="${r.id}"
+                  style="background:none;border:none;color:#4b5563;cursor:pointer;
+                         font-size:10px;padding:0 4px 0 0;line-height:1;vertical-align:middle;"
+                  title="Show/hide steps">▶</button>${r.target ? `<span style="color:#a78bfa;">${r.target}</span> · ` : ""}${r.filter || "?"} · ${r.n_frames || "?"}×${r.exposure || "?"}s
         </td>
         <td></td>
         <td><span class="job-status ${rcls}"${retitle} style="font-size:11px;">${rlabel}</span></td>
-        <td>${link}${framesBtn}</td>
+        <td>${link}${framesBtn}${photBtn}</td>
         <td></td>
       `;
       tbody.appendChild(rtr);
+
+      // ── Steps sub-row (hidden until triangle clicked) ─────────────────────
+      const stepsRow = document.createElement("tr");
+      stepsRow.dataset.stepsFor = r.id;
+      stepsRow.style.cssText = "background:#060c18;display:none;";
+      stepsRow.innerHTML = `<td colspan="6" style="padding:4px 16px 8px 36px;" class="steps-cell"></td>`;
+      tbody.appendChild(stepsRow);
+      _renderStepsRow(stepsRow.querySelector(".steps-cell"), r);
+
+      // Restore open state
+      if (openStepsRows.has(String(r.id))) {
+        stepsRow.style.display = "";
+        const tri = rtr.querySelector(".btn-steps-toggle");
+        if (tri) { tri.textContent = "▼"; tri.style.color = "#60a5fa"; }
+      }
+
+      // Photometry row (hidden until fetched, restored if was open before re-render)
+      const photRow = document.createElement("tr");
+      photRow.dataset.photFor = r.id;
+      photRow.style.cssText = "background:#060f1e;display:none;";
+      photRow.innerHTML = `<td colspan="6" style="padding:6px 16px 10px 36px;"></td>`;
+      tbody.appendChild(photRow);
+
+      // Restore previously open phot row using cached data
+      if (openPhotRows.has(String(r.id)) && r.stdweb_task_id && _photCache[r.stdweb_task_id]) {
+        _renderPhotRow(photRow, _photCache[r.stdweb_task_id], r);
+        photRow.style.display = "";
+        const toggle = tbody.querySelector(`.btn-phot-toggle[data-result-id="${r.id}"]`);
+        if (toggle) toggle.style.opacity = "1";
+      }
 
       // Hidden frame preview row — checkboxes + re-process button
       if (hasFrames) {
@@ -1329,6 +1700,18 @@ function renderPipelineJobs(jobs) {
       loadPipelineJobs();
     });
   }
+  for (const btn of tbody.querySelectorAll(".btn-rerun-job")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "↺ …";
+      try {
+        const r = await fetch(`/api/pipeline/rerun/${btn.dataset.id}`, { method: "POST" });
+        const data = await r.json();
+        if (data.success) { loadPipelineJobs(); }
+        else { btn.textContent = "✗ Failed"; btn.disabled = false; }
+      } catch { btn.textContent = "✗ Error"; btn.disabled = false; }
+    });
+  }
   for (const btn of tbody.querySelectorAll(".btn-job-log")) {
     btn.addEventListener("click", () => openLogModal(btn.dataset.id));
   }
@@ -1340,6 +1723,100 @@ function renderPipelineJobs(jobs) {
       const hidden = row.style.display === "none";
       row.style.display = hidden ? "" : "none";
       btn.style.opacity = hidden ? "1" : "0.5";
+    });
+  }
+
+  // ── Photometry fetch button ───────────────────────────────────────────────
+  for (const btn of tbody.querySelectorAll(".btn-phot-toggle")) {
+    btn.addEventListener("click", async () => {
+      const rid     = btn.dataset.resultId;
+      const taskId  = btn.dataset.taskId;
+      const photRow = tbody.querySelector(`tr[data-phot-for="${rid}"]`);
+      if (!photRow) return;
+
+      // Toggle: hide if already visible
+      if (photRow.style.display !== "none") {
+        photRow.style.display = "none";
+        btn.style.opacity = "0.5";
+        return;
+      }
+
+      // Bust cache if it has no subtraction data — re-fetch to get the full result
+      if (_photCache[taskId] && !_photCache[taskId].sub && !_photCache[taskId].sub_ul) {
+        delete _photCache[taskId];
+      }
+
+      // Fetch if not yet cached
+      const cell = photRow.querySelector("td");
+      if (!_photCache[taskId]) {
+        btn.disabled = true;
+        btn.textContent = "⏳";
+        cell.textContent = "Fetching…";
+        photRow.style.display = "";
+
+        try {
+          const resp = await fetch(`/api/stdweb/task/${taskId}/photometry`);
+          _photCache[taskId] = await resp.json();
+        } catch (e) {
+          cell.textContent = `Error: ${e.message}`;
+          btn.disabled = false; btn.textContent = "📊";
+          return;
+        }
+        btn.disabled = false; btn.textContent = "📊";
+      }
+
+      const resultObj = jobs.flatMap(j => j.results || []).find(x => String(x.id) === String(rid));
+      _renderPhotRow(photRow, _photCache[taskId], resultObj);
+      photRow.style.display = "";
+      btn.style.opacity = "1";
+    });
+  }
+
+  // ── Steps triangle toggle ──────────────────────────────────────────────────
+  for (const btn of tbody.querySelectorAll(".btn-steps-toggle")) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const rid = btn.dataset.resultId;
+      const row = tbody.querySelector(`tr[data-steps-for="${rid}"]`);
+      if (!row) return;
+      const hidden = row.style.display === "none";
+      row.style.display = hidden ? "" : "none";
+      btn.textContent = hidden ? "▼" : "▶";
+      btn.style.color = hidden ? "#60a5fa" : "#4b5563";
+    });
+  }
+
+  // ── Retry step button ──────────────────────────────────────────────────────
+  for (const btn of tbody.querySelectorAll(".btn-retry-step")) {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const rid  = btn.dataset.resultId;
+      const step = btn.dataset.step;
+      const orig = btn.textContent;
+      btn.textContent = "⏳";
+      btn.style.pointerEvents = "none";
+      try {
+        const resp = await fetch(`/api/pipeline/results/${rid}/retry-step`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ step }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+          btn.textContent = "✓";
+          btn.style.color = "#34d399";
+          setTimeout(loadPipelineJobs, 1500);
+        } else {
+          btn.textContent = "✗";
+          btn.style.color = "#f87171";
+          btn.title = data.error || "Failed";
+          btn.style.pointerEvents = "auto";
+        }
+      } catch (err) {
+        btn.textContent = orig;
+        btn.style.pointerEvents = "auto";
+        console.error("retry-step error:", err);
+      }
     });
   }
 
@@ -1433,11 +1910,14 @@ function renderPipelineJobs(jobs) {
   });
 })();
 
+let _allJobs = [];
+
 async function loadPipelineJobs() {
   try {
     const res  = await fetch("/api/pipeline/jobs");
     const data = await res.json();
-    renderPipelineJobs(data.jobs || []);
+    _allJobs = data.jobs || [];
+    renderPipelineJobs(_allJobs);
   } catch { /* ignore */ }
 }
 
@@ -1498,9 +1978,13 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
   btn.disabled = true;
   btn.textContent = "Starting…";
   try {
+    const targetSel = document.getElementById("pipeline-target-select");
+    const selOpt = targetSel?.selectedOptions[0];
+    const isSnapshot = selOpt?.dataset.snapshot === "1";
     const result = await postJson("/api/pipeline/trigger", {
       fits_dir,
       target: target || null,
+      target_filter: isSnapshot ? (selOpt.dataset.name || target || null) : null,
     });
     setLog(result);
     document.getElementById("pipeline-target").value = "";
@@ -1517,3 +2001,107 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
 setActiveTab("devices");
 loadDefaults().then(refreshStatus);
 loadHistory();
+
+// ── Manual mode live toggle ───────────────────────────────────────────────────
+const manualModeChk = document.getElementById("seq-manual-mode");
+if (manualModeChk) {
+  manualModeChk.addEventListener("change", async () => {
+    try { await postJson("/api/sequence/manual-mode", { enabled: manualModeChk.checked }); }
+    catch { /* ignore */ }
+  });
+}
+
+// ── Measurement History ───────────────────────────────────────────────────────
+let _histRows = [];   // last fetched rows for CSV copy
+
+async function loadHistory() {
+  const target   = document.getElementById("hist-target").value.trim();
+  const filter   = document.getElementById("hist-filter").value;
+  const dateFrom = document.getElementById("hist-date-from").value;
+  const dateTo   = document.getElementById("hist-date-to").value;
+
+  const params = new URLSearchParams();
+  if (target)   params.set("target",    target);
+  if (filter)   params.set("filter",    filter);
+  if (dateFrom) params.set("date_from", dateFrom);
+  if (dateTo)   params.set("date_to",   dateTo);
+
+  const emptyEl = document.getElementById("hist-empty");
+  const tableEl = document.getElementById("hist-table");
+  const tbody   = document.getElementById("hist-tbody");
+  emptyEl.textContent = "Loading…";
+  emptyEl.style.display = "";
+  tableEl.style.display = "none";
+
+  try {
+    const res  = await fetch(`/api/pipeline/history?${params}`);
+    const data = await res.json();
+    _histRows = data.results || [];
+
+    if (!_histRows.length) {
+      emptyEl.textContent = "No results found.";
+      return;
+    }
+
+    tbody.innerHTML = _histRows.map(r => {
+      const mag_ap  = r.mag_ap    != null ? `${r.mag_ap.toFixed(2)} ± ${(r.magerr_ap||0).toFixed(2)}` : "–";
+      const mag_sub = r.mag_sub   != null ? `${r.mag_sub.toFixed(2)} ± ${(r.magerr_sub||0).toFixed(2)}`
+                    : r.mag_sub_ul != null ? `&gt;${r.mag_sub_ul.toFixed(2)}` : "–";
+      const mjd     = r.mjd != null ? r.mjd.toFixed(5) : "–";
+      const link    = r.stdweb_url
+        ? `<a href="${r.stdweb_url}" target="_blank" style="color:#60a5fa;font-size:11px;">#${r.stdweb_task_id} ↗</a>`
+        : "–";
+      const frames  = r.n_frames ? `${r.n_frames}×${r.exposure}s` : "–";
+      const tgt     = (r.target || "").replace(/^(sn_|at_)/, m => m.slice(0,-1).toUpperCase() + " ");
+      const hasMag  = r.mag_ap != null || r.mag_sub != null;
+      return `<tr style="border-bottom:1px solid #0f2035;${hasMag ? '' : 'opacity:0.5;'}">
+        <td style="padding:5px 8px;white-space:nowrap;">${r.obs_date || "–"}</td>
+        <td style="padding:5px 8px;color:#a78bfa;">${tgt || r.target || "–"}</td>
+        <td style="padding:5px 8px;text-align:center;">${r.filter || "–"}</td>
+        <td style="padding:5px 8px;text-align:center;color:#6b7280;">${frames}</td>
+        <td style="padding:5px 8px;text-align:right;font-family:monospace;font-size:11px;">${mjd}</td>
+        <td style="padding:5px 8px;text-align:right;font-family:monospace;color:#6ee7b7;">${mag_ap}</td>
+        <td style="padding:5px 8px;text-align:right;font-family:monospace;color:#93c5fd;">${mag_sub}</td>
+        <td style="padding:5px 8px;text-align:center;">${link}</td>
+      </tr>`;
+    }).join("");
+
+    emptyEl.style.display = "none";
+    tableEl.style.display = "";
+  } catch (e) {
+    emptyEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+document.getElementById("hist-search-btn").addEventListener("click", loadHistory);
+// Search on Enter in the target field
+document.getElementById("hist-target").addEventListener("keydown", e => { if (e.key === "Enter") loadHistory(); });
+
+document.getElementById("hist-copy-all-btn").addEventListener("click", async () => {
+  if (!_histRows.length) return;
+  const lines = _histRows
+    .filter(r => r.mag_ap != null || r.mag_sub != null)
+    .flatMap(r => {
+      const rows = [];
+      const tgt   = (r.target || "").replace(/_/g, " ").toUpperCase();
+      const stack = (r.n_frames && r.exposure) ? `, ${r.n_frames}×${r.exposure}s` : "";
+      if (r.mag_ap  != null) rows.push(`${tgt}, ${r.mjd?.toFixed(8) ?? ""}, ${r.filter}${stack}, Aperture photometry, ${r.mag_ap.toFixed(2)}, ${(r.magerr_ap||0).toFixed(2)}`);
+      if (r.mag_sub != null) rows.push(`${tgt}, ${r.mjd?.toFixed(8) ?? ""}, ${r.filter}${stack}, Template substraction aperture photometry, ${r.mag_sub.toFixed(2)}, ${(r.magerr_sub||0).toFixed(2)}`);
+      return rows;
+    });
+  const text = lines.join("\n");
+  const btn = document.getElementById("hist-copy-all-btn");
+  const done = () => {
+    btn.textContent = "✓ Copied";
+    setTimeout(() => { btn.textContent = "⧉ Copy CSV"; }, 2000);
+  };
+  const fail = () => {
+    btn.textContent = "✗ Failed";
+    setTimeout(() => { btn.textContent = "⧉ Copy CSV"; }, 2000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+});

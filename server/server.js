@@ -10,10 +10,16 @@ const Database = require("better-sqlite3");
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
 
-function callProcessingService(job_id, fits_dir, target, selected_files = null) {
+function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null) {
   return new Promise((resolve, reject) => {
     const payload = { job_id, fits_dir, target };
     if (selected_files && selected_files.length) payload.selected_files = selected_files;
+    if (target_filter) payload.target_filter = target_filter;
+    // When the fits_dir is a SNAPSHOT folder, pass the target name as object_filter
+    // so only frames matching that OBJECT header are processed (not all mixed targets).
+    if (fits_dir && path.basename(fits_dir).toUpperCase() === "SNAPSHOT" && target) {
+      payload.object_filter = target;
+    }
     const body = JSON.stringify(payload);
     const url  = new URL(PROCESSING_SERVICE_URL + "/process");
     const lib  = url.protocol === "https:" ? https : http;
@@ -106,8 +112,10 @@ app.get("/api/data/results", (req, res) => {
 
 // ── Persistent DB (targets + pipeline jobs) ───────────────────────────────────
 
-const DB_FILE = process.env.DB_FILE || "nightmanager.db";
-const db = new Database(path.join(__dirname, DB_FILE));
+const DB_FILE = process.env.DB_FILE
+  ? (path.isAbsolute(process.env.DB_FILE) ? process.env.DB_FILE : path.join(__dirname, process.env.DB_FILE))
+  : path.join(__dirname, "..", "nightmanager.db");
+const db = new Database(DB_FILE);
 db.exec(`
   CREATE TABLE IF NOT EXISTS targets (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +171,15 @@ db.exec(`
 // Migrations
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN target TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN frame_previews TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN target_filter TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN stdweb_state TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN obs_date TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mjd REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_ap REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_ap REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_sub REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub_ul REAL").run(); } catch { /* already exists */ }
 
 // ── Queue persistence helpers ─────────────────────────────────────────────────
 
@@ -1137,13 +1154,128 @@ async function assertCameraIdle(target, context = "") {
 function findFilterByName(filters, name) {
   const n = name.toLowerCase();
   return (
-    filters.find(f => f.Name === name) ||
-    filters.find(f => (f.Name || "").toLowerCase() === n) ||
-    filters.find(f => (f.Name || "").toLowerCase().startsWith(n)) ||
+    filters.find(f => f.Name === name) ||                                      // exact
+    filters.find(f => (f.Name || "").toLowerCase() === n) ||                   // case-insensitive exact
+    filters.find(f => (f.Name || "").toLowerCase().startsWith(n)) ||           // prefix: "G" → "GBP"
+    filters.find(f => (f.Name || "").toLowerCase().endsWith(n)) ||             // suffix: "RP" → "GRP"
+    filters.find(f => (f.Name || "").toLowerCase().includes(n)) ||             // substring
     null
   );
 }
 
+
+/**
+ * Snapshot all .fit/.fits filenames currently present in every SNAPSHOT directory.
+ * Call this BEFORE triggering a capture; pass the result to patchFitsFilterHeaders.
+ * Using a before/after set difference avoids any dependency on clock timestamps,
+ * which is important because the NAS (Windows) clock can differ from the Linux host.
+ */
+function snapshotNasFiles() {
+  const existing = new Set();
+  try {
+    for (const entry of fs.readdirSync(NAS_WATCH_PATH, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const snapDir = path.join(NAS_WATCH_PATH, entry.name, "SNAPSHOT");
+      if (!fs.existsSync(snapDir)) continue;
+      try {
+        for (const name of fs.readdirSync(snapDir)) {
+          if (/\.(fit|fits)$/i.test(name)) existing.add(path.join(snapDir, name));
+        }
+      } catch { /* ignore unreadable dirs */ }
+    }
+  } catch (e) {
+    console.error(`[patchFitsFilter] snapshotNasFiles failed: ${e.message}`);
+  }
+  return existing;
+}
+
+/**
+ * After NINA saves a frame, find the new FITS file (by set-difference with beforeFiles)
+ * and patch its FILTER header to filterName.
+ *
+ * Using before/after set difference avoids mtime clock-skew issues between Linux host
+ * and the Windows machine where NINA saves files to the NAS.
+ *
+ * Retries up to ~15 s to handle NFS write-flush delays.
+ * Returns the number of files patched.
+ */
+async function patchFitsFilterHeaders(beforeFiles, filterName) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const patched = new Set();
+
+  // Collect all .../DATE/SNAPSHOT/ directories
+  const snapshotDirs = [];
+  try {
+    for (const entry of fs.readdirSync(NAS_WATCH_PATH, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const snapDir = path.join(NAS_WATCH_PATH, entry.name, "SNAPSHOT");
+      if (fs.existsSync(snapDir)) snapshotDirs.push(snapDir);
+    }
+  } catch (e) {
+    console.error(`[patchFitsFilter] cannot read NAS dir: ${e.message}`);
+    return 0;
+  }
+
+  // Retry loop — NFS directory listings can be stale for several seconds
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (attempt > 0) await sleep(3000);
+
+    for (const snapshotDir of snapshotDirs) {
+      let names;
+      try { names = fs.readdirSync(snapshotDir); } catch { continue; }
+
+      for (const name of names) {
+        if (!/\.(fit|fits)$/i.test(name)) continue;
+        const fullPath = path.join(snapshotDir, name);
+        if (beforeFiles.has(fullPath)) continue; // existed before capture — skip
+        if (patched.has(fullPath)) continue;     // already patched — skip
+
+        // Wait for file size to stabilise (NINA may still be flushing to NAS)
+        let prevSize = -1;
+        for (let s = 0; s < 8; s++) {
+          const sz = (() => { try { return fs.statSync(fullPath).size; } catch { return 0; } })();
+          if (sz > 0 && sz === prevSize) break;
+          prevSize = sz;
+          await sleep(500);
+        }
+
+        // Patch FILTER header via astropy (setval works in-place, single line)
+        try {
+          const cmd = `from astropy.io import fits; fits.setval(${JSON.stringify(fullPath)}, 'FILTER', value=${JSON.stringify(filterName)})`;
+          execSync(`.venv/bin/python -c "${cmd.replace(/"/g, '\\"')}"`,
+            { cwd: path.join(__dirname, ".."), timeout: 15000 });
+
+          // Rename the file: replace the filter token in the filename
+          // Format: YYYY-MM-DD_HH-MM-SS_FILTER_TEMP_DURATION_SEQ.ext
+          const ext  = path.extname(name);
+          const base = path.basename(name, ext);
+          const parts = base.split("_");
+          // parts[2] is the filter token written by NINA (e.g. "RP")
+          let newName = name;
+          if (parts.length >= 3 && parts[2] !== filterName) {
+            parts[2] = filterName;
+            newName = parts.join("_") + ext;
+            const newPath = path.join(snapshotDir, newName);
+            fs.renameSync(fullPath, newPath);
+            console.log(`[patchFitsFilter] renamed: ${name} → ${newName}`);
+          } else {
+            console.log(`[patchFitsFilter] header patched: ${name} → FILTER=${filterName}`);
+          }
+          patched.add(path.join(snapshotDir, newName));
+        } catch (e) {
+          console.error(`[patchFitsFilter] failed for ${name}: ${e.message}`);
+        }
+      }
+    }
+
+    if (patched.size > 0) break;
+  }
+
+  if (patched.size === 0) {
+    console.warn(`[patchFitsFilter] no new files found after retries (filter=${filterName})`);
+  }
+  return patched.size;
+}
 
 async function stepCaptureFilter(target, targetName, filterName, count, duration, gain, filters) {
   checkAbort();
@@ -1161,6 +1293,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
   if (!isNinaApiSuccess(changeResult)) {
     throw new Error(`Filter change to "${filter.Name}" failed`);
   }
+  seqLog(`Filter → ${filter.Name} ✓`);
   checkAbort();
 
   let saved = 0;
@@ -1172,6 +1305,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
     seqLog(`${filterName} frame ${i}/${count}: triggering ${duration}s exposure (gain ${gain})`);
 
     const capturePayload = { duration, gain, save: true, targetName, filter: filterName };
+    const beforeFiles = snapshotNasFiles(); // snapshot before capture for set-difference check
 
     // ninaAPI capture is non-blocking — it starts the exposure and returns immediately
     const captureResult = await callNinaLong(
@@ -1209,6 +1343,9 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
       // If camera doesn't report state, just add a fixed buffer
       await new Promise(r => setTimeout(r, 20000));
     }
+
+    // Patch any new FITS files with the correct FILTER header (await — it retries on NFS delay)
+    await patchFitsFilterHeaders(beforeFiles, filter.Name);
 
     saved++;
     seqLog(`${filterName} ${i}/${count} saved ✓`);
@@ -1298,7 +1435,52 @@ async function runSequence(ninaConfig, seqConfig) {
       return;                      // stop sequence, mount is safe
     }
 
-    // ── Step 1b: Switch to G filter (clear dark/lum filter before imaging) ───
+    // ── Step 1b: Filter checklist — verify all requested filters exist ──────────
+    let verifiedFilters = [];
+    try {
+      const { equipmentInfo: fwInfo } = await getEquipmentInfo(ninaConfig);
+      const availableFilters = fwInfo?.FilterWheel?.AvailableFilters || [];
+      const availableNames = availableFilters.map(f => f.Name).filter(Boolean);
+
+      seqLog("── Filter checklist ────────────────────────────────");
+      seqLog(`  Filterwheel reports: ${availableNames.join(", ") || "(none)"}`);
+      seqLog(`  Requested filters  : ${filterNames.join(", ")}`);
+      seqLog("");
+
+      const missing = [];
+      for (const name of filterNames) {
+        const found = findFilterByName(availableFilters, name);
+        if (found) {
+          seqLog(`  ✓  ${name.padEnd(6)} → matched as "${found.Name}" (ID ${found.Id})`);
+          verifiedFilters.push(name);
+        } else {
+          seqLog(`  ✗  ${name.padEnd(6)} → NOT FOUND in filterwheel — will be skipped`);
+          missing.push(name);
+        }
+      }
+
+      if (missing.length) {
+        seqLog(`  ⚠️  ${missing.length} filter(s) missing — proceeding with: ${verifiedFilters.join(", ") || "none"}`);
+      } else {
+        seqLog(`  All ${verifiedFilters.length} filter(s) OK ✓`);
+      }
+      seqLog("────────────────────────────────────────────────────");
+
+      if (!verifiedFilters.length) {
+        seqLog("✗ No valid filters found — aborting sequence", "error");
+        await safeHome();
+        return;
+      }
+
+      await waitForConfirmation("Filter checklist done — proceed to imaging?");
+      checkAbort();
+    } catch (err) {
+      if (err.message === "__ABORTED__") throw err;
+      seqLog(`Filter checklist failed: ${err.message} — continuing with requested filters`, "warn");
+      verifiedFilters = [...filterNames];
+    }
+
+    // ── Step 1c: Switch to G filter (clear dark/lum filter before imaging) ──────
     try {
       const { equipmentInfo: fwInfo } = await getEquipmentInfo(ninaConfig);
       const filters = fwInfo?.FilterWheel?.AvailableFilters || [];
@@ -1373,7 +1555,7 @@ async function runSequence(ninaConfig, seqConfig) {
         checkAbort();
 
         // ── Step 6: Capture each filter ──────────────────────────────────────
-        for (const filterName of filterNames) {
+        for (const filterName of verifiedFilters) {
           checkAbort();
           await assertCameraIdle(ninaConfig, `before ${filterName} captures`);
           await stepCaptureFilter(ninaConfig, t.name, filterName, count, duration, gain, filters);
@@ -1493,7 +1675,7 @@ app.post("/api/sequence/run", (req, res) => {
     duration:       Number(req.body?.duration)       || 120,
     gain:           Number(req.body?.gain)           || 10,
     count:          Number(req.body?.count)          || 10,
-    filters:        Array.isArray(req.body?.filters) ? req.body.filters : ["G", "BP", "RP"],
+    filters:        Array.isArray(req.body?.filters) ? req.body.filters : ["G", "BP", "RP"],  // real filterwheel names
     solveEnabled:   req.body?.solveEnabled !== false,
     solveExp:       Number(req.body?.solveExp)       || 5,
     solveThreshold: Number(req.body?.solveThreshold) || 60,
@@ -1974,17 +2156,16 @@ app.delete("/api/pipeline/results/:id", (req, res) => {
 });
 
 app.post("/api/pipeline/trigger", async (req, res) => {
-  const { fits_dir, target, filter, exposure, selected_files } = req.body;
+  const { fits_dir, target, filter, exposure, selected_files, target_filter } = req.body;
   if (!fits_dir) return res.status(400).json({ success: false, error: "fits_dir is required" });
 
   const result = db.prepare(
-    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status) VALUES (?, ?, ?, ?, ?)"
-  ).run(target || null, filter || null, exposure || null, fits_dir, "queued");
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(target || null, filter || null, exposure || null, fits_dir, "queued", target_filter || null);
 
   const job_id = result.lastInsertRowid;
 
-  // Call Python processing service (non-blocking — it runs in a thread)
-  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null)
+  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null)
     .then((svc) => {
       if (!svc.success) {
         db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")
@@ -1998,6 +2179,69 @@ app.post("/api/pipeline/trigger", async (req, res) => {
     });
 
   res.json({ success: true, id: job_id });
+});
+
+app.post("/api/pipeline/rerun/:id", async (req, res) => {
+  const oldJob = db.prepare("SELECT * FROM pipeline_jobs WHERE id=?").get(req.params.id);
+  if (!oldJob) return res.status(404).json({ success: false, error: "Job not found" });
+
+  const result = db.prepare(
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(oldJob.target, oldJob.filter, oldJob.exposure, oldJob.fits_dir, "queued", oldJob.target_filter || null);
+
+  const job_id = result.lastInsertRowid;
+
+  callProcessingService(job_id, oldJob.fits_dir, oldJob.target || "Unknown", null, oldJob.target_filter || null)
+    .then((svc) => {
+      if (!svc.success)
+        db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")
+          .run(svc.error || "Service call failed", job_id);
+    })
+    .catch((err) => {
+      db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")
+        .run("Processing service unreachable — is it running?", job_id);
+    });
+
+  res.json({ success: true, id: job_id });
+});
+
+// ── Retry a single pipeline step ─────────────────────────────────────────────
+// POST /api/pipeline/results/:id/retry-step   body: { step: "calibrate"|"solve"|"upload"|"inspect"|"photometry"|"subtraction" }
+//
+// Local steps (calibrate/solve/upload) call the processing service /resume
+// endpoint so only the failed step and everything after it is re-run.
+// STDWeb-only steps (inspect/photometry/subtraction) additionally offer the
+// option to re-trigger directly via STDWeb API (the poller then catches up).
+const PROC_URL = process.env.PROC_URL || "http://127.0.0.1:5200";
+
+app.post("/api/pipeline/results/:id/retry-step", async (req, res) => {
+  const result = db.prepare("SELECT * FROM pipeline_results WHERE id=?").get(req.params.id);
+  if (!result) return res.status(404).json({ success: false, error: "Result not found" });
+
+  const step = req.body?.step;
+  const VALID_STEPS = ["calibrate", "solve", "upload", "inspect", "photometry", "subtraction"];
+  if (!VALID_STEPS.includes(step)) {
+    return res.status(400).json({ success: false, error: `Unknown step: ${step}. Valid: ${VALID_STEPS.join(", ")}` });
+  }
+
+  try {
+    // All steps — delegate to processing service /resume
+    const r = await fetch(`${PROC_URL}/resume`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ result_id: result.id, from_step: step }),
+    });
+    const data = await r.json();
+    if (!data.success) return res.status(400).json(data);
+
+    // Optimistically clear error so UI shows running immediately
+    db.prepare("UPDATE pipeline_results SET status='processing', error=NULL, updated_at=datetime('now') WHERE id=?")
+      .run(result.id);
+
+    res.json({ success: true, step, message: "Resuming from step" });
+  } catch (e) {
+    res.status(500).json({ success: false, error: `Processing service unreachable: ${e.message}` });
+  }
 });
 
 // ── NAS browser ───────────────────────────────────────────────────────────────
@@ -2017,45 +2261,128 @@ function listSubdirs(dir) {
   } catch { return []; }
 }
 
+/** Read FITS OBJECT keyword from first header block without astropy */
+function readFitsObject(filePath) {
+  try {
+    const BLOCK = 2880;
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(BLOCK);
+    let end = false;
+    let object = null;
+    while (!end) {
+      const bytesRead = fs.readSync(fd, buf, 0, BLOCK, null);
+      if (bytesRead === 0) break;
+      for (let i = 0; i < bytesRead; i += 80) {
+        const card = buf.slice(i, i + 80).toString("ascii");
+        if (card.startsWith("END ") || card.trim() === "END") { end = true; break; }
+        if (card.startsWith("OBJECT  =") || card.startsWith("OBJECT =")) {
+          const val = card.slice(10).split("/")[0].trim().replace(/^'+|'+$/g, "").trim();
+          if (val) object = val;
+        }
+      }
+    }
+    fs.closeSync(fd);
+    return object;
+  } catch { return null; }
+}
+
+/** Strip common transient prefixes for deduplication */
+function canonicalTarget(name) {
+  return name.replace(/^(AT|SN|TCP|CSS|MASTER|PSN|PNV)\s*/i, "").trim().toUpperCase();
+}
+
+/** Given a list of raw target names, merge those with the same canonical form.
+ *  Prefers "AT" prefix over "SN"; falls back to the first seen. */
+function deduplicateTargets(names) {
+  const map = new Map(); // canonical → preferred raw name
+  for (const n of names) {
+    const key = canonicalTarget(n);
+    if (!map.has(key)) { map.set(key, n); continue; }
+    const prev = map.get(key);
+    // Prefer AT over SN, otherwise keep first
+    if (/^SN\s*/i.test(prev) && /^AT\s*/i.test(n)) map.set(key, n);
+  }
+  return [...map.values()];
+}
+
+/** For a SNAPSHOT folder, scan FITS files and return unique real target names */
+function snapshotTargets(folderPath) {
+  try {
+    const SKIP_OBJECTS = new Set(["snapshot", "dark", "flat", "bias", "test_target",
+                                   "test_target_v2", "test", "unknown", "none", ""]);
+    const files = fs.readdirSync(folderPath).filter((f) => /\.(fit|fits)$/i.test(f));
+    const seen = new Set();
+    for (const f of files) {
+      const obj = readFitsObject(path.join(folderPath, f));
+      if (obj && !SKIP_OBJECTS.has(obj.toLowerCase())) seen.add(obj);
+    }
+    return deduplicateTargets([...seen]);
+  } catch { return []; }
+}
+
 // GET /api/pipeline/nas-dates
-// Returns date folders + their target subfolders + whether each leaf has FITS
+// Step 1 — fast: returns only the list of date folders.
+// Does NOT read any FITS headers (no SNAPSHOT scanning).
 app.get("/api/pipeline/nas-dates", (req, res) => {
   try {
-    const dateDirs = fs.readdirSync(NAS_WATCH_PATH, { withFileTypes: true })
+    const dates = fs.readdirSync(NAS_WATCH_PATH, { withFileTypes: true })
       .filter((d) => d.isDirectory() && /^\d{4}-\d{2}-\d{2}$/.test(d.name))
       .map((d) => d.name)
       .sort()
       .reverse();
-
-    const tree = dateDirs.map((date) => {
-      const datePath = path.join(NAS_WATCH_PATH, date);
-      const subs = listSubdirs(datePath);
-
-      // Each sub is a target folder (or SNAPSHOT). Check if it contains FITS directly
-      // or has filter sub-subfolders with FITS.
-      const targets = subs.map((sub) => {
-        const subPath = path.join(datePath, sub);
-        const directFits = hasFits(subPath);
-        // Also check one level deeper (filter subfolders)
-        const deepFits = !directFits && listSubdirs(subPath).some((s) =>
-          hasFits(path.join(subPath, s))
-        );
-        return { name: sub, path: subPath, hasFits: directFits || deepFits };
-      }).filter((t) => t.hasFits);
-
-      return { date, targets };
-    });
-
-    res.json({ success: true, tree, base: NAS_WATCH_PATH });
+    res.json({ success: true, dates, base: NAS_WATCH_PATH });
   } catch (err) {
-    res.json({ success: true, tree: [], base: NAS_WATCH_PATH, error: err.message });
+    res.json({ success: true, dates: [], base: NAS_WATCH_PATH, error: err.message });
+  }
+});
+
+// GET /api/pipeline/nas-dates/:date
+// Step 2 — on demand: scan one night's folder and return its targets.
+// Reads FITS headers only for that night's SNAPSHOT (to discover real target names).
+app.get("/api/pipeline/nas-dates/:date", (req, res) => {
+  const { date } = req.params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ success: false, error: "Invalid date format" });
+  }
+  try {
+    const datePath = path.join(NAS_WATCH_PATH, date);
+    if (!fs.existsSync(datePath)) {
+      return res.json({ success: true, date, targets: [] });
+    }
+
+    const subs = listSubdirs(datePath);
+    const targets = [];
+
+    for (const sub of subs) {
+      const subPath = path.join(datePath, sub);
+      const directFits = hasFits(subPath);
+      const deepFits = !directFits && listSubdirs(subPath).some((s) =>
+        hasFits(path.join(subPath, s))
+      );
+      if (!directFits && !deepFits) continue;
+
+      if (sub.toUpperCase() === "SNAPSHOT" && directFits) {
+        const objects = snapshotTargets(subPath);
+        if (objects.length > 0) {
+          for (const obj of objects) {
+            targets.push({ name: obj, path: subPath, hasFits: true, snapshot: true });
+          }
+        } else {
+          targets.push({ name: sub, path: subPath, hasFits: true });
+        }
+      } else {
+        targets.push({ name: sub, path: subPath, hasFits: true });
+      }
+    }
+
+    res.json({ success: true, date, targets });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get("/api/pipeline/job/:id/log", async (req, res) => {
   try {
-    const resp = await callProcessingService(null, null, null)
-      .catch(() => null); // just a health check; fall through to direct fetch
     const url = `${PROCESSING_SERVICE_URL}/jobs/${req.params.id}/log`;
     http.get(url, (r) => {
       let data = "";
@@ -2072,6 +2399,236 @@ app.get("/api/pipeline/job/:id/log", async (req, res) => {
 app.delete("/api/pipeline/jobs/:id", (req, res) => {
   db.prepare("DELETE FROM pipeline_jobs WHERE id = ?").run(req.params.id);
   res.json({ success: true });
+});
+
+// ── Integration test: filter-patch end-to-end ─────────────────────────────────
+// POST /api/test/filter-patch
+// Exercises the real production path:
+//   stepCaptureFilter (change filter → capture → waitForCameraIdle → patchFitsFilterHeaders)
+// then reads back the FITS header to confirm it was corrected.
+// Runs 1-second exposures for each of the two test filters (G and BP by default).
+app.post("/api/test/filter-patch", async (req, res) => {
+  const testFilters = (req.body?.filters || "G,BP,RP").split(",").map(s => s.trim()).filter(Boolean);
+  const duration    = Number(req.body?.duration ?? 5);
+  const gain        = Number(req.body?.gain ?? 10);
+  const count       = Math.max(1, Math.min(10, Number(req.body?.count ?? 2)));
+
+  let ninaConfig;
+  try { ninaConfig = normalizeTargetConfig(req.body || {}); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+
+  const log = [];
+  const results = [];
+
+  const tlog = (...args) => {
+    const line = args.join(" ");
+    log.push(line);
+    console.log("[filter-patch-test]", line);
+  };
+
+  try {
+    // Get available filters from NINA
+    const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
+    const filters = equipmentInfo?.FilterWheel?.AvailableFilters || [];
+    const available = filters.map(f => f.Name).join(", ");
+    tlog(`Available filters: ${available}`);
+    if (!filters.length) return res.status(503).json({ error: "No filters available from NINA", log });
+
+    // Temporarily enable sequence state so stepCaptureFilter can run
+    const prevAborted  = seqState.aborted;
+    const prevRunning  = seqState.running;
+    seqState.aborted   = false;
+    seqState.running   = true;
+
+    try {
+      for (const filterName of testFilters) {
+        tlog(`\n--- Testing filter: ${filterName} ---`);
+
+        const filter = findFilterByName(filters, filterName);
+        if (!filter) {
+          tlog(`  SKIP: '${filterName}' not found in filterwheel`);
+          results.push({ filter: filterName, status: "SKIP", reason: "not in filterwheel" });
+          continue;
+        }
+
+        // Snapshot existing files BEFORE capture (avoids NAS/Windows clock-skew issue)
+        const beforeFiles = snapshotNasFiles();
+
+        // Run the real stepCaptureFilter — this triggers capture + patch
+        tlog(`  Calling stepCaptureFilter (${count} × ${duration}s, gain ${gain}) ...`);
+        await stepCaptureFilter(ninaConfig, "FILTER_TEST", filterName, count, duration, gain, filters);
+
+        // Find new FITS files by set-difference
+        const newFiles = [];
+        for (const entry of fs.readdirSync(NAS_WATCH_PATH, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const snapDir = path.join(NAS_WATCH_PATH, entry.name, "SNAPSHOT");
+          if (!fs.existsSync(snapDir)) continue;
+          for (const name of fs.readdirSync(snapDir)) {
+            if (!/\.(fit|fits)$/i.test(name)) continue;
+            const fullPath = path.join(snapDir, name);
+            if (beforeFiles.has(fullPath)) continue; // pre-existing — skip
+            // Read the FITS FILTER header
+            let header_filter = "?";
+            try {
+              const readScript = `from astropy.io import fits; h = fits.getheader(${JSON.stringify(fullPath)}, memmap=False); print(h.get('FILTER','?'))`;
+              header_filter = execSync(
+                `.venv/bin/python -c "${readScript.replace(/"/g, '\\"')}"`,
+                { cwd: path.join(__dirname, ".."), timeout: 10000 }
+              ).toString().trim();
+            } catch (e) {
+              header_filter = `ERROR: ${e.message.slice(0, 80)}`;
+            }
+            const pass = header_filter === filter.Name;
+            tlog(`  File: ${name}  FILTER header='${header_filter}'  expected='${filter.Name}'  → ${pass ? "PASS ✓" : "FAIL ✗"}`);
+            newFiles.push({ name, header_filter, expected: filter.Name, pass });
+          }
+        }
+
+        if (newFiles.length === 0) {
+          tlog(`  WARNING: No new files found — camera may not have saved`);
+          results.push({ filter: filterName, status: "NO_FILE", files: [] });
+        } else {
+          const allPass = newFiles.every(f => f.pass);
+          results.push({ filter: filterName, status: allPass ? "PASS" : "FAIL", files: newFiles });
+        }
+      }
+    } finally {
+      seqState.aborted  = prevAborted;
+      seqState.running  = prevRunning;
+    }
+
+    const overall = results.every(r => r.status === "PASS" || r.status === "SKIP")
+      ? "PASS" : "FAIL";
+    tlog(`\n=== Overall result: ${overall} ===`);
+    res.json({ overall, results, log });
+
+  } catch (e) {
+    tlog(`ERROR: ${e.message}`);
+    res.status(500).json({ error: e.message, log });
+  }
+});
+
+// ── STDWeb photometry proxy ───────────────────────────────────────────────────
+// GET /api/stdweb/task/:task_id/photometry
+// Returns photometry measurements for a task. Serves from DB when already
+// stored; fetches from STDWeb live otherwise and persists the result.
+app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
+  const { task_id } = req.params;
+  const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
+  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "1e296ddd6738af45467b7bc6558c00a9524447ab";
+  const headers = { "Authorization": `Token ${STDWEB_TOKEN}` };
+
+  try {
+    // Serve from DB only when photometry AND subtraction data are both present.
+    // If mag_sub and mag_sub_ul are both NULL the subtraction hasn't been
+    // stored yet — fetch live so we get the full result and persist it.
+    const stored = db.prepare(
+      `SELECT r.id, r.target, r.filter, r.obs_date, r.mjd,
+              r.mag_ap, r.magerr_ap, r.mag_sub, r.magerr_sub, r.mag_sub_ul, r.status
+       FROM pipeline_results r
+       WHERE r.stdweb_task_id = ?
+         AND r.mjd IS NOT NULL
+         AND (r.mag_sub IS NOT NULL OR r.mag_sub_ul IS NOT NULL)
+       LIMIT 1`
+    ).get(task_id);
+
+    if (stored) {
+      return res.json({
+        task_id: parseInt(task_id),
+        target: stored.target,
+        filter: stored.filter,
+        obs_date: stored.obs_date,
+        mjd:    stored.mjd,
+        direct: stored.mag_ap    != null ? { mag: stored.mag_ap,    magerr: stored.magerr_ap }    : null,
+        sub:    stored.mag_sub   != null ? { mag: stored.mag_sub,   magerr: stored.magerr_sub }   : null,
+        sub_ul: stored.mag_sub_ul != null ? { ul: stored.mag_sub_ul } : null,
+        from_db: true,
+      });
+    }
+
+    // Fetch live from STDWeb
+    const taskJson = await fetch(`${STDWEB_URL}/api/tasks/${task_id}/`, { headers })
+      .then(r => r.json()).catch(() => ({}));
+    const filter = taskJson?.config?.filter || "?";
+
+    const html = await fetch(`${STDWEB_URL}/tasks/${task_id}`, { headers })
+      .then(r => r.text()).catch(() => "");
+
+    const mjdMatch    = html.match(/MJD is ([\d.]+)/);
+    const directMatch = html.match(/Primary target magnitude is \w+ = ([\d.]+) \+\/- ([\d.]+)/);
+    const subMatch    = html.match(/Target magnitude is \w+ = ([\d.]+) \+\/- ([\d.]+)/);
+    const subUlMatch  = !subMatch && html.match(/Target magnitude upper limit is \w+ > ([\d.]+)/);
+
+    const mjd     = mjdMatch    ? parseFloat(mjdMatch[1])    : null;
+    const direct  = directMatch ? { mag: parseFloat(directMatch[1]), magerr: parseFloat(directMatch[2]) } : null;
+    const sub     = subMatch    ? { mag: parseFloat(subMatch[1]),    magerr: parseFloat(subMatch[2]) }    : null;
+    const sub_ul  = subUlMatch  ? { ul: parseFloat(subUlMatch[1]) } : null;
+
+    // Persist to DB if we got useful data
+    if (mjd != null) {
+      const obsDate = mjd ? (() => {
+        const jd = mjd + 2400000.5;
+        const d = new Date((jd - 2440587.5) * 86400000);
+        return d.toISOString().slice(0, 10);
+      })() : null;
+
+      try {
+        db.prepare(
+          `UPDATE pipeline_results
+           SET mjd=?, obs_date=COALESCE(obs_date,?),
+               mag_ap=?, magerr_ap=?, mag_sub=?, magerr_sub=?, mag_sub_ul=?,
+               updated_at=datetime('now')
+           WHERE stdweb_task_id=?`
+        ).run(mjd, obsDate,
+              direct?.mag ?? null, direct?.magerr ?? null,
+              sub?.mag    ?? null, sub?.magerr    ?? null,
+              sub_ul?.ul  ?? null,
+              task_id);
+      } catch { /* non-fatal */ }
+    }
+
+    res.json({
+      task_id: parseInt(task_id),
+      target: taskJson?.config?.target || null,
+      filter,
+      mjd,
+      direct,
+      sub,
+      sub_ul,
+      from_db: false,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Pipeline history search ───────────────────────────────────────────────────
+// GET /api/pipeline/history?target=&filter=&date_from=&date_to=&limit=
+app.get("/api/pipeline/history", (req, res) => {
+  try {
+    const { target, filter, date_from, date_to, limit = 200 } = req.query;
+    let sql = `
+      SELECT r.id, r.job_id, r.target, r.filter, r.exposure, r.n_frames,
+             r.obs_date, r.mjd, r.mag_ap, r.magerr_ap, r.mag_sub, r.magerr_sub,
+             r.mag_sub_ul, r.stdweb_task_id, r.stdweb_url, r.status,
+             j.fits_dir, j.created_at
+      FROM pipeline_results r
+      LEFT JOIN pipeline_jobs j ON j.id = r.job_id
+      WHERE r.status = 'done'`;
+    const params = [];
+    if (target) { sql += ` AND lower(r.target) LIKE lower(?)`; params.push(`%${target}%`); }
+    if (filter) { sql += ` AND r.filter = ?`; params.push(filter); }
+    if (date_from) { sql += ` AND r.obs_date >= ?`; params.push(date_from); }
+    if (date_to)   { sql += ` AND r.obs_date <= ?`; params.push(date_to); }
+    sql += ` ORDER BY r.obs_date DESC, r.id DESC LIMIT ?`;
+    params.push(parseInt(limit));
+
+    const rows = db.prepare(sql).all(...params);
+    res.json({ success: true, results: rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.use((req, res) => {
