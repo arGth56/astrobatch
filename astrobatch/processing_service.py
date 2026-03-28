@@ -1090,6 +1090,20 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
     for (obj, filt, exp_str), files in groups.items():
         jlog.info(f"\n--- Processing object={obj}  filter={filt}  exp={exp_str}s ({len(files)} frames) ---")
 
+        # Skip groups that already completed successfully in a previous run
+        try:
+            with _db() as conn:
+                existing_done = conn.execute(
+                    "SELECT id FROM pipeline_results WHERE job_id=? AND target=? AND filter=? AND status='done'",
+                    (job_id, obj, filt)
+                ).fetchone()
+        except Exception:
+            existing_done = None
+        if existing_done:
+            jlog.info(f"  Already done (result #{existing_done[0]}) — skipping")
+            success_count += 1
+            continue
+
         # Create a per-result row immediately
         result_id = create_result(job_id, filt, exp_str, len(files), target=obj, obs_date=date_str)
 
@@ -1323,24 +1337,6 @@ def _recover_queued_jobs():
                         (job_id,)
                     )
                 continue
-            # If every result is already done, just mark the job done — no re-run
-            with _db() as conn:
-                total = conn.execute(
-                    "SELECT COUNT(*) FROM pipeline_results WHERE job_id=?", (job_id,)
-                ).fetchone()[0]
-                done  = conn.execute(
-                    "SELECT COUNT(*) FROM pipeline_results WHERE job_id=? AND status='done'",
-                    (job_id,)
-                ).fetchone()[0]
-            if total > 0 and done == total:
-                log.info("  Skipping job %s — all %d result(s) already done", job_id, done)
-                with _db() as conn:
-                    conn.execute(
-                        "UPDATE pipeline_jobs SET status='done', error=NULL WHERE id=?",
-                        (job_id,)
-                    )
-                continue
-
             log.info("  Re-queuing job %s (%s) [was: %s]", job_id, target, old_status)
             # Delete non-done results to avoid duplicate rows on re-run
             with _db() as conn:
