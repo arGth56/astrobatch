@@ -10,6 +10,8 @@ ExecStart=/home/pyl/Documents/astrobatch/.venv/bin/python3 -m astrobatch.process
 Restart=always
 RestartSec=5
 Environment=DISPLAY=:0
+Environment=NIGHTMANAGER_DB=/home/pyl/Documents/astrobatch/nightmanager.db
+Environment=DATA_DIR=/mnt/usb/astrobatch_data
 
 StandardOutput=append:/var/log/astrobatch-processing.log
 StandardError=append:/var/log/astrobatch-processing.log
