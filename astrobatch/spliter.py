@@ -1813,8 +1813,8 @@ class PlateSolver:
             '--no-verify',          # Skip verification (faster)
             '--crpix-center',       # Put CRPIX at image center
             '--scale-units', 'arcsecperpix',  # Use arcsec/pixel for scale
-            '--scale-low', '1.5',   # Expected scale range (1.5-3.0 arcsec/pixel)
-            '--scale-high', '3.0',
+            '--scale-low', '0.8',   # Camera actual scale ~1.044 arcsec/pix; bracket with margin
+            '--scale-high', '1.3',
             '--downsample', '2',    # Downsample for faster solving
             '--cpulimit', '60',     # 60 second CPU limit
         ]
