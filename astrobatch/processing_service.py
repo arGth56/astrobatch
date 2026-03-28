@@ -1052,6 +1052,19 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
     if selected_files:
         jlog.info(f"Selected  : {len(selected_files)} specific file(s)")
 
+    # Purge any stale result rows from a previous run of this job so we start
+    # with a clean slate — avoids ghost errors in the UI from old failures.
+    try:
+        with _db() as conn:
+            deleted = conn.execute(
+                "DELETE FROM pipeline_results WHERE job_id=? AND status != 'done'",
+                (job_id,)
+            ).rowcount
+        if deleted:
+            jlog.info(f"Purged {deleted} stale result row(s) from previous run")
+    except Exception as exc:
+        jlog.warning(f"Could not purge old results: {exc}")
+
     fits_path = Path(fits_dir)
     date_str  = _detect_date(fits_path)
 
