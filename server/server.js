@@ -31,7 +31,16 @@ function callProcessingService(job_id, fits_dir, target, selected_files = null, 
         let data = "";
         res.on("data", (c) => (data += c));
         res.on("end", () => {
-          try { resolve(JSON.parse(data)); } catch { resolve({ raw: data }); }
+          let parsed;
+          try { parsed = JSON.parse(data); } catch { parsed = { raw: data }; }
+          // 409 = job already active in processing service → treat as idempotent success
+          if (res.statusCode === 409) {
+            resolve({ success: true, alreadyActive: true, ...parsed });
+          } else if (res.statusCode >= 400) {
+            resolve({ success: false, error: parsed.error || `HTTP ${res.statusCode}`, ...parsed });
+          } else {
+            resolve(parsed);
+          }
         });
       }
     );
@@ -47,7 +56,7 @@ const PORT = Number(process.env.PORT || 3000);
 const DEFAULT_NINA_HOST = process.env.NINA_HOST || "192.168.1.174";
 const DEFAULT_NINA_PORT = process.env.NINA_PORT || "1888";
 const DEFAULT_NINA_PROTOCOL = process.env.NINA_PROTOCOL || "http";
-const DEFAULT_OCS_HOST = process.env.OCS_HOST || "ocs.local";
+const DEFAULT_OCS_HOST = process.env.OCS_HOST || "192.168.1.220";
 const TNS_BOT_ID = process.env.TNS_BOT_ID || "";
 const TNS_BOT_NAME = process.env.TNS_BOT_NAME || "";
 const TNS_API_KEY = process.env.TNS_API_KEY || "";
@@ -180,6 +189,50 @@ try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_ap REAL").run()
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_sub REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub_ul REAL").run(); } catch { /* already exists */ }
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ocs_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL DEFAULT (datetime('now')),
+    roof      TEXT,
+    safe      TEXT,
+    rain      TEXT,
+    temp      REAL,
+    humidity  REAL,
+    pressure  REAL,
+    sky       REAL
+  );
+`);
+
+// ── OCS history poller ────────────────────────────────────────────────────────
+
+async function pollAndStoreOcs() {
+  try {
+    const host = DEFAULT_OCS_HOST;
+    const { ok, fields } = await ocsStatus(host);
+    if (!ok) return;
+    const temp     = parseFloat(fields.wea_temp);
+    const humidity = parseFloat(fields.wea_humd);
+    const pressure = parseFloat(fields.wea_pres);
+    const sky      = parseFloat(fields.wea_sky || fields.sqm || "");
+    db.prepare(
+      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      fields.roof_sta  || null,
+      fields.stat_safe || null,
+      fields.wea_rain  || null,
+      isNaN(temp)     ? null : temp,
+      isNaN(humidity) ? null : humidity,
+      isNaN(pressure) ? null : pressure,
+      isNaN(sky)      ? null : sky,
+    );
+  } catch (e) {
+    // OCS unreachable — skip silently (don't fill logs with noise)
+    if (process.env.DEBUG) console.error("[OCS poller]", e.message);
+  }
+}
+
+setInterval(pollAndStoreOcs, 10 * 60 * 1000);  // every 10 min
+setTimeout(pollAndStoreOcs, 8000);              // initial reading after server startup
 
 // ── Queue persistence helpers ─────────────────────────────────────────────────
 
@@ -1308,9 +1361,24 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
     const beforeFiles = snapshotNasFiles(); // snapshot before capture for set-difference check
 
     // ninaAPI capture is non-blocking — it starts the exposure and returns immediately
-    const captureResult = await callNinaLong(
-      target, "/v2/api/equipment/camera/capture", capturePayload, 30000,
-    );
+    let captureResult;
+    try {
+      captureResult = await callNinaLong(
+        target, "/v2/api/equipment/camera/capture", capturePayload, 30000,
+      );
+    } catch (fetchErr) {
+      // Network-level error (fetch failed, ECONNREFUSED, ETIMEDOUT) — retry once after 15s
+      seqLog(`${filterName} ${i}/${count}: network error (${fetchErr.message}) — retrying in 15s...`, "warn");
+      await new Promise(r => setTimeout(r, 15000));
+      try {
+        captureResult = await callNinaLong(
+          target, "/v2/api/equipment/camera/capture", capturePayload, 30000,
+        );
+      } catch (retryErr) {
+        seqLog(`${filterName} ${i}/${count}: retry also failed (${retryErr.message}) — skipping frame`, "warn");
+        continue;
+      }
+    }
 
     if (!isNinaApiSuccess(captureResult)) {
       seqLog(`${filterName} ${i}/${count}: failed to start — ${captureResult.body?.Error || captureResult.status}`, "warn");
@@ -1573,12 +1641,47 @@ async function runSequence(ninaConfig, seqConfig) {
         // User abort propagates up to the outer handler — stop the whole sequence
         if (err.message === "__ABORTED__") throw err;
 
-        // Any other error: log it, home mount, skip to next target
-        t.error = err.message;
-        seqLog(`✗ ${t.name} failed: ${err.message}`, "error");
-        seqLog(`  Homing mount before next target...`);
-        await safeHome();
-        seqLog(`  Continuing to next target`);
+        const isTransient = /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND/i.test(err.message);
+        const MAX_TARGET_RETRIES = 2;
+        let targetSucceeded = false;
+
+        if (isTransient) {
+          for (let attempt = 1; attempt <= MAX_TARGET_RETRIES && !targetSucceeded; attempt++) {
+            seqLog(`✗ ${t.name} transient error (${err.message}) — retry ${attempt}/${MAX_TARGET_RETRIES} in 30s...`, "warn");
+            await new Promise(r => setTimeout(r, 30000));
+            try {
+              // Re-run the full target block after transient error
+              const { equipmentInfo: reInfo } = await getEquipmentInfo(ninaConfig);
+              const reFilters = reInfo?.FilterWheel?.AvailableFilters || [];
+              await stepUnparkMount(ninaConfig);
+              await checkTargetAboveHorizon(ninaConfig, t.raDeg, t.decDeg, t.name);
+              const useCenter = solveEnabled !== false;
+              await stepSlewToTarget(ninaConfig, t.raDeg, t.decDeg, t.name, { center: useCenter });
+              await stepStartGuiding(ninaConfig);
+              await stepAutofocus(ninaConfig);
+              for (const filterName of verifiedFilters) {
+                checkAbort();
+                await assertCameraIdle(ninaConfig, `before ${filterName} captures`);
+                await stepCaptureFilter(ninaConfig, t.name, filterName, count, duration, gain, reFilters);
+              }
+              t.done = true;
+              saveQueue();
+              seqLog(`${t.name} — recovered and complete ✓`);
+              targetSucceeded = true;
+            } catch (retryErr) {
+              if (retryErr.message === "__ABORTED__") throw retryErr;
+              err = retryErr; // update err for next iteration / final log
+            }
+          }
+        }
+
+        if (!targetSucceeded) {
+          t.error = err.message;
+          seqLog(`✗ ${t.name} failed: ${err.message}`, "error");
+          seqLog(`  Homing mount before next target...`);
+          await safeHome();
+          seqLog(`  Continuing to next target`);
+        }
       }
     }
 
@@ -2100,6 +2203,50 @@ app.post("/api/ocs/roof", async (req, res) => {
   }
 });
 
+app.get("/api/ocs/history", (req, res) => {
+  const hours = Math.min(Number(req.query.hours) || 48, 168); // max 7 days
+  const rows = db.prepare(
+    `SELECT id, ts, roof, safe, rain, temp, humidity, pressure, sky
+     FROM ocs_history
+     WHERE ts >= datetime('now', ? || ' hours')
+     ORDER BY ts ASC`
+  ).all(`-${hours}`);
+  res.json({ success: true, history: rows, hours });
+});
+
+app.post("/api/ocs/poll-now", async (req, res) => {
+  try {
+    const host = validateOcsHost(req.body?.ocsHost || DEFAULT_OCS_HOST);
+    const { ok, fields } = await ocsStatus(host);
+    if (!ok) return res.status(502).json({ success: false, error: "OCS returned non-OK status" });
+
+    const temp     = parseFloat(fields.wea_temp);
+    const humidity = parseFloat(fields.wea_humd);
+    const pressure = parseFloat(fields.wea_pres);
+    const sky      = parseFloat(fields.wea_sky || fields.sqm || "");
+
+    const result = db.prepare(
+      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      fields.roof_sta  || null,
+      fields.stat_safe || null,
+      fields.wea_rain  || null,
+      isNaN(temp)     ? null : temp,
+      isNaN(humidity) ? null : humidity,
+      isNaN(pressure) ? null : pressure,
+      isNaN(sky)      ? null : sky,
+    );
+
+    const row = db.prepare("SELECT * FROM ocs_history WHERE id = ?").get(result.lastInsertRowid);
+    res.json({ success: true, row });
+  } catch (error) {
+    res.status(502).json({
+      success: false,
+      error: error.name === "AbortError" ? "OCS connection timed out" : error.message,
+    });
+  }
+});
+
 // ── Saved Targets routes ──────────────────────────────────────────────────────
 
 app.get("/api/targets", (req, res) => {
@@ -2137,10 +2284,12 @@ app.get("/api/pipeline/jobs", (req, res) => {
   const jobs = db.prepare(
     "SELECT * FROM pipeline_jobs ORDER BY created_at DESC LIMIT 100"
   ).all();
+  if (!jobs.length) return res.json({ success: true, jobs: [] });
+  const ids = jobs.map(j => j.id);
+  const placeholders = ids.map(() => "?").join(",");
   const results = db.prepare(
-    "SELECT * FROM pipeline_results ORDER BY created_at ASC"
-  ).all();
-  // Attach results array to each job
+    `SELECT * FROM pipeline_results WHERE job_id IN (${placeholders}) ORDER BY created_at ASC`
+  ).all(...ids);
   const resultsByJob = {};
   for (const r of results) {
     if (!resultsByJob[r.job_id]) resultsByJob[r.job_id] = [];
