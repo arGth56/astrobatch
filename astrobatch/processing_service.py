@@ -1044,6 +1044,7 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
 def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
                   selected_files: list[str] | None = None,
                   object_filter: str | None = None):
+    update_job(job_id, "running")
     jlog.info(f"=== Job {job_id} started ===")
     jlog.info(f"Input dir : {fits_dir}")
     if object_filter:
@@ -1210,23 +1211,42 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
 
 # ── Sequential job queue ──────────────────────────────────────────────────────
 # A single worker thread drains this queue so jobs run one at a time.
-# Each item is a callable (no arguments) that runs the full pipeline/resume.
+# Each item is a (job_id, callable) tuple so we can deduplicate and track.
 _job_queue: queue.Queue = queue.Queue()
-_worker_lock = threading.Lock()   # ensures only one worker spawned at a time
+_worker_lock  = threading.Lock()
+_active_jobs: set[int] = set()      # job_ids currently queued OR running
+_active_lock  = threading.Lock()
+_current_job_id: int | None = None  # job_id currently executing
+
+
+def _enqueue_job(job_id: int, task_fn) -> bool:
+    """Add job_id to queue. Returns False (409) if already queued/running."""
+    with _active_lock:
+        if job_id in _active_jobs:
+            return False
+        _active_jobs.add(job_id)
+    _job_queue.put((job_id, task_fn))
+    return True
 
 
 def _queue_worker():
+    global _current_job_id
     log.info("Pipeline worker thread started")
     while True:
         try:
-            task = _job_queue.get(timeout=5)   # timeout so we can check if we should keep running
+            item = _job_queue.get(timeout=5)
         except queue.Empty:
             continue
+        job_id, task = item
+        _current_job_id = job_id
         try:
             task()
-        except BaseException as exc:           # catch SystemExit / KeyboardInterrupt too
+        except BaseException as exc:
             log.exception("Unhandled exception in queue worker task: %s", exc)
         finally:
+            _current_job_id = None
+            with _active_lock:
+                _active_jobs.discard(job_id)
             try:
                 _job_queue.task_done()
             except Exception:
@@ -1259,17 +1279,16 @@ threading.Thread(target=_watchdog, daemon=True, name="pipeline-watchdog").start(
 
 
 def _recover_queued_jobs():
-    """On startup, re-enqueue any jobs that were left in a running/queued state
-    because the service was restarted mid-execution.
-    
-    - 'queued': waiting to start → re-enqueue as-is
-    - 'scanning'/'splitting'/'calibrating'/'solving'/'uploading'/'inspecting'/
-      'photometrizing'/'subtracting': were running when service crashed → re-enqueue
-      (they will restart from scratch; this is safe because prepare_work_dir skips
-       already-copied files)
+    """On startup, re-enqueue any jobs left in an interrupted state.
+
+    Includes 'running' (crashed mid-execution) and all intermediate step statuses.
+    Deletes non-done pipeline_results before re-queuing to avoid duplicates.
     """
-    RECOVERABLE = {'queued', 'scanning', 'splitting', 'calibrating', 'solving',
-                   'uploading', 'inspecting', 'photometrizing', 'subtracting'}
+    RECOVERABLE = {
+        'queued', 'running',
+        'scanning', 'splitting', 'calibrating', 'solving',
+        'uploading', 'inspecting', 'photometry', 'subtraction',
+    }
     try:
         with _db() as conn:
             rows = conn.execute(
@@ -1291,7 +1310,7 @@ def _recover_queued_jobs():
                         (job_id,)
                     )
                 continue
-            # Don't re-run jobs that already have all results done
+            # If every result is already done, just mark the job done — no re-run
             with _db() as conn:
                 total = conn.execute(
                     "SELECT COUNT(*) FROM pipeline_results WHERE job_id=?", (job_id,)
@@ -1310,24 +1329,22 @@ def _recover_queued_jobs():
                 continue
 
             log.info("  Re-queuing job %s (%s) [was: %s]", job_id, target, old_status)
-            # Reset any stuck result rows so the pipeline re-runs them cleanly
+            # Delete non-done results to avoid duplicate rows on re-run
             with _db() as conn:
                 conn.execute(
-                    "UPDATE pipeline_results SET status='queued', error=NULL "
-                    "WHERE job_id=? AND status NOT IN ('done')",
+                    "DELETE FROM pipeline_results WHERE job_id=? AND status != 'done'",
                     (job_id,)
                 )
                 conn.execute(
                     "UPDATE pipeline_jobs SET status='queued', error=NULL WHERE id=?",
                     (job_id,)
                 )
-            # For SNAPSHOT folders, object_filter must match the job's target so we
-            # don't inadvertently process every object in the directory.
             is_snapshot = fits_dir and Path(fits_dir).name.upper() == "SNAPSHOT"
-            obj_filter = (target_filter or target) if is_snapshot else None
-            _job_queue.put(lambda jid=int(job_id), fd=fits_dir, t=target or "Unknown",
-                                  of=obj_filter:
-                           run_pipeline(jid, fd, t, object_filter=of))
+            obj_filter  = (target_filter or target) if is_snapshot else None
+            _enqueue_job(int(job_id),
+                         lambda jid=int(job_id), fd=fits_dir, t=target or "Unknown",
+                                of=obj_filter:
+                         run_pipeline(jid, fd, t, object_filter=of))
     except Exception as exc:
         log.error("Job recovery failed: %s", exc)
 
@@ -1339,11 +1356,22 @@ threading.Timer(2.0, _recover_queued_jobs).start()
 
 @app.route("/health", methods=["GET"])
 def health():
+    db_ok = True
+    try:
+        with _db() as conn:
+            conn.execute("SELECT 1").fetchone()
+    except Exception:
+        db_ok = False
+    with _active_lock:
+        active = list(_active_jobs)
     return jsonify({
-        "status": "ok",
+        "status": "ok" if _worker_thread.is_alive() and db_ok else "degraded",
         "service": "processing_service",
         "queue_depth": _job_queue.qsize(),
+        "current_job": _current_job_id,
+        "active_jobs": active,
         "worker_alive": _worker_thread.is_alive(),
+        "db_ok": db_ok,
     })
 
 
@@ -1364,14 +1392,20 @@ def trigger():
     if not Path(fits_dir).exists():
         return jsonify({"success": False, "error": f"Directory not found: {fits_dir}"}), 400
 
-    _job_queue.put(lambda jid=int(job_id), fd=fits_dir, t=target,
-                              sf=selected_files, of=object_filter:
-                   run_pipeline(jid, fd, t, selected_files=sf, object_filter=of))
+    enqueued = _enqueue_job(
+        int(job_id),
+        lambda jid=int(job_id), fd=fits_dir, t=target,
+               sf=selected_files, of=object_filter:
+        run_pipeline(jid, fd, t, selected_files=sf, object_filter=of)
+    )
+    if not enqueued:
+        return jsonify({"success": True, "job_id": job_id,
+                        "message": "Already active — skipped duplicate"}), 409
 
-    queue_pos = _job_queue.qsize()
+    queue_depth = _job_queue.qsize()
+    msg = "Running" if _current_job_id is None else f"Queued (position {queue_depth})"
     return jsonify({"success": True, "job_id": job_id,
-                    "message": "Queued" if queue_pos > 1 else "Started",
-                    "queue_position": queue_pos})
+                    "message": msg, "queue_depth": queue_depth})
 
 
 @app.route("/resume", methods=["POST"])
