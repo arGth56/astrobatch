@@ -5,34 +5,45 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NINA Control Dashboard</title>
     <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   </head>
   <body>
     <main class="container">
       <h1>NINA Control Dashboard</h1>
 
       <section class="panel">
-        <h2>1) Connect to NINA API</h2>
-        <form id="config-form">
-          <label>
-            Host
-            <input id="host" name="host" type="text" placeholder="192.168.1.174" value="192.168.1.174" required />
-          </label>
-          <label>
-            Port
-            <input id="port" name="port" type="number" min="1" max="65535" placeholder="1888" required />
-          </label>
-          <label>
-            Protocol
-            <select id="protocol" name="protocol">
-              <option value="http">http</option>
-              <option value="https">https</option>
-            </select>
-          </label>
-          <div class="buttons">
-            <button type="submit">Test Connection</button>
+        <h2>1) Connect to NINA &amp; OCS</h2>
+
+        <div class="connect-row">
+          <div class="connect-block">
+            <h3>NINA API</h3>
+            <form id="config-form">
+              <label>Host<input id="host" name="host" type="text" placeholder="192.168.1.174" value="192.168.1.174" required /></label>
+              <label>Port<input id="port" name="port" type="number" min="1" max="65535" placeholder="1888" required /></label>
+              <label>Protocol
+                <select id="protocol" name="protocol">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </label>
+              <div class="buttons">
+                <button type="submit">Test / Refresh</button>
+              </div>
+            </form>
+            <p id="connection-status" class="status">Not tested yet.</p>
           </div>
-        </form>
-        <p id="connection-status" class="status">Not tested yet.</p>
+
+          <div class="connect-block">
+            <h3>OCS <small style="color:#6b7280;font-weight:400;">(Observatory Control System)</small></h3>
+            <form id="ocs-connect-form" class="inline-form">
+              <label>Host<input id="ocs-host-top" type="text" placeholder="192.168.1.220" value="192.168.1.220" /></label>
+              <div class="buttons">
+                <button type="submit">Test / Refresh</button>
+              </div>
+            </form>
+            <p id="ocs-connection-status" class="ocs-status-indicator offline">OCS — not tested yet.</p>
+          </div>
+        </div>
       </section>
 
       <section class="panel">
@@ -41,10 +52,9 @@
           <button id="tab-actions" class="tab-button" type="button">Actions</button>
           <button id="tab-dome" class="tab-button" type="button">Dome</button>
           <button id="tab-target" class="tab-button" type="button">Target</button>
-          <button id="tab-todo" class="tab-button" type="button">ToDo</button>
+          <button id="tab-todo" class="tab-button" type="button">Night Plan</button>
           <button id="tab-pipeline" class="tab-button" type="button">Pipeline</button>
           <button id="tab-history" class="tab-button" type="button">History</button>
-          <button id="tab-nightplan" class="tab-button" type="button">Night Plan</button>
         </div>
 
         <div id="panel-devices" class="tab-panel active">
@@ -167,6 +177,33 @@
             <button id="dome-close" type="button" class="btn-danger">Close Roof</button>
             <button id="dome-stop" type="button" class="btn-stop">Stop!</button>
           </div>
+
+          <hr style="margin:20px 0; border-color: #333;" />
+
+          <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
+            <h3 style="margin:0;">48h Weather Timeline</h3>
+            <select id="ocs-history-hours" style="background:#1a1a1a;color:#ccc;border:1px solid #444;padding:3px 8px;border-radius:4px;">
+              <option value="12">Last 12 h</option>
+              <option value="24">Last 24 h</option>
+              <option value="48" selected>Last 48 h</option>
+              <option value="72">Last 72 h</option>
+            </select>
+            <button id="ocs-history-refresh" type="button" style="padding:3px 10px;">Refresh</button>
+            <button id="ocs-poll-now" type="button" style="padding:3px 10px;" title="Force an immediate OCS reading and add it to the graph">Poll Now</button>
+            <span id="ocs-history-status" style="color:#888;font-size:0.85em;"></span>
+          </div>
+
+          <div style="position:relative; background:#111; border-radius:6px; padding:12px; border:1px solid #2a2a2a;">
+            <canvas id="ocs-history-chart" style="width:100%; height:320px;"></canvas>
+          </div>
+          <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:16px; font-size:0.8em; color:#888;">
+            <span><span style="display:inline-block;width:12px;height:3px;background:#f59e0b;vertical-align:middle;margin-right:4px;"></span>Temperature (°C)</span>
+            <span><span style="display:inline-block;width:12px;height:3px;background:#38bdf8;vertical-align:middle;margin-right:4px;"></span>Humidity (%)</span>
+            <span><span style="display:inline-block;width:12px;height:3px;background:#a78bfa;vertical-align:middle;margin-right:4px;"></span>Pressure (hPa)</span>
+            <span><span style="display:inline-block;width:12px;height:3px;background:#22d3ee;vertical-align:middle;margin-right:4px;"></span>Sky Quality (mag/″²)</span>
+            <span style="margin-left:8px;"><span style="display:inline-block;width:12px;height:10px;background:rgba(34,197,94,0.35);vertical-align:middle;margin-right:4px;border-radius:2px;"></span>Roof open</span>
+            <span><span style="display:inline-block;width:12px;height:10px;background:rgba(99,102,241,0.45);vertical-align:middle;margin-right:4px;border-radius:2px;"></span>Rain</span>
+          </div>
         </div>
 
         <div id="panel-target" class="tab-panel">
@@ -216,7 +253,7 @@
             <div class="target-header">
               <span id="target-full-name" class="target-title"></span>
               <a id="target-tns-link" href="#" target="_blank" class="tns-link">View on TNS</a>
-              <button id="add-to-todo" type="button" class="btn-add-todo">+ Add to ToDo</button>
+              <button id="add-to-todo" type="button" class="btn-add-todo">+ Add to Night Plan</button>
             </div>
 
             <table class="target-table">
@@ -273,7 +310,7 @@
 
         <!-- ToDo / Observation Queue tab -->
         <div id="panel-todo" class="tab-panel">
-          <h2>Observation Queue</h2>
+          <h2>Night Plan</h2>
 
           <details class="seq-config">
             <summary>Sequence Parameters</summary>
@@ -292,6 +329,14 @@
               <label>PS exposure (s)<input id="seq-solve-exp" type="number" min="1" step="1" value="5" /></label>
               <label>Accuracy (&quot;)<input id="seq-solve-threshold" type="number" min="5" step="5" value="60" /></label>
             </div>
+            <div class="seq-config-divider">Per-Frame Pointing Check</div>
+            <div class="inline-form seq-config-form">
+              <label class="seq-toggle-label">
+                <input id="seq-frame-check-enable" type="checkbox" />
+                Plate-solve each frame &amp; check pointing
+              </label>
+              <label>Threshold (arcmin)<input id="seq-frame-check-threshold" type="number" min="1" step="1" value="5" /></label>
+            </div>
             <div class="seq-config-divider">Execution Mode</div>
             <div class="inline-form seq-config-form">
               <label class="seq-toggle-label">
@@ -299,10 +344,19 @@
                 Manual step mode <small style="color:#6b7280;">(confirm each step before continuing)</small>
               </label>
             </div>
+            <div class="seq-config-divider">Night Plan Constraints</div>
+            <div class="inline-form seq-config-form">
+              <label>AF overhead (min)<input id="np-af" type="number" min="0" step="0.5" value="3" /></label>
+              <label>Slew + center (min)<input id="np-slew" type="number" min="0" step="0.5" value="3" /></label>
+              <label>Save overhead (s/frame)<input id="np-save" type="number" min="0" step="1" value="5" /></label>
+              <label>Min altitude (°)<input id="np-minalt" type="number" min="0" max="90" step="5" value="20" /></label>
+              <label>Init duration (min)<input id="np-init-min" type="number" min="0" step="1" value="10" title="Open roof, unpark, cool camera…" /></label>
+              <label>End duration (min)<input id="np-end-min" type="number" min="0" step="1" value="10" title="Park mount, close roof…" /></label>
+            </div>
           </details>
 
           <div id="seq-queue-empty" class="seq-empty">
-            Queue is empty — look up a target in the Target tab and press "+ Add to ToDo"
+            Queue is empty — look up a target in the Target tab and press "+ Add to Night Plan"
           </div>
           <ol id="seq-queue-list" class="seq-queue"></ol>
 
@@ -311,6 +365,7 @@
             <button id="seq-abort" type="button" class="btn-danger" disabled>■ Abort</button>
             <button id="seq-restart" type="button">↺ Restart</button>
             <button id="seq-clear" type="button">Clear All</button>
+            <button id="seq-add-wait" type="button" title="Insert a 'wait until HH:MM' pause at the end of the queue">⏳ Add Wait</button>
             <button id="seq-reset-af" type="button" class="btn-small">Reset AF Timer</button>
           </div>
 
@@ -332,11 +387,54 @@
             <div id="seq-progress-wrap" class="seq-progress-wrap" style="display:none;">
               <div id="seq-progress-bar" class="seq-progress-bar"></div>
             </div>
+            <div id="seq-frame-solve-row" style="display:none;margin-top:6px;font-size:12px;"></div>
           </div>
 
-          <!-- Log -->
+          <!-- Sequence Log -->
           <div class="seq-log-header">Sequence Log</div>
           <div id="seq-log" class="seq-log"></div>
+
+          <!-- ── 7Timer Weather ──────────────────────────────────────────────── -->
+          <div class="seq-log-header" style="margin-top:24px;display:flex;align-items:center;justify-content:space-between;">
+            <span>Weather Forecast (7Timer ASTRO)</span>
+            <button id="np-weather-btn" type="button" style="font-size:12px;padding:2px 10px;">↺ Refresh</button>
+          </div>
+          <div id="np-weather-container" style="margin-top:8px;">
+            <p id="np-weather-status" style="color:#6b8090;font-size:13px;margin:0;">Set observer location to fetch forecast.</p>
+          </div>
+
+          <!-- ── Night Plan graph ───────────────────────────────────────────── -->
+          <div class="seq-log-header" style="margin-top:24px;">Altitude Chart</div>
+
+          <div id="nightplan-info-bar" class="nightplan-info-bar">Computing night info…</div>
+
+          <div style="position:relative;margin-top:10px;">
+            <canvas id="nightplan-canvas" style="width:100%;height:510px;border-radius:6px;display:block;background:#090d18;"></canvas>
+          </div>
+
+          <div class="buttons" style="margin-top:10px;">
+            <button id="np-optimize-btn" type="button">⚡ Optimize Order</button>
+            <button id="np-refresh-btn" type="button">↺ Refresh chart</button>
+          </div>
+
+          <p id="nightplan-empty" class="seq-empty" style="display:none;">
+            No targets in queue with coordinates — add targets via the Target tab.
+          </p>
+
+          <table id="nightplan-table" style="margin-top:16px;display:none;">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Target</th>
+                <th>Start</th>
+                <th>End</th>
+                <th>Duration</th>
+                <th>Alt range</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="nightplan-tbody"></tbody>
+          </table>
         </div>
 
         <!-- Pipeline tab -->
@@ -432,22 +530,6 @@
             <tbody id="pipeline-tbody"></tbody>
           </table>
 
-          <!-- Stacked results browser -->
-          <h3 style="margin-top:28px;">Stacked Results</h3>
-          <table id="results-table" style="display:none;">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Target</th>
-                <th>Filter</th>
-                <th>Exp</th>
-                <th>Size</th>
-                <th>Download</th>
-              </tr>
-            </thead>
-            <tbody id="results-tbody"></tbody>
-          </table>
-          <p id="results-empty" class="seq-empty">No stacked results yet.</p>
         </div>
 
         <!-- History tab -->
@@ -521,57 +603,56 @@
           </div>
         </div>
 
-        <!-- Night Plan tab -->
-        <div id="panel-nightplan" class="tab-panel">
-          <h2>Night Plan</h2>
 
-          <div id="nightplan-info-bar" class="nightplan-info-bar">Computing night info…</div>
-
-          <details class="seq-config" open>
-            <summary>Overhead &amp; Constraints</summary>
-            <div class="inline-form seq-config-form" style="margin-top:10px;">
-              <label>AF overhead (min)<input id="np-af" type="number" min="0" step="0.5" value="3" /></label>
-              <label>Slew + center (min)<input id="np-slew" type="number" min="0" step="0.5" value="3" /></label>
-              <label>Save overhead (s/frame)<input id="np-save" type="number" min="0" step="1" value="5" /></label>
-              <label>Min altitude (°)<input id="np-minalt" type="number" min="0" max="90" step="5" value="20" /></label>
-            </div>
-            <p style="font-size:12px;color:#6b7280;margin:4px 0 0;">
-              Exposure, filter count and frames per filter are read from the <strong>ToDo</strong> tab's Sequence Parameters.
-            </p>
-          </details>
-
-          <div style="position:relative;margin-top:14px;">
-            <canvas id="nightplan-canvas" style="width:100%;height:480px;border-radius:6px;display:block;background:#090d18;"></canvas>
-          </div>
-
-          <div class="buttons" style="margin-top:12px;">
-            <button id="np-optimize-btn" type="button">⚡ Optimize Order</button>
-            <button id="np-refresh-btn" type="button">↺ Refresh</button>
-          </div>
-
-          <p id="nightplan-empty" class="seq-empty" style="display:none;">
-            No targets in queue with coordinates — add targets via the Target tab → "+ Add to ToDo".
-          </p>
-
-          <table id="nightplan-table" style="margin-top:16px;display:none;">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Target</th>
-                <th>Start</th>
-                <th>End</th>
-                <th>Duration</th>
-                <th>Alt range</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="nightplan-tbody"></tbody>
-          </table>
-        </div>
 
         <pre id="log" class="log"></pre>
       </section>
     </main>
+
+    <!-- ── Safety Override Modal ──────────────────────────────────────────── -->
+    <div id="safety-modal" style="display:none; position:fixed; inset:0;
+         background:rgba(0,0,0,.75); z-index:2000; overflow:auto; padding:20px;
+         display:none; align-items:center; justify-content:center;">
+      <div style="max-width:520px; width:100%; background:#1a0f0f; border:2px solid #b91c1c;
+                  border-radius:10px; padding:28px 28px 24px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+          <span style="font-size:28px; line-height:1;">⛔</span>
+          <h3 style="margin:0; color:#fca5a5; font-size:17px;">Safety Check Failed</h3>
+        </div>
+        <p id="safety-modal-message"
+           style="color:#fde8e8; font-size:14px; margin:0 0 16px; line-height:1.6;"></p>
+        <table id="safety-modal-table" style="width:100%; font-size:13px; margin-bottom:20px;
+               border-collapse:collapse;">
+          <tbody>
+            <tr><td style="color:#9ca3af; padding:4px 8px 4px 0;">OCS</td>
+                <td id="sm-ocs" style="color:#f9fafb; padding:4px 0;"></td></tr>
+            <tr><td style="color:#9ca3af; padding:4px 8px 4px 0;">Safety</td>
+                <td id="sm-safe" style="color:#f9fafb; padding:4px 0;"></td></tr>
+            <tr><td style="color:#9ca3af; padding:4px 8px 4px 0;">Roof</td>
+                <td id="sm-roof" style="color:#f9fafb; padding:4px 0;"></td></tr>
+            <tr><td style="color:#9ca3af; padding:4px 8px 4px 0;">Rain</td>
+                <td id="sm-rain" style="color:#f9fafb; padding:4px 0;"></td></tr>
+          </tbody>
+        </table>
+        <p style="color:#fbbf24; font-size:12px; margin:0 0 20px;">
+          ⚠ Overriding will move the mount regardless of safety status. Only do this if you are
+          certain the roof is open and it is safe to operate.
+        </p>
+        <div style="display:flex; gap:12px; justify-content:flex-end;">
+          <button id="safety-abort-btn" type="button"
+                  style="background:#7f1d1d; border:1px solid #b91c1c; color:#fca5a5;
+                         border-radius:5px; padding:8px 22px; font-size:14px; cursor:pointer;">
+            ■ Abort Sequence
+          </button>
+          <button id="safety-override-btn" type="button"
+                  style="background:#78350f; border:1px solid #d97706; color:#fde68a;
+                         border-radius:5px; padding:8px 22px; font-size:14px; cursor:pointer;
+                         font-weight:600;">
+            ⚠ Override — Move Anyway
+          </button>
+        </div>
+      </div>
+    </div>
 
     <script src="/astronomy.js"></script>
     <script src="/nightplan.js"></script>
