@@ -8,10 +8,9 @@ const tabDevicesBtn  = document.getElementById("tab-devices");
 const tabActionsBtn  = document.getElementById("tab-actions");
 const tabDomeBtn     = document.getElementById("tab-dome");
 const tabTargetBtn   = document.getElementById("tab-target");
-const tabTodoBtn     = document.getElementById("tab-todo");
+const tabTodoBtn      = document.getElementById("tab-todo");
 const tabPipelineBtn  = document.getElementById("tab-pipeline");
 const tabHistoryBtn   = document.getElementById("tab-history");
-const tabNightPlanBtn = document.getElementById("tab-nightplan");
 const panelDevices    = document.getElementById("panel-devices");
 const panelActions    = document.getElementById("panel-actions");
 const panelDome       = document.getElementById("panel-dome");
@@ -19,7 +18,6 @@ const panelTarget     = document.getElementById("panel-target");
 const panelTodo       = document.getElementById("panel-todo");
 const panelPipeline   = document.getElementById("panel-pipeline");
 const panelHistory    = document.getElementById("panel-history");
-const panelNightPlan  = document.getElementById("panel-nightplan");
 
 const cameraCaptureForm = document.getElementById("camera-capture-form");
 const filterwheelForm = document.getElementById("filterwheel-form");
@@ -50,14 +48,20 @@ const ocsSafetyEl = document.getElementById("status-safetymonitor");
 const ocsSafetyDetailEl = document.getElementById("detail-safetymonitor");
 
 let lastEquipment = null;
-let ocsHost = "ocs.local";
+let ocsHost = "192.168.1.220";
+let ocsConnected = false;
 let observerLocation = { lat: null, lon: null, elevation: null };
 let lastTargetCoords = { raDeg: null, decDeg: null };
 let lastTnsTarget = null;
 
 // Sequence polling
-let seqPollInterval = null;
+let seqPollInterval    = null;
 let seqLogRenderedCount = 0;
+
+// Drag-and-drop state (module-level so re-renders during polling don't lose it)
+let _seqDragSrc        = null;
+let _seqDragging       = false;
+let _seqDragInsertAfter = false; // last hover half from dragover, used by drop
 
 function currentConfig() {
   return {
@@ -72,32 +76,27 @@ function setLog(value) {
 }
 
 function setActiveTab(tab) {
-  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false, nightplan: false };
+  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false };
   tabs[tab] = true;
-  tabDevicesBtn.classList.toggle("active",   tabs.devices);
-  tabActionsBtn.classList.toggle("active",   tabs.actions);
-  tabDomeBtn.classList.toggle("active",      tabs.dome);
-  tabTargetBtn.classList.toggle("active",    tabs.target);
-  tabTodoBtn.classList.toggle("active",      tabs.todo);
-  tabPipelineBtn.classList.toggle("active",  tabs.pipeline);
-  tabHistoryBtn.classList.toggle("active",   tabs.history);
-  tabNightPlanBtn.classList.toggle("active", tabs.nightplan);
-  panelDevices.classList.toggle("active",    tabs.devices);
-  panelActions.classList.toggle("active",    tabs.actions);
-  panelDome.classList.toggle("active",       tabs.dome);
-  panelTarget.classList.toggle("active",     tabs.target);
-  panelTodo.classList.toggle("active",       tabs.todo);
-  panelPipeline.classList.toggle("active",   tabs.pipeline);
-  panelHistory.classList.toggle("active",    tabs.history);
-  panelNightPlan.classList.toggle("active",  tabs.nightplan);
-
-  if (tab === "nightplan") {
-    initNightPlan();
-    refreshNightPlan();
-  }
+  tabDevicesBtn.classList.toggle("active",  tabs.devices);
+  tabActionsBtn.classList.toggle("active",  tabs.actions);
+  tabDomeBtn.classList.toggle("active",     tabs.dome);
+  tabTargetBtn.classList.toggle("active",   tabs.target);
+  tabTodoBtn.classList.toggle("active",     tabs.todo);
+  tabPipelineBtn.classList.toggle("active", tabs.pipeline);
+  tabHistoryBtn.classList.toggle("active",  tabs.history);
+  panelDevices.classList.toggle("active",   tabs.devices);
+  panelActions.classList.toggle("active",   tabs.actions);
+  panelDome.classList.toggle("active",      tabs.dome);
+  panelTarget.classList.toggle("active",    tabs.target);
+  panelTodo.classList.toggle("active",      tabs.todo);
+  panelPipeline.classList.toggle("active",  tabs.pipeline);
+  panelHistory.classList.toggle("active",   tabs.history);
 
   if (tab === "todo") {
     startSeqPolling();
+    initNightPlan();
+    refreshNightPlan();
   } else {
     stopSeqPolling();
   }
@@ -109,23 +108,33 @@ function setActiveTab(tab) {
 }
 
 function currentOcsHost() {
-  return document.getElementById("dome-ocs-host").value.trim() || ocsHost;
+  // Primary source: top-level OCS host input; fallback to Dome tab input
+  const top = document.getElementById("ocs-host-top");
+  return (top?.value.trim()) || document.getElementById("dome-ocs-host").value.trim() || ocsHost;
 }
 
-function setOcsStatus(roof = {}) {
+function syncOcsHostInputs(host) {
+  const top = document.getElementById("ocs-host-top");
+  const dome = document.getElementById("dome-ocs-host");
+  if (top) top.value = host;
+  if (dome) dome.value = host;
+  ocsHost = host;
+}
+
+function setOcsStatus(roof = {}, reachable = true) {
   // Dome tab detail view
   const roofEl = document.getElementById("dome-roof-status");
   const safeEl = document.getElementById("dome-safe");
 
   const roofStatus = (roof.status || "Unknown").replace(/<[^>]*>/g, "");
-  roofEl.textContent = roofStatus;
+  roofEl.textContent = reachable ? roofStatus : "Unreachable";
   const isOpen = /open/i.test(roofStatus);
   const isClosed = /close/i.test(roofStatus);
-  roofEl.className = isOpen ? "online" : isClosed ? "offline" : "";
+  roofEl.className = reachable ? (isOpen ? "online" : isClosed ? "offline" : "") : "offline";
 
   const safe = roof.safe || "Unknown";
-  safeEl.textContent = safe;
-  safeEl.className = /safe/i.test(safe) ? "online" : "offline";
+  safeEl.textContent = reachable ? safe : "Unreachable";
+  safeEl.className = reachable && /safe/i.test(safe) ? "online" : "offline";
 
   document.getElementById("dome-rain").textContent = roof.rain || "–";
   document.getElementById("dome-temp").textContent = roof.temp || "–";
@@ -133,20 +142,51 @@ function setOcsStatus(roof = {}) {
   document.getElementById("dome-pressure").textContent = roof.pressure || "–";
 
   // Devices tab — Dome row (roof open/closed)
-  ocsDomeEl.textContent = roofStatus;
-  ocsDomeEl.className = isOpen ? "online" : isClosed ? "offline" : "";
+  ocsDomeEl.textContent = reachable ? roofStatus : "Unreachable";
+  ocsDomeEl.className = reachable ? (isOpen ? "online" : isClosed ? "offline" : "") : "offline";
   if (ocsDomeDetailEl) {
     ocsDomeDetailEl.textContent = roof.rain ? `Rain: ${roof.rain}` : "";
   }
 
   // Devices tab — Safety Monitor row
-  ocsSafetyEl.textContent = safe;
-  ocsSafetyEl.className = /safe/i.test(safe) ? "online" : "offline";
+  ocsSafetyEl.textContent = reachable ? safe : "Unreachable";
+  ocsSafetyEl.className = reachable && /safe/i.test(safe) ? "online" : "offline";
   if (ocsSafetyDetailEl) {
     const details = [];
     if (roof.temp && roof.temp !== "Invalid") details.push(`${roof.temp}°C`);
     if (roof.humidity && roof.humidity !== "Invalid") details.push(`${roof.humidity}% RH`);
     ocsSafetyDetailEl.textContent = details.join("  ");
+  }
+
+  // Update global OCS connection state
+  ocsConnected = reachable;
+  updateOcsIndicator();
+  updateSeqRunButton();
+}
+
+function updateOcsIndicator() {
+  const el = document.getElementById("ocs-connection-status");
+  if (!el) return;
+  if (ocsConnected) {
+    el.textContent = `OCS ✓ ${currentOcsHost()}`;
+    el.className = "ocs-status-indicator online";
+  } else {
+    el.textContent = `OCS ✗ ${currentOcsHost()} — not reachable`;
+    el.className = "ocs-status-indicator offline";
+  }
+}
+
+function updateSeqRunButton() {
+  const runBtn = document.getElementById("seq-run");
+  if (!runBtn) return;
+  const seqRunning = runBtn.disabled && document.getElementById("seq-abort") && !document.getElementById("seq-abort").disabled;
+  if (seqRunning) return; // sequence already running — don't touch it
+  if (!ocsConnected) {
+    runBtn.disabled = true;
+    runBtn.title = "OCS not connected — cannot launch sequence";
+  } else {
+    runBtn.disabled = false;
+    runBtn.title = "";
   }
 }
 
@@ -155,9 +195,10 @@ async function refreshOcsStatus() {
   setLog(`Fetching OCS status from ${host}...`);
   try {
     const payload = await postJson("/api/ocs/status", { ocsHost: host });
-    setOcsStatus(payload.roof || {});
+    setOcsStatus(payload.roof || {}, true);
     setLog(payload);
   } catch (error) {
+    setOcsStatus({}, false);
     setLog({ success: false, action: "ocs-status", error: error.message });
   }
 }
@@ -453,12 +494,9 @@ async function refreshStatus() {
   }
 
   if (ocsResult.status === "fulfilled") {
-    setOcsStatus(ocsResult.value.roof || {});
+    setOcsStatus(ocsResult.value.roof || {}, true);
   } else {
-    ocsDomeEl.textContent = "Unreachable";
-    ocsDomeEl.className = "offline";
-    ocsSafetyEl.textContent = "Unreachable";
-    ocsSafetyEl.className = "offline";
+    setOcsStatus({}, false);
   }
 }
 
@@ -549,7 +587,7 @@ form.addEventListener("submit", async (event) => {
 
 tabDevicesBtn.addEventListener("click", () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click", () => setActiveTab("actions"));
-tabDomeBtn.addEventListener("click", () => { setActiveTab("dome"); refreshOcsStatus(); });
+tabDomeBtn.addEventListener("click", () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); });
 tabTargetBtn.addEventListener("click", () => setActiveTab("target"));
 
 document.getElementById("target-lookup-form").addEventListener("submit", async (event) => {
@@ -559,6 +597,13 @@ document.getElementById("target-lookup-form").addEventListener("submit", async (
 
 document.getElementById("dome-ocs-config-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  syncOcsHostInputs(document.getElementById("dome-ocs-host").value.trim() || ocsHost);
+  await refreshOcsStatus();
+});
+
+document.getElementById("ocs-connect-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  syncOcsHostInputs(document.getElementById("ocs-host-top").value.trim() || ocsHost);
   await refreshOcsStatus();
 });
 
@@ -566,7 +611,20 @@ document.getElementById("dome-open").addEventListener("click", async () => {
   if (confirm("Open the roof?")) await roofCommand("open");
 });
 document.getElementById("dome-close").addEventListener("click", async () => {
-  if (confirm("Close the roof?")) await roofCommand("close");
+  // Check mount park state before allowing roof close
+  const mount = lastEquipment?.Mount;
+  if (mount?.Connected && mount?.AtPark !== true) {
+    const detail = `Mount is ${mount.Slewing ? "slewing" : "not parked"} (AtPark=${mount.AtPark}).`;
+    alert(`⛔ Cannot close roof — ${detail}\n\nPark the mount first.`);
+    return;
+  }
+  if (!mount?.Connected) {
+    const ok = confirm("⚠ Mount status unknown (NINA not connected).\nCannot verify park state.\n\nClose roof anyway?");
+    if (!ok) return;
+  } else {
+    if (!confirm("Mount is parked ✓ — close the roof?")) return;
+  }
+  await roofCommand("close");
 });
 document.getElementById("dome-stop").addEventListener("click", async () => roofCommand("stop"));
 
@@ -604,8 +662,8 @@ async function loadDefaults() {
     document.getElementById("host").value = defaults.host || "192.168.1.174";
     document.getElementById("port").value = defaults.port || "1888";
     document.getElementById("protocol").value = defaults.protocol || "http";
-    ocsHost = defaults.ocsHost || "ocs.local";
-    document.getElementById("dome-ocs-host").value = ocsHost;
+    ocsHost = defaults.ocsHost || "192.168.1.220";
+    syncOcsHostInputs(ocsHost);
     if (defaults.tns?.botId) document.getElementById("tns-bot-id").value = defaults.tns.botId;
     if (defaults.tns?.botName) document.getElementById("tns-bot-name").value = defaults.tns.botName;
     if (defaults.tns?.hasApiKey) document.getElementById("tns-api-key").placeholder = "Loaded from server env";
@@ -613,7 +671,7 @@ async function loadDefaults() {
     document.getElementById("host").value = "192.168.1.174";
     document.getElementById("port").value = "1888";
     document.getElementById("protocol").value = "http";
-    document.getElementById("dome-ocs-host").value = "ocs.local";
+    syncOcsHostInputs("192.168.1.220");
   }
 }
 
@@ -626,48 +684,148 @@ function seqConfig() {
     gain:           Number(document.getElementById("seq-gain").value)           || 10,
     count:          Number(document.getElementById("seq-count").value)          || 10,
     filters:        filterRaw.split(",").map(s => s.trim()).filter(Boolean),
-    solveEnabled:   document.getElementById("seq-solve-enable").checked,
-    solveExp:       Number(document.getElementById("seq-solve-exp").value)       || 5,
-    solveThreshold: Number(document.getElementById("seq-solve-threshold").value) || 60,
-    manualMode:     document.getElementById("seq-manual-mode").checked,
+    solveEnabled:              document.getElementById("seq-solve-enable").checked,
+    solveExp:                  Number(document.getElementById("seq-solve-exp").value)                  || 5,
+    solveThreshold:            Number(document.getElementById("seq-solve-threshold").value)            || 60,
+    frameCheckEnabled:         document.getElementById("seq-frame-check-enable").checked,
+    frameCheckThresholdArcmin: Number(document.getElementById("seq-frame-check-threshold").value)     || 5,
+    manualMode:                document.getElementById("seq-manual-mode").checked,
   };
 }
 
 function renderSeqQueue(queue) {
+  // Don't tear down the list while the user is mid-drag — it would destroy the
+  // dragged element and reset the drag source, causing items to vanish.
+  if (_seqDragging) return;
+
   const list  = document.getElementById("seq-queue-list");
   const empty = document.getElementById("seq-queue-empty");
   list.innerHTML = "";
 
-  if (!queue.length) {
-    empty.style.display = "block";
-    return;
+  const nonWaitItems = queue.filter(t => !t.done && t.itemType !== "wait");
+  if (!queue.length || (!nonWaitItems.length && !queue.some(t => t.itemType === "wait"))) {
+    empty.style.display = queue.length === 0 ? "block" : "none";
+  } else {
+    empty.style.display = "none";
   }
-  empty.style.display = "none";
+  if (!queue.length) return;
 
   queue.forEach((t, i) => {
-    const raH  = t.raDeg / 15;
-    const raHH = Math.floor(raH);
-    const raM  = String(Math.floor((raH - raHH) * 60)).padStart(2, "0");
-    const decSign = t.decDeg >= 0 ? "+" : "";
+    const isWait   = t.itemType === "wait";
+    const li       = document.createElement("li");
+    li.className   = "seq-queue-item" + (t.done ? " done" : "") + (isWait ? " wait-item" : "");
+    li.setAttribute("draggable", t.done ? "false" : "true");
+    li.dataset.idx = i;
 
-    const li = document.createElement("li");
-    li.className = "seq-queue-item" + (t.done ? " done" : "");
+    if (isWait) {
+      li.innerHTML = `
+        <span class="seq-queue-num">${i + 1}</span>
+        <span style="font-size:16px;flex-shrink:0;">⏳</span>
+        <span class="seq-queue-name">Wait until</span>
+        <input class="seq-queue-wait-input" type="time" value="${t.waitTime || "00:00"}" data-idx="${i}" />
+        ${t.done
+          ? `<span class="seq-queue-done-badge">✓ Done</span>`
+          : `<button class="seq-queue-remove" data-idx="${i}" type="button">×</button>`}
+      `;
+    } else {
+      const raH     = (t.raDeg || 0) / 15;
+      const raHH    = Math.floor(raH);
+      const raM     = String(Math.floor((raH - raHH) * 60)).padStart(2, "0");
+      const decSign = (t.decDeg || 0) >= 0 ? "+" : "";
+      li.innerHTML = `
+        <span class="seq-queue-num">${i + 1}</span>
+        <span class="seq-queue-name">${t.name}</span>
+        <span class="seq-queue-coords">α&nbsp;${raHH}h${raM}m &nbsp;δ&nbsp;${decSign}${(t.decDeg || 0).toFixed(1)}°</span>
+        ${t.done
+          ? `<span class="seq-queue-done-badge">✓ Done</span>`
+          : `<button class="seq-queue-remove" data-idx="${i}" type="button">×</button>`}
+      `;
+    }
 
-    li.innerHTML = `
-      <span class="seq-queue-num">${i + 1}</span>
-      <span class="seq-queue-name">${t.name}</span>
-      <span class="seq-queue-coords">α&nbsp;${raHH}h${raM}m &nbsp;δ&nbsp;${decSign}${t.decDeg.toFixed(1)}°</span>
-      ${t.done
-        ? `<span class="seq-queue-done-badge">✓ Done</span>`
-        : `<button class="seq-queue-remove" data-idx="${i}" type="button">×</button>`
+    // ── Drag-and-drop ───────────────────────────────────────────────────────
+    li.addEventListener("dragstart", e => {
+      _seqDragSrc  = i;
+      _seqDragging = true;
+      e.dataTransfer.effectAllowed = "move";
+      setTimeout(() => li.classList.add("dragging"), 0);
+    });
+    li.addEventListener("dragend", () => {
+      li.classList.remove("dragging");
+      // Only refresh when drag was CANCELLED (no drop fired).
+      // If drop handled it, _seqDragSrc is already null and _seqDragging
+      // will be cleared by the drop handler after its async work finishes.
+      if (_seqDragSrc !== null) {
+        _seqDragSrc  = null;
+        _seqDragging = false;
+        refreshSeqState();
       }
-    `;
+    });
+    li.addEventListener("dragover", e => {
+      e.preventDefault();
+      _seqDragInsertAfter = e.offsetY >= li.offsetHeight / 2;
+      li.classList.toggle("drag-insert-before", !_seqDragInsertAfter);
+      li.classList.toggle("drag-insert-after",   _seqDragInsertAfter);
+    });
+    li.addEventListener("dragleave", () => {
+      li.classList.remove("drag-insert-before", "drag-insert-after");
+    });
+    li.addEventListener("drop", async e => {
+      e.preventDefault();
+      li.classList.remove("drag-insert-before", "drag-insert-after");
+      if (_seqDragSrc === null) return;
+
+      const from = _seqDragSrc;
+      // Clear src immediately so dragend (which fires next) knows drop was handled
+      // and won't race with our async refresh below.
+      _seqDragSrc = null;
+
+      // gap = insertion point in original array (0 = before first, n = after last)
+      const gap = _seqDragInsertAfter ? i + 1 : i;
+
+      // No-op: drop lands right before or after the source item
+      if (gap === from || gap === from + 1) {
+        _seqDragging = false;
+        await refreshSeqState();
+        return;
+      }
+
+      // `to` = insertion index in the array AFTER `from` is removed
+      const to = gap > from ? gap - 1 : gap;
+
+      try {
+        await fetch("/api/sequence/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from, to }),
+        });
+      } finally {
+        // Always unblock renders and refresh, even on error
+        _seqDragging = false;
+        await refreshSeqState();
+      }
+    });
+
     list.appendChild(li);
   });
 
+  // Remove buttons
   for (const btn of list.querySelectorAll(".seq-queue-remove")) {
     btn.addEventListener("click", async () => {
       await fetch(`/api/sequence/queue/${btn.dataset.idx}`, { method: "DELETE" });
+      await refreshSeqState();
+    });
+  }
+
+  // Wait-time edits: update the wait item's time on change
+  for (const inp of list.querySelectorAll(".seq-queue-wait-input")) {
+    inp.addEventListener("change", async () => {
+      const idx = parseInt(inp.dataset.idx);
+      const newTime = inp.value; // HH:MM
+      await fetch(`/api/sequence/queue/wait/${idx}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ waitTime: newTime }),
+      });
       await refreshSeqState();
     });
   }
@@ -703,14 +861,16 @@ function renderSeqStatus(state) {
   } else if (state.error) {
     dot.className = "seq-dot seq-dot-error";
     label.textContent = "Error";
-    runBtn.disabled = false;
+    runBtn.disabled = !ocsConnected;
+    runBtn.title = ocsConnected ? "" : "OCS not connected — cannot launch sequence";
     abortBtn.disabled = true;
     nextBtn.disabled = true;
   } else {
     const allDone = state.queue.length > 0 && state.queue.every(t => t.done);
     dot.className = "seq-dot " + (allDone ? "seq-dot-done" : "seq-dot-idle");
     label.textContent = allDone ? "All targets complete ✓" : "Idle";
-    runBtn.disabled = false;
+    runBtn.disabled = !ocsConnected;
+    runBtn.title = ocsConnected ? "" : "OCS not connected — cannot launch sequence";
     abortBtn.disabled = true;
     nextBtn.disabled = true;
   }
@@ -734,6 +894,29 @@ function renderSeqStatus(state) {
     progBar.style.width = `${(state.progress.frame / state.progress.frames) * 100}%`;
   } else {
     progWrap.style.display = "none";
+  }
+
+  // Per-frame solve badge
+  const frameSolveRow = document.getElementById("seq-frame-solve-row");
+  if (frameSolveRow) {
+    const fs = state.lastFrameSolve;
+    if (!fs || !state.running) {
+      frameSolveRow.style.display = "none";
+    } else if (!fs.solved) {
+      frameSolveRow.style.display = "block";
+      frameSolveRow.innerHTML =
+        `<span style="color:#f59e0b;">⚠ Frame check: solve failed</span>` +
+        `<span style="color:#9ca3af;margin-left:6px;">${fs.filename || ""}</span>`;
+    } else {
+      const color  = fs.on_target ? "#22c55e" : "#ef4444";
+      const icon   = fs.on_target ? "✓" : "✗";
+      const label  = fs.on_target ? "on target" : "DRIFTED";
+      const offset = fs.offset_arcmin != null ? `${fs.offset_arcmin}'` : "?";
+      frameSolveRow.style.display = "block";
+      frameSolveRow.innerHTML =
+        `<span style="color:${color};font-weight:600;">${icon} Frame check: ${label}</span>` +
+        `<span style="color:#9ca3af;margin-left:6px;">offset ${offset} — ${fs.filename || ""}</span>`;
+    }
   }
 }
 
@@ -760,6 +943,13 @@ async function refreshSeqState() {
     renderSeqQueue(state.queue);
     renderSeqStatus(state);
     renderSeqLog(state.log);
+
+    // Safety override modal — show/hide based on state
+    if (state.waitingForSafetyOverride) {
+      showSafetyModal(state.waitingForSafetyOverride);
+    } else {
+      hideSafetyModal();
+    }
   } catch { /* ignore */ }
 }
 
@@ -803,6 +993,10 @@ document.getElementById("add-to-todo").addEventListener("click", () => {
 tabTodoBtn.addEventListener("click", () => setActiveTab("todo"));
 
 document.getElementById("seq-run").addEventListener("click", async () => {
+  if (!ocsConnected) {
+    setLog({ success: false, error: `OCS not connected (${currentOcsHost()}) — cannot launch sequence. Check OCS connection in the Dome tab.` });
+    return;
+  }
   try {
     const result = await postJson("/api/sequence/run", { ...currentConfig(), ...seqConfig() });
     setLog(result);
@@ -816,6 +1010,45 @@ document.getElementById("seq-abort").addEventListener("click", async () => {
   try {
     const result = await postJson("/api/sequence/abort", {});
     setLog(result);
+  } catch (error) {
+    setLog({ success: false, error: error.message });
+  }
+});
+
+// ── Safety Override Modal ─────────────────────────────────────────────────────
+
+function showSafetyModal(details) {
+  const modal = document.getElementById("safety-modal");
+  if (!modal) return;
+  document.getElementById("safety-modal-message").textContent = details.message || "Safety condition not met.";
+  document.getElementById("sm-ocs").textContent  = details.ocsReachable ? "✓ Reachable" : "✗ Unreachable";
+  document.getElementById("sm-ocs").style.color  = details.ocsReachable ? "#4ade80" : "#f87171";
+  document.getElementById("sm-safe").textContent = details.safe || "?";
+  document.getElementById("sm-safe").style.color = /safe/i.test(details.safe || "") ? "#4ade80" : "#f87171";
+  document.getElementById("sm-roof").textContent = details.roof || "?";
+  document.getElementById("sm-roof").style.color = /open/i.test(details.roof || "") ? "#4ade80" : "#f87171";
+  document.getElementById("sm-rain").textContent = details.rain || "?";
+  modal.style.display = "flex";
+}
+
+function hideSafetyModal() {
+  const modal = document.getElementById("safety-modal");
+  if (modal) modal.style.display = "none";
+}
+
+document.getElementById("safety-override-btn").addEventListener("click", async () => {
+  try {
+    await postJson("/api/sequence/safety-override", {});
+    hideSafetyModal();
+  } catch (error) {
+    setLog({ success: false, error: error.message });
+  }
+});
+
+document.getElementById("safety-abort-btn").addEventListener("click", async () => {
+  try {
+    await postJson("/api/sequence/abort", {});
+    hideSafetyModal();
   } catch (error) {
     setLog({ success: false, error: error.message });
   }
@@ -843,6 +1076,19 @@ document.getElementById("seq-clear").addEventListener("click", async () => {
   } catch (error) {
     setLog({ success: false, error: error.message });
   }
+});
+
+document.getElementById("seq-add-wait").addEventListener("click", async () => {
+  const t = prompt("Wait until (HH:MM):", "23:30");
+  if (!t || !t.match(/^\d{1,2}:\d{2}$/)) return;
+  const hh = String(parseInt(t.split(":")[0])).padStart(2, "0");
+  const mm = t.split(":")[1];
+  await fetch("/api/sequence/queue/wait", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ waitTime: `${hh}:${mm}` }),
+  });
+  await refreshSeqState();
 });
 
 document.getElementById("seq-reset-af").addEventListener("click", async () => {
@@ -896,7 +1142,6 @@ window.addEventListener("resize", () => {
 
 tabPipelineBtn.addEventListener("click",  () => setActiveTab("pipeline"));
 tabHistoryBtn.addEventListener("click",   () => { setActiveTab("history"); loadHistory(); });
-tabNightPlanBtn.addEventListener("click", () => setActiveTab("nightplan"));
 
 // ── Target History ────────────────────────────────────────────────────────────
 
@@ -1221,7 +1466,7 @@ async function openAllPhotModal(jobs) {
     if (d.sub)    lines.push(`${tgt}${mjd}, ${filter}${stack}, Template substraction aperture photometry, ${d.sub.mag.toFixed(2)}, ${d.sub.magerr.toFixed(2)}`);
     else if (d.sub_ul) lines.push(`${tgt}${mjd}, ${filter}${stack}, Template substraction aperture photometry, >${d.sub_ul.ul.toFixed(2)}, –`);
 
-    rows.push({ filter, taskId, lines, target, error: d.error || null });
+    rows.push({ filter, taskId, lines, target, candidates: d.candidates || null, error: d.error || null });
     allLines.push(...lines);
   }
 
@@ -1239,6 +1484,20 @@ async function openAllPhotModal(jobs) {
       </div>`;
     }
     if (!row.lines.length) {
+      if (row.candidates && row.candidates.length) {
+        const candLines = row.candidates.map((c, i) => {
+          const filt = c.filter || row.filter;
+          const magerr = c.magerr != null && !isNaN(c.magerr) ? ` ± ${c.magerr.toFixed(3)}` : "";
+          const pos = (c.ra != null && c.dec != null) ? ` (RA ${c.ra.toFixed(5)}, Dec ${c.dec.toFixed(5)})` : "";
+          return `Candidate ${i+1}${pos}: ${filt} = ${c.mag.toFixed(2)}${magerr}`;
+        });
+        const candEscaped = candLines.map(l => l.replace(/</g,"&lt;")).join("<br>");
+        return `<div style="margin-bottom:14px;">
+          <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">${tgtLabel}${row.filter} · <a href="//${location.host.replace(/:\d+/,'')}:7000/tasks/${row.taskId}" target="_blank" style="color:#60a5fa;">#${row.taskId} ↗</a></div>
+          <div style="color:#fbbf24;font-size:11px;margin-bottom:4px;">⚠ Target position unknown — ${row.candidates.length} transient candidate(s):</div>
+          <pre style="margin:0;font-size:12px;color:#fde68a;font-family:monospace;line-height:1.7;">${candEscaped}</pre>
+        </div>`;
+      }
       return `<div style="margin-bottom:12px;">
         <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">${tgtLabel}${row.filter} · <a href="//${location.host.replace(/:\d+/,'')}:7000/tasks/${row.taskId}" target="_blank" style="color:#60a5fa;">#${row.taskId}</a></div>
         <div style="color:#9ca3af;font-size:11px;">No magnitude found</div>
@@ -1383,6 +1642,37 @@ function _renderPhotRow(photRow, d, result) {
     lines.push(`${target ? target + ", " : ""}${mjd}, ${filter}${stack}, Template substraction aperture photometry, ${d.sub.mag.toFixed(2)}, ${d.sub.magerr.toFixed(2)}`);
   } else if (d.sub_ul) {
     lines.push(`${target ? target + ", " : ""}${mjd}, ${filter}${stack}, Template substraction aperture photometry, >${d.sub_ul.ul.toFixed(2)}, –`);
+  }
+
+  // Fallback: show transient candidates detected in difference image
+  if (!lines.length && d.candidates && d.candidates.length) {
+    const candLines = d.candidates.map((c, i) => {
+      const filt = c.filter || filter;
+      const magerr = c.magerr != null && !isNaN(c.magerr) ? ` ± ${c.magerr.toFixed(3)}` : "";
+      const pos = (c.ra != null && c.dec != null) ? ` (RA ${c.ra.toFixed(5)}, Dec ${c.dec.toFixed(5)})` : "";
+      return `Candidate ${i+1}${pos}: ${filt} = ${c.mag.toFixed(2)}${magerr}`;
+    });
+    const candEscaped = candLines.map(l => l.replace(/</g, "&lt;")).join("<br>");
+    const candText    = candLines.join("\n");
+    cell.innerHTML = `
+      <div style="display:flex;align-items:flex-start;gap:10px;flex-direction:column;">
+        <span style="color:#fbbf24;font-size:11px;">⚠ Target position unknown — showing ${d.candidates.length} transient candidate(s) from subtraction:</span>
+        <div style="display:flex;align-items:flex-start;gap:10px;">
+          <pre style="margin:0;font-size:11px;color:#fde68a;font-family:monospace;line-height:1.6;">${candEscaped}</pre>
+          <button class="btn-phot-copy" title="Copy to clipboard"
+                  style="flex-shrink:0;background:none;border:1px solid #78350f;color:#fbbf24;
+                         border-radius:4px;padding:2px 7px;cursor:pointer;font-size:14px;line-height:1;"
+                  data-text="${candText.replace(/"/g, "&quot;")}">⧉</button>
+        </div>
+      </div>`;
+    cell.querySelector(".btn-phot-copy").addEventListener("click", (e) => {
+      const copyBtn = e.currentTarget;
+      navigator.clipboard.writeText(copyBtn.dataset.text).then(() => {
+        copyBtn.textContent = "✓";
+        setTimeout(() => { copyBtn.textContent = "⧉"; }, 1500);
+      });
+    });
+    return;
   }
 
   if (!lines.length) {
@@ -1569,6 +1859,14 @@ function renderPipelineJobs(jobs) {
                    style="margin-left:4px;color:#34d399;border-color:#065f46;" type="button"
                    title="Fetch photometry from STDWeb">📊</button>` : "";
 
+      // FITS download button (only when result is done)
+      const fitsBtn = r.status === "done"
+        ? `<a href="/api/pipeline/result/${r.id}/download"
+              class="btn-small"
+              style="margin-left:4px;color:#a78bfa;border:1px solid #5b21b6;border-radius:4px;
+                     padding:2px 6px;font-size:12px;text-decoration:none;display:inline-block;"
+              title="Download stacked FITS (${r.obs_date} · ${r.target} · ${r.filter} · ${r.exposure}s)">⭐</a>` : "";
+
       const rtr = document.createElement("tr");
       rtr.dataset.resultId = r.id;
       rtr.style.background = "#0d1929";
@@ -1582,7 +1880,7 @@ function renderPipelineJobs(jobs) {
         </td>
         <td></td>
         <td><span class="job-status ${rcls}"${retitle} style="font-size:11px;">${rlabel}</span></td>
-        <td>${link}${framesBtn}${photBtn}</td>
+        <td>${link}${framesBtn}${photBtn}${fitsBtn}</td>
         <td></td>
       `;
       tbody.appendChild(rtr);
@@ -1921,41 +2219,12 @@ async function loadPipelineJobs() {
   } catch { /* ignore */ }
 }
 
-async function loadStackedResults() {
-  try {
-    const res   = await fetch("/api/data/results");
-    const items = await res.json();
-    const tbody = document.getElementById("results-tbody");
-    const empty = document.getElementById("results-empty");
-    const table = document.getElementById("results-table");
-    if (!items.length) { table.style.display = "none"; empty.style.display = ""; return; }
-    table.style.display = "";
-    empty.style.display = "none";
-    tbody.innerHTML = items.map(r => `
-      <tr>
-        <td>${r.date}</td>
-        <td>${r.target}</td>
-        <td>${r.filter}</td>
-        <td>${r.exp}</td>
-        <td>${r.size_mb} MB</td>
-        <td><a href="${r.url}" download style="color:#60a5fa;">⬇ res.fit</a></td>
-      </tr>
-      ${r.preview_url ? `<tr>
-        <td colspan="6" style="padding:8px 12px 16px;">
-          <img src="${r.preview_url}" alt="${r.target} ${r.filter}"
-               style="max-width:100%;border-radius:6px;cursor:zoom-in;display:block;"
-               onclick="this.style.maxWidth=this.style.maxWidth==='100%'?'none':'100%'" />
-        </td>
-      </tr>` : ""}`).join("");
-  } catch { /* ignore */ }
-}
 
 function startPipelinePolling() {
   if (pipelinePollInterval) return;
   loadNasDates();
   loadPipelineJobs();
-  loadStackedResults();
-  pipelinePollInterval = setInterval(() => { loadPipelineJobs(); loadStackedResults(); }, 4000);
+  pipelinePollInterval = setInterval(() => { loadPipelineJobs(); }, 4000);
 }
 
 function stopPipelinePolling() {
@@ -2103,5 +2372,287 @@ document.getElementById("hist-copy-all-btn").addEventListener("click", async () 
     navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
   } else {
     fallbackCopy(text, done);
+  }
+});
+
+// ── OCS History Timeline Chart ────────────────────────────────────────────────
+
+let _ocsChart = null;
+
+function formatHistoryTime(isoStr) {
+  const d = new Date(isoStr);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${mm}/${dd} ${hh}:${min}`;
+}
+
+function ocsRoofValue(roofStr) {
+  if (!roofStr) return null;
+  if (/open/i.test(roofStr)) return 1;
+  if (/close/i.test(roofStr)) return 0;
+  return null;
+}
+
+function ocsRainValue(rainStr) {
+  if (!rainStr) return null;
+  return /rain|yes|wet|true/i.test(rainStr) ? 1 : 0;
+}
+
+function renderOcsChart(history) {
+  const canvas = document.getElementById("ocs-history-chart");
+  if (!canvas) return;
+
+  if (_ocsChart) { _ocsChart.destroy(); _ocsChart = null; }
+
+  if (!history || history.length === 0) {
+    canvas.style.height = "80px";
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#555";
+    ctx.font = "14px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("No OCS data yet — readings stored every 10 min", canvas.width / 2, 40);
+    return;
+  }
+  canvas.style.height = "320px";
+
+  const roofOpen   = history.map(r => ocsRoofValue(r.roof));
+  const rainActive = history.map(r => ocsRainValue(r.rain));
+  const tsList     = history.map(r => r.ts);
+
+  const backgroundPlugin = {
+    id: "ocsBands",
+    beforeDraw(chart) {
+      const { ctx, chartArea: { left, right, top, bottom }, scales: { x } } = chart;
+      const n = history.length;
+      for (let i = 0; i < n; i++) {
+        const x1 = i === 0 ? left  : x.getPixelForValue(i - 0.5);
+        const x2 = i === n - 1 ? right : x.getPixelForValue(i + 0.5);
+        if (roofOpen[i] === 1) {
+          ctx.fillStyle = "rgba(34,197,94,0.12)";
+          ctx.fillRect(x1, top, x2 - x1, bottom - top);
+        }
+        if (rainActive[i] === 1) {
+          ctx.fillStyle = "rgba(99,102,241,0.32)";
+          ctx.fillRect(x1, top, x2 - x1, bottom - top);
+        }
+      }
+    },
+  };
+
+  const tempData     = history.map((r, i) => ({ x: i, y: r.temp     ?? null }));
+  const humidityData = history.map((r, i) => ({ x: i, y: r.humidity ?? null }));
+  const pressureData = history.map((r, i) => ({ x: i, y: r.pressure ?? null }));
+  const skyData      = history.map((r, i) => ({ x: i, y: r.sky      ?? null }));
+
+  const hasSky      = history.some(r => r.sky      != null);
+  const hasPressure = history.some(r => r.pressure != null);
+
+  const step = Math.max(1, Math.round(history.length / 8));
+
+  const datasets = [
+    {
+      label: "Temp (°C)",
+      data: tempData,
+      borderColor: "#f59e0b",
+      backgroundColor: "rgba(245,158,11,0.08)",
+      pointRadius: 2,
+      borderWidth: 2,
+      tension: 0.3,
+      yAxisID: "yTemp",
+      spanGaps: true,
+    },
+    {
+      label: "Humidity (%)",
+      data: humidityData,
+      borderColor: "#38bdf8",
+      backgroundColor: "rgba(56,189,248,0.08)",
+      pointRadius: 2,
+      borderWidth: 2,
+      tension: 0.3,
+      yAxisID: "yHumid",
+      spanGaps: true,
+    },
+  ];
+
+  if (hasPressure) {
+    datasets.push({
+      label: "Pressure (hPa)",
+      data: pressureData,
+      borderColor: "#a78bfa",
+      backgroundColor: "rgba(167,139,250,0.08)",
+      pointRadius: 2,
+      borderWidth: 2,
+      tension: 0.3,
+      yAxisID: "yPres",
+      spanGaps: true,
+    });
+  }
+
+  if (hasSky) {
+    datasets.push({
+      label: "Sky Quality (mag/\u2033\u00b2)",
+      data: skyData,
+      borderColor: "#22d3ee",
+      backgroundColor: "rgba(34,211,238,0.08)",
+      pointRadius: 2,
+      borderWidth: 2,
+      tension: 0.3,
+      yAxisID: "ySky",
+      spanGaps: true,
+    });
+  }
+
+  const scales = {
+    x: {
+      type: "linear",
+      min: 0,
+      max: history.length - 1,
+      ticks: {
+        stepSize: step,
+        callback: (v) => {
+          const idx = Math.round(v);
+          return tsList[idx] ? formatHistoryTime(tsList[idx]) : "";
+        },
+        color: "#888",
+        maxRotation: 35,
+      },
+      grid: { color: "rgba(255,255,255,0.05)" },
+    },
+    yTemp: {
+      type: "linear",
+      position: "left",
+      title: { display: true, text: "\u00b0C / SQ", color: "#f59e0b" },
+      ticks: { color: "#888" },
+      grid: { color: "rgba(255,255,255,0.07)" },
+    },
+    yHumid: {
+      type: "linear",
+      position: "right",
+      min: 0,
+      max: 100,
+      title: { display: true, text: "%", color: "#38bdf8" },
+      ticks: { color: "#888" },
+      grid: { display: false },
+    },
+  };
+
+  if (hasPressure) {
+    const pVals = history.map(r => r.pressure).filter(v => v != null);
+    const pMin  = Math.floor(Math.min(...pVals) / 5) * 5 - 5;
+    const pMax  = Math.ceil(Math.max(...pVals) / 5) * 5 + 5;
+    scales.yPres = {
+      type: "linear",
+      position: "right",
+      min: pMin,
+      max: pMax,
+      title: { display: true, text: "hPa", color: "#a78bfa" },
+      ticks: { color: "#888" },
+      grid: { display: false },
+    };
+  }
+
+  if (hasSky) {
+    const skyVals = history.map(r => r.sky).filter(v => v != null);
+    const sMin = Math.floor(Math.min(...skyVals)) - 1;
+    const sMax = Math.ceil(Math.max(...skyVals)) + 1;
+    scales.ySky = {
+      type: "linear",
+      position: "left",
+      min: sMin,
+      max: sMax,
+      title: { display: false },
+      ticks: { display: false },
+      grid: { display: false },
+    };
+  }
+
+  _ocsChart = new Chart(canvas.getContext("2d"), {
+    type: "line",
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          labels: { color: "#aaa", boxWidth: 20, padding: 12, font: { size: 11 } },
+        },
+        tooltip: {
+          backgroundColor: "#1a1a2e",
+          titleColor: "#ccc",
+          bodyColor: "#aaa",
+          borderColor: "#444",
+          borderWidth: 1,
+          callbacks: {
+            title: (items) => {
+              const idx = Math.round(items[0].parsed.x);
+              const row = history[idx];
+              if (!row) return "";
+              const parts = [formatHistoryTime(row.ts)];
+              if (row.roof) parts.push(`Roof: ${row.roof}`);
+              if (row.rain) parts.push(`Rain: ${row.rain}`);
+              if (row.safe) parts.push(`Safe: ${row.safe}`);
+              return parts;
+            },
+          },
+        },
+      },
+      scales,
+    },
+    plugins: [backgroundPlugin],
+  });
+}
+
+async function loadOcsHistory() {
+  const statusEl = document.getElementById("ocs-history-status");
+  const hoursEl  = document.getElementById("ocs-history-hours");
+  const hours = hoursEl ? hoursEl.value : 48;
+  if (statusEl) statusEl.textContent = "Loading\u2026";
+  try {
+    const resp = await fetch(`/api/ocs/history?hours=${hours}`);
+    const data = await resp.json();
+    renderOcsChart(data.history || []);
+    if (statusEl) {
+      const n = data.history?.length ?? 0;
+      statusEl.textContent = n
+        ? `${n} readings over last ${hours}h`
+        : "No data yet \u2014 check back after first polling cycle (~10 min after server start)";
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+document.getElementById("ocs-history-refresh")?.addEventListener("click", loadOcsHistory);
+document.getElementById("ocs-history-hours")?.addEventListener("change", loadOcsHistory);
+
+document.getElementById("ocs-poll-now")?.addEventListener("click", async () => {
+  const btn = document.getElementById("ocs-poll-now");
+  const statusEl = document.getElementById("ocs-history-status");
+  btn.disabled = true;
+  btn.textContent = "Polling…";
+  if (statusEl) statusEl.textContent = "Fetching OCS reading…";
+  try {
+    const resp = await fetch("/api/ocs/poll-now", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ocsHost: currentOcsHost() }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      if (statusEl) statusEl.textContent = "Reading stored — reloading chart…";
+      await loadOcsHistory();
+    } else {
+      if (statusEl) statusEl.textContent = `Poll failed: ${data.error}`;
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Poll Now";
   }
 });
