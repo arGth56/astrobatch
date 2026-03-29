@@ -205,6 +205,11 @@ db.exec(`
 
 // ── OCS history poller ────────────────────────────────────────────────────────
 
+/** Strip HTML tags and trim whitespace from an OCS field value. */
+function ocsClean(v) {
+  return (v || "").replace(/<[^>]*>/g, "").replace(/&[a-z]+;/gi, "").trim();
+}
+
 async function pollAndStoreOcs() {
   try {
     const host = DEFAULT_OCS_HOST;
@@ -213,13 +218,13 @@ async function pollAndStoreOcs() {
     const temp     = parseFloat(fields.wea_temp);
     const humidity = parseFloat(fields.wea_humd);
     const pressure = parseFloat(fields.wea_pres);
-    const sky      = parseFloat(fields.wea_sky || fields.sqm || "");
+    const sky      = parseFloat(fields.wea_sq || "");   // e.g. " 5.4 mpsas"
     db.prepare(
       `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(
-      fields.roof_sta  || null,
-      fields.stat_safe || null,
-      fields.wea_rain  || null,
+      ocsClean(fields.roof_sta)  || null,
+      ocsClean(fields.stat_safe) || null,
+      ocsClean(fields.wea_rain)  || null,
       isNaN(temp)     ? null : temp,
       isNaN(humidity) ? null : humidity,
       isNaN(pressure) ? null : pressure,
@@ -2223,14 +2228,14 @@ app.post("/api/ocs/poll-now", async (req, res) => {
     const temp     = parseFloat(fields.wea_temp);
     const humidity = parseFloat(fields.wea_humd);
     const pressure = parseFloat(fields.wea_pres);
-    const sky      = parseFloat(fields.wea_sky || fields.sqm || "");
+    const sky      = parseFloat(fields.wea_sq || "");
 
     const result = db.prepare(
       `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
     ).run(
-      fields.roof_sta  || null,
-      fields.stat_safe || null,
-      fields.wea_rain  || null,
+      ocsClean(fields.roof_sta)  || null,
+      ocsClean(fields.stat_safe) || null,
+      ocsClean(fields.wea_rain)  || null,
       isNaN(temp)     ? null : temp,
       isNaN(humidity) ? null : humidity,
       isNaN(pressure) ? null : pressure,
@@ -2243,6 +2248,89 @@ app.post("/api/ocs/poll-now", async (req, res) => {
     res.status(502).json({
       success: false,
       error: error.name === "AbortError" ? "OCS connection timed out" : error.message,
+    });
+  }
+});
+
+// ── OCS backfill: scrape 60-min history from OCS embedded charts ──────────────
+
+app.post("/api/ocs/backfill", async (req, res) => {
+  try {
+    const host = validateOcsHost(req.body?.ocsHost || DEFAULT_OCS_HOST);
+    const now = Date.now();
+
+    // Fetch all three time windows + sky page in parallel
+    const [weatherRecent, weather24h, weather48h, skyRecent, sky24h, sky48h] = await Promise.all([
+      fetch(`http://${host}/weatherpage.htm?x=${now}`,             { signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+      fetch(`http://${host}/weatherpage.htm?chart=last24&x=${now}`,{ signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+      fetch(`http://${host}/weatherpage.htm?chart=last48&x=${now}`,{ signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+      fetch(`http://${host}/skypage.htm?x=${now}`,                 { signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+      fetch(`http://${host}/skypage.htm?chart=last24&x=${now}`,    { signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+      fetch(`http://${host}/skypage.htm?chart=last48&x=${now}`,    { signal: AbortSignal.timeout(8000) }).then(r => r.text()),
+    ]);
+
+    // Parse {x: hoursAgo_or_minutesAgo, y: value} from an embedded Chart.js dataset.
+    // Returns array of { msAgo, value } — x unit auto-detected by label suffix.
+    function parseDataset(html, labelFragment) {
+      const re = new RegExp(
+        `label:\\s*'[^']*${labelFragment}[^']*'[\\s\\S]*?data:\\s*(\\[[^\\]]*\\])`,
+        "i"
+      );
+      const m = html.match(re);
+      if (!m) return [];
+      // Detect unit from the label text
+      const labelMatch = html.match(new RegExp(`label:\\s*'([^']*${labelFragment}[^']*)'`, "i"));
+      const isHours = labelMatch && /hours/i.test(labelMatch[1]);
+      return [...m[1].matchAll(/\{x:([\d.]+),y:([\d.-]+)\}/g)].map(p => ({
+        msAgo: parseFloat(p[1]) * (isHours ? 3600000 : 60000),
+        value: parseFloat(p[2]),
+      }));
+    }
+
+    // Collect all points from all windows
+    const allPts = {
+      temp:     [...parseDataset(weatherRecent, "Temperature"), ...parseDataset(weather24h, "Temperature"), ...parseDataset(weather48h, "Temperature")],
+      pressure: [...parseDataset(weatherRecent, "Pressure"),    ...parseDataset(weather24h, "Pressure"),    ...parseDataset(weather48h, "Pressure")],
+      humidity: [...parseDataset(weatherRecent, "Humidity"),    ...parseDataset(weather24h, "Humidity"),    ...parseDataset(weather48h, "Humidity")],
+      sky:      [...parseDataset(skyRecent,     "Sky Quality"), ...parseDataset(sky24h,     "Sky Quality"), ...parseDataset(sky48h,     "Sky Quality")],
+    };
+
+    // Build map keyed by minute-rounded timestamp string
+    const byTs = new Map();
+    const roundToMin = ms => {
+      const d = new Date(now - ms);
+      d.setSeconds(0, 0);
+      return d.toISOString().replace("T", " ").slice(0, 19);
+    };
+    for (const [key, pts] of Object.entries(allPts)) {
+      for (const { msAgo, value } of pts) {
+        const ts = roundToMin(msAgo);
+        if (!byTs.has(ts)) byTs.set(ts, {});
+        // Prefer finer-resolution (recent) data — only fill if not yet set
+        if (byTs.get(ts)[key] === undefined) byTs.get(ts)[key] = value;
+      }
+    }
+
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ocs_history_ts_unique ON ocs_history(ts)`);
+    const stmt = db.prepare(
+      `INSERT OR IGNORE INTO ocs_history (ts, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?)`
+    );
+
+    let inserted = 0;
+    db.transaction(() => {
+      for (const [ts, vals] of byTs) {
+        const r = stmt.run(ts, vals.temp ?? null, vals.humidity ?? null, vals.pressure ?? null, vals.sky ?? null);
+        if (r.changes) inserted++;
+      }
+    })();
+
+    res.json({ success: true, inserted, total: byTs.size, windows: ["recent (60 min)", "last24h", "last48h"] });
+  } catch (error) {
+    res.status(502).json({
+      success: false,
+      error: error.name === "AbortError" || error.name === "TimeoutError"
+        ? "OCS connection timed out"
+        : error.message,
     });
   }
 });
