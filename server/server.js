@@ -2392,6 +2392,37 @@ app.delete("/api/pipeline/results/:id", (req, res) => {
   res.json({ success: true });
 });
 
+app.get("/api/pipeline/result/:id/download", (req, res) => {
+  const row = db.prepare(
+    "SELECT r.*, j.fits_dir FROM pipeline_results r JOIN pipeline_jobs j ON j.id = r.job_id WHERE r.id = ?"
+  ).get(req.params.id);
+  if (!row) return res.status(404).json({ error: "Result not found" });
+
+  // date_str: use obs_date if set, otherwise extract from fits_dir (last numeric-date-like segment)
+  let dateStr = row.obs_date;
+  if (!dateStr && row.fits_dir) {
+    const parts = row.fits_dir.split("/");
+    const datePart = parts.find(p => /^\d{4}-\d{2}-\d{2}$/.test(p));
+    dateStr = datePart || parts[parts.length - 2] || "unknown";
+  }
+  dateStr = dateStr || "unknown";
+
+  const target = (row.target || "unknown").toLowerCase().replace(/\s+/g, "_");
+  const filter = (row.filter || "unknown").toUpperCase();
+
+  const NAS_OUTPUT = process.env.NAS_OUTPUT || "/mnt/nas/input/pyl/astro/output";
+  const fitsPath = path.join(NAS_OUTPUT, dateStr, target, filter, "res.fit");
+
+  if (!fs.existsSync(fitsPath)) {
+    return res.status(404).json({ error: `FITS file not found: ${fitsPath}` });
+  }
+
+  const filename = `${dateStr}_${target}_${filter}.fits`;
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Content-Type", "application/fits");
+  res.sendFile(path.resolve(fitsPath));
+});
+
 app.post("/api/pipeline/trigger", async (req, res) => {
   const { fits_dir, target, filter, exposure, selected_files, target_filter } = req.body;
   if (!fits_dir) return res.status(400).json({ success: false, error: "fits_dir is required" });

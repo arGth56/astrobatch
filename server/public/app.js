@@ -1862,6 +1862,7 @@ function renderPipelineJobs(jobs) {
       // FITS download button (only when result is done)
       const fitsBtn = r.status === "done"
         ? `<a href="/api/pipeline/result/${r.id}/download"
+              download
               class="btn-small"
               style="margin-left:4px;color:#a78bfa;border:1px solid #5b21b6;border-radius:4px;
                      padding:2px 6px;font-size:12px;text-decoration:none;display:inline-block;"
