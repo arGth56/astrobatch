@@ -2379,12 +2379,17 @@ document.getElementById("hist-copy-all-btn").addEventListener("click", async () 
 
 let _ocsChart = null;
 
-function formatHistoryTime(isoStr) {
-  const d = new Date(isoStr);
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const min = String(d.getMinutes()).padStart(2, "0");
+/** Convert SQLite UTC string "2026-03-28 08:53:20" → epoch ms */
+function ocsTs(isoStr) {
+  return new Date(isoStr.replace(" ", "T") + "Z").getTime();
+}
+
+function formatTsMs(ms) {
+  const d = new Date(ms);
+  const mm  = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd  = String(d.getUTCDate()).padStart(2, "0");
+  const hh  = String(d.getUTCHours()).padStart(2, "0");
+  const min = String(d.getUTCMinutes()).padStart(2, "0");
   return `${mm}/${dd} ${hh}:${min}`;
 }
 
@@ -2400,11 +2405,73 @@ function ocsRainValue(rainStr) {
   return /rain|yes|wet|true/i.test(rainStr) ? 1 : 0;
 }
 
+// Original X bounds for zoom reset
+let _ocsXMin = null, _ocsXMax = null;
+let _ocsDragStart = null; // canvas-relative X px where drag began
+
+function _ocsDragZoomStart(e) {
+  if (!_ocsChart) return;
+  const area = _ocsChart.chartArea;
+  const rect = _ocsChart.canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  if (x < area.left || x > area.right) return; // only inside chart area
+  _ocsDragStart = x;
+  e.preventDefault();
+}
+
+function _ocsDragZoomMove(e) {
+  if (!_ocsChart || _ocsDragStart === null) return;
+  const canvas  = _ocsChart.canvas;
+  const area    = _ocsChart.chartArea;
+  const rect    = canvas.getBoundingClientRect();
+  const xNow    = Math.max(area.left, Math.min(area.right, e.clientX - rect.left));
+
+  // Draw selection overlay via the chart's selection plugin (redraws each move)
+  _ocsChart._dragCurrent = xNow;
+  _ocsChart.update("none");
+}
+
+function _ocsDragZoomEnd(e) {
+  if (!_ocsChart || _ocsDragStart === null) return;
+  const canvas  = _ocsChart.canvas;
+  const area    = _ocsChart.chartArea;
+  const rect    = canvas.getBoundingClientRect();
+  const xNow    = Math.max(area.left, Math.min(area.right, e.clientX - rect.left));
+  const x0      = Math.min(_ocsDragStart, xNow);
+  const x1      = Math.max(_ocsDragStart, xNow);
+  const start   = _ocsDragStart;
+  _ocsDragStart = null;
+  _ocsChart._dragCurrent = null;
+
+  if (x1 - x0 < 8) { // too small = ignore (just a click)
+    _ocsChart.update("none");
+    return;
+  }
+
+  const xScale = _ocsChart.scales.x;
+  const newMin = xScale.getValueForPixel(x0);
+  const newMax = xScale.getValueForPixel(x1);
+  if (newMax - newMin < 60000) return; // ignore sub-minute selections
+
+  _ocsChart.options.scales.x.min = newMin;
+  _ocsChart.options.scales.x.max = newMax;
+  _ocsChart.update("none");
+}
+
 function renderOcsChart(history) {
   const canvas = document.getElementById("ocs-history-chart");
   if (!canvas) return;
 
-  if (_ocsChart) { _ocsChart.destroy(); _ocsChart = null; }
+  // Always remove listeners and destroy any chart instance on this canvas
+  canvas.removeEventListener("mousedown",  _ocsDragZoomStart);
+  canvas.removeEventListener("mousemove",  _ocsDragZoomMove);
+  canvas.removeEventListener("mouseup",    _ocsDragZoomEnd);
+  canvas.removeEventListener("mouseleave", _ocsDragZoomEnd);
+  const existing = Chart.getChart(canvas);
+  if (existing) existing.destroy();
+  if (_ocsChart) { _ocsChart.destroy(); }
+  _ocsChart = null;
+  _ocsDragStart = null;
 
   if (!history || history.length === 0) {
     canvas.style.height = "80px";
@@ -2418,43 +2485,80 @@ function renderOcsChart(history) {
   }
   canvas.style.height = "320px";
 
-  const roofOpen   = history.map(r => ocsRoofValue(r.roof));
-  const rainActive = history.map(r => ocsRainValue(r.rain));
-  const tsList     = history.map(r => r.ts);
+  // Convert each reading's timestamp to epoch ms for accurate X positioning
+  const tsMs      = history.map(r => ocsTs(r.ts));
+  const roofOpen  = history.map(r => ocsRoofValue(r.roof));
+  const rainAct   = history.map(r => ocsRainValue(r.rain));
+  const xMin      = tsMs[0];
+  const xMax      = tsMs[tsMs.length - 1];
+  _ocsXMin = xMin;
+  _ocsXMax = xMax;
+  const rangeMs   = Math.max(xMax - xMin, 60000); // at least 1 min to avoid division by zero
+
+  // Half-interval for background band edges (use actual gap or 5 min fallback)
+  function halfGap(i) {
+    if (tsMs.length < 2) return 5 * 60000;
+    const prev = i > 0 ? (tsMs[i] - tsMs[i - 1]) / 2 : (tsMs[1] - tsMs[0]) / 2;
+    const next = i < tsMs.length - 1 ? (tsMs[i + 1] - tsMs[i]) / 2 : (tsMs[tsMs.length - 1] - tsMs[tsMs.length - 2]) / 2;
+    return { left: prev, right: next };
+  }
 
   const backgroundPlugin = {
     id: "ocsBands",
     beforeDraw(chart) {
-      const { ctx, chartArea: { left, right, top, bottom }, scales: { x } } = chart;
+      const { ctx, chartArea: { left: cLeft, right: cRight, top, bottom }, scales: { x } } = chart;
+      const stripH   = (bottom - top) * 0.20;  // rain strip = bottom 20%
+      const stripTop = bottom - stripH;
       const n = history.length;
+
       for (let i = 0; i < n; i++) {
-        const x1 = i === 0 ? left  : x.getPixelForValue(i - 0.5);
-        const x2 = i === n - 1 ? right : x.getPixelForValue(i + 0.5);
+        const g  = halfGap(i);
+        const x1 = Math.max(cLeft,  x.getPixelForValue(tsMs[i] - g.left));
+        const x2 = Math.min(cRight, x.getPixelForValue(tsMs[i] + g.right));
+        const w  = x2 - x1;
+        if (w <= 0) continue;
+
+        // Roof open → subtle green tint full height
         if (roofOpen[i] === 1) {
-          ctx.fillStyle = "rgba(34,197,94,0.12)";
-          ctx.fillRect(x1, top, x2 - x1, bottom - top);
+          ctx.fillStyle = "rgba(34,197,94,0.10)";
+          ctx.fillRect(x1, top, w, bottom - top);
         }
-        if (rainActive[i] === 1) {
-          ctx.fillStyle = "rgba(99,102,241,0.32)";
-          ctx.fillRect(x1, top, x2 - x1, bottom - top);
+        // Rain → solid indigo bar in bottom 20%
+        if (rainAct[i] === 1) {
+          ctx.fillStyle = "rgba(99,102,241,0.75)";
+          ctx.fillRect(x1, stripTop, w, stripH);
         }
       }
+
+      // Rain strip separator line
+      ctx.strokeStyle = "rgba(99,102,241,0.25)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cLeft, stripTop);
+      ctx.lineTo(cRight, stripTop);
+      ctx.stroke();
     },
   };
 
-  const tempData     = history.map((r, i) => ({ x: i, y: r.temp     ?? null }));
-  const humidityData = history.map((r, i) => ({ x: i, y: r.humidity ?? null }));
-  const pressureData = history.map((r, i) => ({ x: i, y: r.pressure ?? null }));
-  const skyData      = history.map((r, i) => ({ x: i, y: r.sky      ?? null }));
+  // X tick step: aim for ~8 labels across the range
+  const nTicks   = 8;
+  const stepMs   = Math.pow(10, Math.ceil(Math.log10(rangeMs / nTicks)));
+  const niceStep = [1, 2, 3, 6, 12, 24].map(h => h * 3600000)
+    .find(s => rangeMs / s <= nTicks) || stepMs;
+
+  const toXY = (r) => ({ x: ocsTs(r.ts), y: null });  // placeholder
+
+  const tempData     = history.map(r => ({ x: ocsTs(r.ts), y: r.temp     ?? null }));
+  const humidityData = history.map(r => ({ x: ocsTs(r.ts), y: r.humidity ?? null }));
+  const pressureData = history.map(r => ({ x: ocsTs(r.ts), y: r.pressure ?? null }));
+  const skyData      = history.map(r => ({ x: ocsTs(r.ts), y: r.sky      ?? null }));
 
   const hasSky      = history.some(r => r.sky      != null);
   const hasPressure = history.some(r => r.pressure != null);
 
-  const step = Math.max(1, Math.round(history.length / 8));
-
   const datasets = [
     {
-      label: "Temp (°C)",
+      label: "Temp (\u00b0C)",
       data: tempData,
       borderColor: "#f59e0b",
       backgroundColor: "rgba(245,158,11,0.08)",
@@ -2508,16 +2612,14 @@ function renderOcsChart(history) {
   const scales = {
     x: {
       type: "linear",
-      min: 0,
-      max: history.length - 1,
+      min: xMin,
+      max: xMax,
       ticks: {
-        stepSize: step,
-        callback: (v) => {
-          const idx = Math.round(v);
-          return tsList[idx] ? formatHistoryTime(tsList[idx]) : "";
-        },
+        stepSize: niceStep,
+        callback: (v) => formatTsMs(v),
         color: "#888",
         maxRotation: 35,
+        maxTicksLimit: 10,
       },
       grid: { color: "rgba(255,255,255,0.05)" },
     },
@@ -2569,6 +2671,24 @@ function renderOcsChart(history) {
     };
   }
 
+  const selectionPlugin = {
+    id: "ocsDragSelect",
+    afterDraw(chart) {
+      if (_ocsDragStart === null || chart._dragCurrent === null) return;
+      const { ctx, chartArea: { top, bottom } } = chart;
+      const x0 = Math.min(_ocsDragStart, chart._dragCurrent);
+      const x1 = Math.max(_ocsDragStart, chart._dragCurrent);
+      ctx.save();
+      ctx.fillStyle = "rgba(99,179,237,0.15)";
+      ctx.fillRect(x0, top, x1 - x0, bottom - top);
+      ctx.strokeStyle = "rgba(99,179,237,0.7)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x0, top, x1 - x0, bottom - top);
+      ctx.restore();
+    },
+  };
+
   _ocsChart = new Chart(canvas.getContext("2d"), {
     type: "line",
     data: { datasets },
@@ -2589,13 +2709,18 @@ function renderOcsChart(history) {
           borderWidth: 1,
           callbacks: {
             title: (items) => {
-              const idx = Math.round(items[0].parsed.x);
-              const row = history[idx];
-              if (!row) return "";
-              const parts = [formatHistoryTime(row.ts)];
-              if (row.roof) parts.push(`Roof: ${row.roof}`);
-              if (row.rain) parts.push(`Rain: ${row.rain}`);
-              if (row.safe) parts.push(`Safe: ${row.safe}`);
+              const tsVal = items[0].parsed.x;
+              // Find closest history row by timestamp
+              let closest = history[0];
+              let minDiff = Infinity;
+              for (const r of history) {
+                const d = Math.abs(ocsTs(r.ts) - tsVal);
+                if (d < minDiff) { minDiff = d; closest = r; }
+              }
+              const parts = [formatTsMs(ocsTs(closest.ts))];
+              if (closest.roof) parts.push(`Roof: ${closest.roof}`);
+              if (closest.rain) parts.push(`Rain: ${closest.rain}`);
+              if (closest.safe) parts.push(`Safe: ${closest.safe}`);
               return parts;
             },
           },
@@ -2603,8 +2728,14 @@ function renderOcsChart(history) {
       },
       scales,
     },
-    plugins: [backgroundPlugin],
+    plugins: [backgroundPlugin, selectionPlugin],
   });
+
+  canvas.addEventListener("mousedown",  _ocsDragZoomStart);
+  canvas.addEventListener("mousemove",  _ocsDragZoomMove);
+  canvas.addEventListener("mouseup",    _ocsDragZoomEnd);
+  canvas.addEventListener("mouseleave", _ocsDragZoomEnd);
+  canvas.style.cursor = "crosshair";
 }
 
 async function loadOcsHistory() {
@@ -2629,6 +2760,33 @@ async function loadOcsHistory() {
 
 document.getElementById("ocs-history-refresh")?.addEventListener("click", loadOcsHistory);
 document.getElementById("ocs-history-hours")?.addEventListener("change", loadOcsHistory);
+
+document.getElementById("ocs-backfill")?.addEventListener("click", async () => {
+  const btn = document.getElementById("ocs-backfill");
+  const statusEl = document.getElementById("ocs-history-status");
+  btn.disabled = true;
+  btn.textContent = "Backfilling…";
+  if (statusEl) statusEl.textContent = "Scraping 60-min history from OCS…";
+  try {
+    const resp = await fetch("/api/ocs/backfill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ocsHost: currentOcsHost() }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      if (statusEl) statusEl.textContent = `Backfill done — ${data.inserted} new rows inserted (${data.total} points from OCS). Reloading…`;
+      await loadOcsHistory();
+    } else {
+      if (statusEl) statusEl.textContent = `Backfill failed: ${data.error}`;
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Backfill 60 min";
+  }
+});
 
 document.getElementById("ocs-poll-now")?.addEventListener("click", async () => {
   const btn = document.getElementById("ocs-poll-now");
