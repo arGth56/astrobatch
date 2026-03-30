@@ -587,7 +587,7 @@ form.addEventListener("submit", async (event) => {
 
 tabDevicesBtn.addEventListener("click", () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click", () => setActiveTab("actions"));
-tabDomeBtn.addEventListener("click", () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); });
+tabDomeBtn.addEventListener("click", () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
 tabTargetBtn.addEventListener("click", () => setActiveTab("target"));
 
 document.getElementById("target-lookup-form").addEventListener("submit", async (event) => {
@@ -2553,9 +2553,11 @@ function renderOcsChart(history) {
   const humidityData = history.map(r => ({ x: ocsTs(r.ts), y: r.humidity ?? null }));
   const pressureData = history.map(r => ({ x: ocsTs(r.ts), y: r.pressure ?? null }));
   const skyData      = history.map(r => ({ x: ocsTs(r.ts), y: r.sky      ?? null }));
+  const irSkyData    = history.map(r => ({ x: ocsTs(r.ts), y: r.ir_sky   ?? null }));
 
-  const hasSky      = history.some(r => r.sky      != null);
+  const hasSky      = history.some(r => r.sky    != null);
   const hasPressure = history.some(r => r.pressure != null);
+  const hasIrSky    = history.some(r => r.ir_sky  != null);
 
   const datasets = [
     {
@@ -2606,6 +2608,21 @@ function renderOcsChart(history) {
       borderWidth: 2,
       tension: 0.3,
       yAxisID: "ySky",
+      spanGaps: true,
+    });
+  }
+
+  if (hasIrSky) {
+    datasets.push({
+      label: "IR Sky (\u00b0C)",
+      data: irSkyData,
+      borderColor: "#f87171",
+      backgroundColor: "rgba(248,113,113,0.08)",
+      pointRadius: 2,
+      borderWidth: 2,
+      borderDash: [5, 3],
+      tension: 0.3,
+      yAxisID: "yTemp",  // shares °C axis with ambient temp
       spanGaps: true,
     });
   }
@@ -2815,3 +2832,91 @@ document.getElementById("ocs-poll-now")?.addEventListener("click", async () => {
     btn.textContent = "Poll Now";
   }
 });
+
+// ── IR Thermal Camera heatmap ─────────────────────────────────────────────────
+
+function renderIrHeatmap(pixels, avg, cols, rows) {
+  const canvas = document.getElementById("ocs-ir-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const cw = W / cols, ch = H / rows;
+
+  const temps = pixels.map(p => p.temp);
+  const tMin = Math.min(...temps);
+  const tMax = Math.max(...temps);
+  const range = tMax - tMin || 1;
+
+  // Inferno-like colormap: black → purple → red → orange → yellow
+  function tempColor(t) {
+    const frac = Math.max(0, Math.min(1, (t - tMin) / range));
+    // 5-stop gradient
+    const stops = [
+      [0.0,  [10,  5,  30]],
+      [0.25, [90,  0, 120]],
+      [0.5,  [200, 30,  20]],
+      [0.75, [240,120,   0]],
+      [1.0,  [252,255, 160]],
+    ];
+    for (let i = 0; i < stops.length - 1; i++) {
+      const [t0, c0] = stops[i];
+      const [t1, c1] = stops[i + 1];
+      if (frac >= t0 && frac <= t1) {
+        const u = (frac - t0) / (t1 - t0);
+        const r = Math.round(c0[0] + u * (c1[0] - c0[0]));
+        const g = Math.round(c0[1] + u * (c1[1] - c0[1]));
+        const b = Math.round(c0[2] + u * (c1[2] - c0[2]));
+        return `rgb(${r},${g},${b})`;
+      }
+    }
+    return "white";
+  }
+
+  ctx.clearRect(0, 0, W, H);
+  for (const { col, row, temp } of pixels) {
+    ctx.fillStyle = tempColor(temp);
+    ctx.fillRect(col * cw, row * ch, cw, ch);
+    // Temp label on each cell
+    ctx.fillStyle = (temp - tMin) / range > 0.6 ? "#000" : "#fff";
+    ctx.font = `${Math.min(cw * 0.38, 12)}px monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(temp.toFixed(1), col * cw + cw / 2, row * ch + ch / 2);
+  }
+
+  // Grid lines
+  ctx.strokeStyle = "rgba(0,0,0,0.3)";
+  ctx.lineWidth = 0.5;
+  for (let c = 1; c < cols; c++) { ctx.beginPath(); ctx.moveTo(c * cw, 0); ctx.lineTo(c * cw, H); ctx.stroke(); }
+  for (let r = 1; r < rows; r++) { ctx.beginPath(); ctx.moveTo(0, r * ch); ctx.lineTo(W, r * ch); ctx.stroke(); }
+
+  const minEl = document.getElementById("ocs-ir-min");
+  const maxEl = document.getElementById("ocs-ir-max");
+  const avgEl = document.getElementById("ocs-ir-avg");
+  if (minEl) minEl.textContent = `Min: ${tMin.toFixed(1)}°C`;
+  if (maxEl) maxEl.textContent = `Max: ${tMax.toFixed(1)}°C`;
+  if (avgEl) avgEl.textContent = avg != null ? `Avg: ${avg.toFixed(1)}°C` : "";
+}
+
+async function loadIrImage() {
+  const btn     = document.getElementById("ocs-ir-refresh");
+  const statusEl = document.getElementById("ocs-ir-status");
+  if (btn) { btn.disabled = true; btn.textContent = "Loading…"; }
+  if (statusEl) statusEl.textContent = "";
+  try {
+    const resp = await fetch(`/api/ocs/ir-image?ocsHost=${encodeURIComponent(currentOcsHost())}`);
+    const data = await resp.json();
+    if (data.success && data.pixels.length) {
+      renderIrHeatmap(data.pixels, data.avg, data.cols, data.rows);
+      if (statusEl) statusEl.textContent = `avg ${data.avg?.toFixed(1)}°C · ${data.pixels.length} pixels`;
+    } else {
+      if (statusEl) statusEl.textContent = data.error || "No IR data";
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
+  }
+}
+
+document.getElementById("ocs-ir-refresh")?.addEventListener("click", loadIrImage);

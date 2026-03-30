@@ -112,6 +112,7 @@ Weather and observatory condition history, stored every 10 minutes.
 | `humidity` | REAL | Relative humidity (%) |
 | `pressure` | REAL | Barometric pressure (hPa) |
 | `sky` | REAL | Sky quality (mag/arcsec²) |
+| `ir_sky` | REAL | IR thermal camera average sky temperature (°C, from MLX90621) |
 
 **Note:** Backfilled rows (from `POST /api/ocs/backfill`) will not have `roof`, `safe`, or `rain` values (OCS does not include those in its chart data).
 

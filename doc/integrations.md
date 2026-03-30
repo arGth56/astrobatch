@@ -68,6 +68,27 @@ GET /skypage.htm?chart=last48     → last 48 hours
 
 Data points are `{x: hoursAgo, y: value}` format, parsed by the backfill endpoint.
 
+### IR Thermal Camera (MLX90621 · 16×4)
+
+An MLX90621 IR thermal array is integrated into the OCS, providing a 16×4 pixel sky temperature map (60° FOV, pointing at zenith).
+
+**Live pixel matrix:**
+```
+GET http://192.168.1.220/ir-image.txt
+```
+Returns 65 lines: 64 pixel lines (`col,row,temp_C`) + one average (`avg,temp_C`).
+
+**Average in dashboard poll (`/index.txt`):**
+```
+wea_irsky| 25.7 °C
+```
+
+**Interpretation:** Clear sky: IR sky temp well below ambient (−20 to −40°C delta). Cloudy: approaches ambient. `ir_sky − ambient` = cloud cover indicator.
+
+**AstroBatch integration:**
+- `GET /api/ocs/ir-image` — full 16×4 pixel array, rendered as an inferno colormap heatmap in the Dome tab
+- `ocs_history.ir_sky` — array average stored every 10 min; plotted as dashed red line on the weather timeline chart
+
 ---
 
 ## STDWeb

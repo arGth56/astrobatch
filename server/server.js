@@ -199,9 +199,12 @@ db.exec(`
     temp      REAL,
     humidity  REAL,
     pressure  REAL,
-    sky       REAL
+    sky       REAL,
+    ir_sky    REAL
   );
 `);
+// Migration: add ir_sky column if DB was created before this version
+try { db.exec(`ALTER TABLE ocs_history ADD COLUMN ir_sky REAL`); } catch (_) {}
 
 // ── OCS history poller ────────────────────────────────────────────────────────
 
@@ -210,28 +213,32 @@ function ocsClean(v) {
   return (v || "").replace(/<[^>]*>/g, "").replace(/&[a-z]+;/gi, "").trim();
 }
 
+/** Parse a numeric value from an OCS field string (handles " 25.7 °C", "nan", "--"). */
+function ocsNum(v) {
+  if (!v) return null;
+  const n = parseFloat(ocsClean(v));
+  return isNaN(n) ? null : n;
+}
+
 async function pollAndStoreOcs() {
   try {
     const host = DEFAULT_OCS_HOST;
     const { ok, fields } = await ocsStatus(host);
     if (!ok) return;
-    const temp     = parseFloat(fields.wea_temp);
-    const humidity = parseFloat(fields.wea_humd);
-    const pressure = parseFloat(fields.wea_pres);
-    const sky      = parseFloat(fields.wea_sq || "");   // e.g. " 5.4 mpsas"
     db.prepare(
-      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky, ir_sky)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       ocsClean(fields.roof_sta)  || null,
       ocsClean(fields.stat_safe) || null,
       ocsClean(fields.wea_rain)  || null,
-      isNaN(temp)     ? null : temp,
-      isNaN(humidity) ? null : humidity,
-      isNaN(pressure) ? null : pressure,
-      isNaN(sky)      ? null : sky,
+      ocsNum(fields.wea_temp),
+      ocsNum(fields.wea_humd),
+      ocsNum(fields.wea_pres),
+      ocsNum(fields.wea_sq),
+      ocsNum(fields.wea_irsky),
     );
   } catch (e) {
-    // OCS unreachable — skip silently (don't fill logs with noise)
     if (process.env.DEBUG) console.error("[OCS poller]", e.message);
   }
 }
@@ -2211,7 +2218,7 @@ app.post("/api/ocs/roof", async (req, res) => {
 app.get("/api/ocs/history", (req, res) => {
   const hours = Math.min(Number(req.query.hours) || 48, 168); // max 7 days
   const rows = db.prepare(
-    `SELECT id, ts, roof, safe, rain, temp, humidity, pressure, sky
+    `SELECT id, ts, roof, safe, rain, temp, humidity, pressure, sky, ir_sky
      FROM ocs_history
      WHERE ts >= datetime('now', ? || ' hours')
      ORDER BY ts ASC`
@@ -2225,21 +2232,18 @@ app.post("/api/ocs/poll-now", async (req, res) => {
     const { ok, fields } = await ocsStatus(host);
     if (!ok) return res.status(502).json({ success: false, error: "OCS returned non-OK status" });
 
-    const temp     = parseFloat(fields.wea_temp);
-    const humidity = parseFloat(fields.wea_humd);
-    const pressure = parseFloat(fields.wea_pres);
-    const sky      = parseFloat(fields.wea_sq || "");
-
     const result = db.prepare(
-      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO ocs_history (roof, safe, rain, temp, humidity, pressure, sky, ir_sky)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       ocsClean(fields.roof_sta)  || null,
       ocsClean(fields.stat_safe) || null,
       ocsClean(fields.wea_rain)  || null,
-      isNaN(temp)     ? null : temp,
-      isNaN(humidity) ? null : humidity,
-      isNaN(pressure) ? null : pressure,
-      isNaN(sky)      ? null : sky,
+      ocsNum(fields.wea_temp),
+      ocsNum(fields.wea_humd),
+      ocsNum(fields.wea_pres),
+      ocsNum(fields.wea_sq),
+      ocsNum(fields.wea_irsky),
     );
 
     const row = db.prepare("SELECT * FROM ocs_history WHERE id = ?").get(result.lastInsertRowid);
@@ -2330,6 +2334,45 @@ app.post("/api/ocs/backfill", async (req, res) => {
       success: false,
       error: error.name === "AbortError" || error.name === "TimeoutError"
         ? "OCS connection timed out"
+        : error.message,
+    });
+  }
+});
+
+// ── OCS IR thermal camera ──────────────────────────────────────────────────────
+
+app.get("/api/ocs/ir-image", async (req, res) => {
+  try {
+    const host = validateOcsHost(req.query?.ocsHost || DEFAULT_OCS_HOST);
+    const response = await fetch(`http://${host}/ir-image.txt?x=${Date.now()}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return res.status(502).json({ success: false, error: `OCS returned ${response.status}` });
+
+    const text = await response.text();
+    const pixels = [];  // [{col, row, temp}]
+    let avg = null;
+
+    for (const line of text.trim().split("\n")) {
+      const parts = line.trim().split(",");
+      if (parts[0] === "avg") {
+        avg = parseFloat(parts[1]);
+      } else if (parts.length === 3) {
+        const col = parseInt(parts[0], 10);
+        const row = parseInt(parts[1], 10);
+        const temp = parseFloat(parts[2]);
+        if (!isNaN(col) && !isNaN(row) && !isNaN(temp)) {
+          pixels.push({ col, row, temp });
+        }
+      }
+    }
+
+    res.json({ success: true, pixels, avg, cols: 16, rows: 4 });
+  } catch (error) {
+    res.status(502).json({
+      success: false,
+      error: error.name === "AbortError" || error.name === "TimeoutError"
+        ? "OCS IR camera timed out"
         : error.message,
     });
   }
