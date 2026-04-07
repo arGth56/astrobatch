@@ -38,7 +38,7 @@ from astropy.io import fits
 PROJECT_ROOT    = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT   = Path("/mnt/nas/input/pyl/astro/input/FLAT")
 CALIB_FLATS_DIR = PROJECT_ROOT / "calib" / "flats"
-SIRIL_BIN       = "siril"
+SIRIL_BIN       = "siril-cli"
 
 # ── Filter name → master flat stem ────────────────────────────────────────────
 # Keys are UPPERCASE. Edit to match your naming convention.

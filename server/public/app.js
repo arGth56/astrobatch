@@ -4,13 +4,14 @@ const logEl = document.getElementById("log");
 const refreshButton = document.getElementById("refresh-status");
 const connectButtons = Array.from(document.querySelectorAll("button[data-device]"));
 
-const tabDevicesBtn  = document.getElementById("tab-devices");
-const tabActionsBtn  = document.getElementById("tab-actions");
-const tabDomeBtn     = document.getElementById("tab-dome");
-const tabTargetBtn   = document.getElementById("tab-target");
+const tabDevicesBtn   = document.getElementById("tab-devices");
+const tabActionsBtn   = document.getElementById("tab-actions");
+const tabDomeBtn      = document.getElementById("tab-dome");
+const tabTargetBtn    = document.getElementById("tab-target");
 const tabTodoBtn      = document.getElementById("tab-todo");
 const tabPipelineBtn  = document.getElementById("tab-pipeline");
 const tabHistoryBtn   = document.getElementById("tab-history");
+const tabSettingsBtn  = document.getElementById("tab-settings");
 const panelDevices    = document.getElementById("panel-devices");
 const panelActions    = document.getElementById("panel-actions");
 const panelDome       = document.getElementById("panel-dome");
@@ -18,6 +19,7 @@ const panelTarget     = document.getElementById("panel-target");
 const panelTodo       = document.getElementById("panel-todo");
 const panelPipeline   = document.getElementById("panel-pipeline");
 const panelHistory    = document.getElementById("panel-history");
+const panelSettings   = document.getElementById("panel-settings");
 
 const cameraCaptureForm = document.getElementById("camera-capture-form");
 const filterwheelForm = document.getElementById("filterwheel-form");
@@ -50,9 +52,14 @@ const ocsSafetyDetailEl = document.getElementById("detail-safetymonitor");
 let lastEquipment = null;
 let ocsHost = "192.168.1.220";
 let ocsConnected = false;
+let stdwebConnected = false;
 let observerLocation = { lat: null, lon: null, elevation: null };
 let lastTargetCoords = { raDeg: null, decDeg: null };
 let lastTnsTarget = null;
+
+// Plan Tonight state
+let _tonightEvents = [];
+let _tonightSort   = { col: "maxAlt", dir: -1 }; // default: highest altitude first
 
 // Sequence polling
 let seqPollInterval    = null;
@@ -61,7 +68,10 @@ let seqLogRenderedCount = 0;
 // Drag-and-drop state (module-level so re-renders during polling don't lose it)
 let _seqDragSrc        = null;
 let _seqDragging       = false;
-let _seqDragInsertAfter = false; // last hover half from dragover, used by drop
+let _seqDragInsertAfter = false;
+
+// Track which per-target override panels are currently open (by queue index)
+const _openOverridePanels = new Set();
 
 function currentConfig() {
   return {
@@ -76,7 +86,7 @@ function setLog(value) {
 }
 
 function setActiveTab(tab) {
-  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false };
+  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false, settings: false };
   tabs[tab] = true;
   tabDevicesBtn.classList.toggle("active",  tabs.devices);
   tabActionsBtn.classList.toggle("active",  tabs.actions);
@@ -85,6 +95,7 @@ function setActiveTab(tab) {
   tabTodoBtn.classList.toggle("active",     tabs.todo);
   tabPipelineBtn.classList.toggle("active", tabs.pipeline);
   tabHistoryBtn.classList.toggle("active",  tabs.history);
+  tabSettingsBtn.classList.toggle("active", tabs.settings);
   panelDevices.classList.toggle("active",   tabs.devices);
   panelActions.classList.toggle("active",   tabs.actions);
   panelDome.classList.toggle("active",      tabs.dome);
@@ -92,6 +103,7 @@ function setActiveTab(tab) {
   panelTodo.classList.toggle("active",      tabs.todo);
   panelPipeline.classList.toggle("active",  tabs.pipeline);
   panelHistory.classList.toggle("active",   tabs.history);
+  panelSettings.classList.toggle("active",  tabs.settings);
 
   if (tab === "todo") {
     startSeqPolling();
@@ -100,10 +112,17 @@ function setActiveTab(tab) {
   } else {
     stopSeqPolling();
   }
+  if (tab === "actions") {
+    // Refresh filter list when Actions tab opens
+    refreshStatus().catch(() => {});
+  }
   if (tab === "pipeline") {
     startPipelinePolling();
   } else {
     stopPipelinePolling();
+  }
+  if (tab !== "settings") {
+    stopWatchdogPolling();
   }
 }
 
@@ -167,12 +186,41 @@ function setOcsStatus(roof = {}, reachable = true) {
 function updateOcsIndicator() {
   const el = document.getElementById("ocs-connection-status");
   if (!el) return;
+  const hostEl = document.getElementById("ocs-host-display");
+  if (hostEl) hostEl.textContent = currentOcsHost();
   if (ocsConnected) {
     el.textContent = `OCS ✓ ${currentOcsHost()}`;
     el.className = "ocs-status-indicator online";
   } else {
     el.textContent = `OCS ✗ ${currentOcsHost()} — not reachable`;
     el.className = "ocs-status-indicator offline";
+  }
+}
+
+function updateStdwebIndicator(url, reachable, detail) {
+  const el     = document.getElementById("stdweb-connection-status");
+  const hostEl = document.getElementById("stdweb-host-display");
+  const shortUrl = url ? url.replace(/^https?:\/\//, "") : "—";
+  if (hostEl) hostEl.textContent = shortUrl;
+  if (!el) return;
+  stdwebConnected = reachable;
+  if (reachable) {
+    el.textContent = `STDWeb ✓ ${shortUrl}`;
+    el.className = "ocs-status-indicator online";
+  } else {
+    el.textContent = `STDWeb ✗ ${shortUrl}${detail ? ` — ${detail}` : " — not reachable"}`;
+    el.className = "ocs-status-indicator offline";
+  }
+}
+
+async function checkStdwebHealth() {
+  const el = document.getElementById("stdweb-connection-status");
+  if (el) { el.textContent = "STDWeb — checking…"; el.className = "ocs-status-indicator"; }
+  try {
+    const data = await fetch("/api/stdweb/health").then(r => r.json());
+    updateStdwebIndicator(data.url, data.reachable, data.error || (data.httpStatus && !data.reachable ? `HTTP ${data.httpStatus}` : null));
+  } catch (err) {
+    updateStdwebIndicator(null, false, err.message);
   }
 }
 
@@ -397,7 +445,17 @@ async function roofCommand(command) {
   const host = currentOcsHost();
   setLog(`Sending roof command: ${command}...`);
   try {
-    const payload = await postJson("/api/ocs/roof", { ocsHost: host, command });
+    const resp = await fetch("/api/ocs/roof", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ocsHost: host, command }),
+    });
+    const payload = await resp.json();
+    if (resp.status === 403) {
+      alert(`⛔ ${payload.error}`);
+      setLog(payload);
+      return;
+    }
     setOcsStatus(payload.roof || {});
     setLog(payload);
   } catch (error) {
@@ -419,25 +477,32 @@ function setDeviceStatuses(devices = {}) {
 }
 
 function updateFilterOptions(equipment = null) {
-  const filters = equipment?.FilterWheel?.AvailableFilters || [];
+  const raw = equipment?.FilterWheel?.AvailableFilters || [];
+  // Keep only slots with a non-empty name; fallback to 4 numeric slots so the
+  // dropdown is always usable even when NINA is offline.
+  const named   = raw.filter(f => f.Name && f.Name.trim());
+  const filters  = named.length ? named : raw.length ? raw : null;
   const selectedId = equipment?.FilterWheel?.SelectedFilter?.Id;
-  filterSelect.innerHTML = "";
-  for (const filter of filters) {
-    const option = document.createElement("option");
-    option.value = String(filter.Id);
-    const label = filter.Name && filter.Name.trim() ? filter.Name : `Filter ${filter.Id}`;
-    option.textContent = `${label} (${filter.Id})`;
-    if (selectedId === filter.Id) {
-      option.selected = true;
-    }
-    filterSelect.appendChild(option);
-  }
 
-  if (!filters.length) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "No filters available";
-    filterSelect.appendChild(option);
+  filterSelect.innerHTML = "";
+
+  if (filters) {
+    for (const filter of filters) {
+      const option = document.createElement("option");
+      option.value = String(filter.Id);
+      const label = filter.Name && filter.Name.trim() ? filter.Name : `Filter ${filter.Id}`;
+      option.textContent = `${label} (slot ${filter.Id})`;
+      if (selectedId === filter.Id) option.selected = true;
+      filterSelect.appendChild(option);
+    }
+  } else {
+    // NINA unreachable — offer 4 numeric slots as fallback
+    for (let i = 0; i < 4; i++) {
+      const option = document.createElement("option");
+      option.value = String(i);
+      option.textContent = `Slot ${i}`;
+      filterSelect.appendChild(option);
+    }
   }
 }
 
@@ -467,6 +532,13 @@ async function refreshStatus() {
     postJson("/api/ocs/status", { ocsHost: currentOcsHost() }),
   ]);
 
+  // Update NINA host display
+  const ninaHostEl = document.getElementById("nina-host-display");
+  if (ninaHostEl) {
+    const cfg = currentConfig();
+    ninaHostEl.textContent = `${cfg.host}:${cfg.port}`;
+  }
+
   if (ninaResult.status === "fulfilled") {
     const payload = ninaResult.value;
     connectionStatus.textContent = payload.success
@@ -475,6 +547,8 @@ async function refreshStatus() {
     setDeviceStatuses(payload.devices || {});
     lastEquipment = payload.equipment || null;
     updateFilterOptions(lastEquipment);
+    updateFwCurrentBadge(lastEquipment);
+    updateCoverBadge(lastEquipment?.FlatDevice ?? null);
 
     // Store site coordinates when mount is connected and has real coordinates
     const mount = lastEquipment?.Mount;
@@ -549,18 +623,79 @@ async function runCameraCapture() {
   }
 }
 
+function updateFwCurrentBadge(equipment) {
+  const fw = equipment?.FilterWheel;
+  const label = document.getElementById("fw-current-label");
+  const slot  = document.getElementById("fw-current-slot");
+  if (!label || !slot) return;
+  if (fw?.Connected && fw.SelectedFilter) {
+    label.textContent = fw.SelectedFilter.Name || `Filter ${fw.SelectedFilter.Id}`;
+    label.style.color = "#a78bfa";
+    slot.textContent  = `(slot ${fw.SelectedFilter.Id})`;
+  } else {
+    label.textContent = fw?.Connected ? "Unknown" : "Not connected";
+    label.style.color = "#9ca3af";
+    slot.textContent  = "";
+  }
+}
+
 async function changeFilter() {
-  const filterId = Number(filterSelect.value);
-  setLog(`Changing filter to ${filterId}...`);
+  const filterId    = Number(filterSelect.value);
+  const filterName  = filterSelect.options[filterSelect.selectedIndex]?.text || String(filterId);
+  const msgEl       = document.getElementById("fw-result-msg");
+
+  // Capture before state
+  const beforeFilter = lastEquipment?.FilterWheel?.SelectedFilter;
+  const beforeName   = beforeFilter?.Name || (beforeFilter ? `Filter ${beforeFilter.Id}` : "Unknown");
+  const beforeSlot   = beforeFilter?.Id ?? "?";
+
+  if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">Sending change to ${filterName}…</span>`;
+  setLog(`Changing filter to ${filterName} (id=${filterId})...`);
+
   try {
     const payload = await postJson("/api/nina/actions/filterwheel/change", {
       ...currentConfig(),
       filterId,
     });
-    await refreshStatus();
+    await refreshStatus();  // updates lastEquipment
+
+    // Capture after state
+    const afterFilter = lastEquipment?.FilterWheel?.SelectedFilter;
+    const afterName   = afterFilter?.Name || (afterFilter ? `Filter ${afterFilter.Id}` : "Unknown");
+    const afterSlot   = afterFilter?.Id ?? "?";
+
+    const moved = afterSlot !== beforeSlot;
+    if (msgEl) {
+      if (moved) {
+        msgEl.innerHTML =
+          `<span style="color:#34d399">✔ Moved: <b>${beforeName}</b> (slot ${beforeSlot}) → <b>${afterName}</b> (slot ${afterSlot})</span>`;
+      } else {
+        msgEl.innerHTML =
+          `<span style="color:#fbbf24">⚠ Filter wheel position unchanged — still <b>${afterName}</b> (slot ${afterSlot}). Was it already on this filter, or did it not move?</span>`;
+      }
+    }
     setLog(payload);
   } catch (error) {
+    if (msgEl) msgEl.innerHTML = `<span style="color:#f87171">✘ Error: ${error.message}</span>`;
     setLog({ success: false, action: "filter-change", error: error.message });
+  }
+}
+
+async function verifyFilterPosition() {
+  const msgEl = document.getElementById("fw-result-msg");
+  if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">Querying NINA…</span>`;
+  await refreshStatus();
+  const fw = lastEquipment?.FilterWheel;
+  if (msgEl) {
+    if (fw?.Connected && fw.SelectedFilter) {
+      const filters = fw.AvailableFilters || [];
+      const list = filters.map(f => `${f.Name}=slot${f.Id}`).join(", ");
+      msgEl.innerHTML =
+        `<span style="color:#60a5fa">Current: <b>${fw.SelectedFilter.Name}</b> (slot ${fw.SelectedFilter.Id})</span>` +
+        (list ? `<br><span style="font-size:11px;color:#6b7280">Available: ${list}</span>` : "");
+    } else {
+      msgEl.innerHTML = `<span style="color:#f87171">Filter wheel not connected</span>`;
+    }
   }
 }
 
@@ -582,13 +717,66 @@ async function moveFocuser(direction) {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  // Update NINA host display in connect-bar
+  const ninaHostEl = document.getElementById("nina-host-display");
+  if (ninaHostEl) {
+    const host = document.getElementById("host").value;
+    const port = document.getElementById("port").value;
+    ninaHostEl.textContent = `${host}:${port}`;
+  }
   await refreshStatus();
 });
 
-tabDevicesBtn.addEventListener("click", () => setActiveTab("devices"));
-tabActionsBtn.addEventListener("click", () => setActiveTab("actions"));
-tabDomeBtn.addEventListener("click", () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
-tabTargetBtn.addEventListener("click", () => setActiveTab("target"));
+// ── Connect-bar Test buttons ──────────────────────────────────────────────────
+
+document.getElementById("btn-nina-test")?.addEventListener("click", async () => {
+  const btn = document.getElementById("btn-nina-test");
+  const el  = document.getElementById("connection-status");
+  btn.disabled = true;
+  btn.textContent = "…";
+  if (el) { el.textContent = "Testing…"; el.className = "status"; }
+  try {
+    await refreshStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test";
+  }
+});
+
+document.getElementById("btn-ocs-test")?.addEventListener("click", async () => {
+  const btn = document.getElementById("btn-ocs-test");
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    await refreshOcsStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test";
+  }
+});
+
+document.getElementById("btn-stdweb-test")?.addEventListener("click", async () => {
+  const btn = document.getElementById("btn-stdweb-test");
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    await checkStdwebHealth();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test";
+  }
+});
+
+tabDevicesBtn.addEventListener("click",  () => setActiveTab("devices"));
+tabActionsBtn.addEventListener("click",  () => setActiveTab("actions"));
+tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
+tabTargetBtn.addEventListener("click",   () => setActiveTab("target"));
+tabSettingsBtn.addEventListener("click", () => {
+  setActiveTab("settings");
+  loadWatchdogConfig();
+  loadArbiterConfig();
+  startWatchdogPolling();
+});
 
 document.getElementById("target-lookup-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -601,7 +789,7 @@ document.getElementById("dome-ocs-config-form").addEventListener("submit", async
   await refreshOcsStatus();
 });
 
-document.getElementById("ocs-connect-form").addEventListener("submit", async (event) => {
+document.getElementById("ocs-connect-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   syncOcsHostInputs(document.getElementById("ocs-host-top").value.trim() || ocsHost);
   await refreshOcsStatus();
@@ -611,19 +799,32 @@ document.getElementById("dome-open").addEventListener("click", async () => {
   if (confirm("Open the roof?")) await roofCommand("open");
 });
 document.getElementById("dome-close").addEventListener("click", async () => {
-  // Check mount park state before allowing roof close
   const mount = lastEquipment?.Mount;
-  if (mount?.Connected && mount?.AtPark !== true) {
-    const detail = `Mount is ${mount.Slewing ? "slewing" : "not parked"} (AtPark=${mount.AtPark}).`;
-    alert(`⛔ Cannot close roof — ${detail}\n\nPark the mount first.`);
+  const fd    = lastEquipment?.FlatDevice;
+
+  // Build list of blocking conditions
+  const blocks = [];
+  if (mount?.Connected && mount.AtPark !== true)
+    blocks.push(`mount is not parked (AtPark=${mount.AtPark}${mount.Slewing ? ", slewing" : ""})`);
+  if (fd?.Connected && normCoverStateClient(fd.CoverState) !== 1)
+    blocks.push(`dust cover is not closed (${COVER_STATE_LABELS[normCoverStateClient(fd.CoverState)] ?? fd.CoverState})`);
+
+  if (blocks.length) {
+    alert(`⛔ Cannot close roof:\n\n• ${blocks.join("\n• ")}\n\nFix these first.`);
     return;
   }
-  if (!mount?.Connected) {
-    const ok = confirm("⚠ Mount status unknown (NINA not connected).\nCannot verify park state.\n\nClose roof anyway?");
-    if (!ok) return;
-  } else {
-    if (!confirm("Mount is parked ✓ — close the roof?")) return;
-  }
+
+  const ninaUnknown = !mount?.Connected;
+  const coverUnknown = !fd?.Connected;
+  let warning = "";
+  if (ninaUnknown)   warning += "⚠ NINA not connected — cannot verify mount park state.\n";
+  if (coverUnknown)  warning += "⚠ Cover device not connected — cannot verify dust cover state.\n";
+
+  const msg = warning
+    ? `${warning}\nClose roof anyway?`
+    : "Mount parked ✓  Cover closed ✓\n\nClose the roof?";
+
+  if (!confirm(msg)) return;
   await roofCommand("close");
 });
 document.getElementById("dome-stop").addEventListener("click", async () => roofCommand("stop"));
@@ -652,8 +853,76 @@ filterwheelForm.addEventListener("submit", async (event) => {
   await changeFilter();
 });
 
+document.getElementById("fw-verify-btn")?.addEventListener("click", () => verifyFilterPosition());
+
 focuserInBtn.addEventListener("click", async () => moveFocuser("in"));
 focuserOutBtn.addEventListener("click", async () => moveFocuser("out"));
+
+// ── Dust Cover ────────────────────────────────────────────────────────────────
+
+// NINA returns CoverState as a string ("Open", "Closed", "Moving", …) or int
+function normCoverStateClient(raw) {
+  if (typeof raw === "number") return raw;
+  const map = { notpresent: 0, closed: 1, moving: 2, open: 3, unknown: 100, error: 101 };
+  return map[String(raw ?? "").toLowerCase().trim()] ?? 100;
+}
+
+const COVER_STATE_LABELS = { 0: "Not Present", 1: "Closed", 2: "Moving…", 3: "Open", 100: "Unknown", 101: "Error" };
+const COVER_STATE_COLORS = { 0: "#6b7280", 1: "#4ade80", 2: "#fbbf24", 3: "#34d399", 100: "#9ca3af", 101: "#f87171" };
+
+function updateCoverBadge(fd) {
+  const stateEl  = document.getElementById("cover-state-label");
+  const detailEl = document.getElementById("detail-flatdevice");
+  if (!fd) { if (stateEl) { stateEl.textContent = "—"; stateEl.style.color = ""; } return; }
+  const stateNum = normCoverStateClient(fd.CoverState);
+  const label    = COVER_STATE_LABELS[stateNum] ?? String(fd.CoverState ?? "Unknown");
+  const color    = COVER_STATE_COLORS[stateNum] ?? "#9ca3af";
+  if (stateEl)  { stateEl.textContent = label; stateEl.style.color = color; }
+  if (detailEl) { detailEl.textContent = fd.Connected ? label : "Not connected"; detailEl.style.color = fd.Connected ? color : "#6b7280"; }
+}
+
+async function coverAction(action) {
+  const msgEl = document.getElementById("cover-result-msg");
+  if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">${action === "open" ? "Opening" : "Closing"} cover…</span>`;
+  try {
+    const resp = await fetch(`/api/nina/actions/flatdevice/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentConfig()),
+    });
+    const r = await resp.json();
+    if (msgEl) {
+      if (r.success) {
+        msgEl.innerHTML = `<span style="color:#34d399">✔ Cover ${action === "open" ? "opened" : "closed"} ✓</span>`;
+      } else if (resp.status === 403) {
+        msgEl.innerHTML = `<span style="color:#f87171">⛔ ${r.error}</span>`;
+      } else {
+        msgEl.innerHTML = `<span style="color:#f87171">✘ ${r.error || "Failed"}</span>`;
+      }
+    }
+    if (!r.success) setLog(r);
+    await refreshStatus();
+  } catch (err) {
+    if (msgEl) msgEl.innerHTML = `<span style="color:#f87171">✘ ${err.message}</span>`;
+    setLog({ success: false, action: `cover-${action}`, error: err.message });
+  }
+}
+
+document.getElementById("cover-open-btn").addEventListener("click", () => coverAction("open"));
+document.getElementById("cover-close-btn").addEventListener("click", () => coverAction("close"));
+document.getElementById("cover-connect-btn").addEventListener("click", async () => {
+  const msgEl = document.getElementById("cover-result-msg");
+  if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">Connecting…</span>`;
+  try {
+    const r = await postJson("/api/nina/actions/flatdevice/connect", currentConfig());
+    if (msgEl) msgEl.innerHTML = r.success
+      ? `<span style="color:#34d399">✔ Connected</span>`
+      : `<span style="color:#f87171">✘ ${r.error || "Failed"}</span>`;
+    await refreshStatus();
+  } catch (err) {
+    if (msgEl) msgEl.innerHTML = `<span style="color:#f87171">✘ ${err.message}</span>`;
+  }
+});
 
 async function loadDefaults() {
   try {
@@ -667,31 +936,492 @@ async function loadDefaults() {
     if (defaults.tns?.botId) document.getElementById("tns-bot-id").value = defaults.tns.botId;
     if (defaults.tns?.botName) document.getElementById("tns-bot-name").value = defaults.tns.botName;
     if (defaults.tns?.hasApiKey) document.getElementById("tns-api-key").placeholder = "Loaded from server env";
+    // Restore Astro-COLIBRI UID from server DB (persists across browsers/sessions)
+    if (defaults.colibriUid) {
+      const el = document.getElementById("colibri-uid");
+      if (el && !el.value) el.value = defaults.colibriUid;
+    }
   } catch {
     document.getElementById("host").value = "192.168.1.174";
     document.getElementById("port").value = "1888";
     document.getElementById("protocol").value = "http";
     syncOcsHostInputs("192.168.1.220");
   }
+  // Restore tonight search settings from localStorage
+  ["tonight-days", "tonight-minalt"].forEach(id => {
+    const saved = localStorage.getItem(id);
+    const el    = document.getElementById(id);
+    if (el && saved) el.value = saved;
+  });
+  // Update NINA host display in connect-bar
+  const ninaHostEl = document.getElementById("nina-host-display");
+  if (ninaHostEl) {
+    const host = document.getElementById("host").value;
+    const port = document.getElementById("port").value;
+    ninaHostEl.textContent = `${host}:${port}`;
+  }
+  // Update OCS host display
+  updateOcsIndicator();
+  // Check STDWeb reachability
+  checkStdwebHealth();
 }
+
+// ── Watchdog ──────────────────────────────────────────────────────────────────
+
+async function loadWatchdogConfig() {
+  try {
+    const res  = await fetch("/api/watchdog");
+    if (!res.ok) return;
+    const cfg  = await res.json();
+    document.getElementById("watchdog-enable").checked      = !!cfg.enabled;
+    document.getElementById("watchdog-sky-temp").value      = cfg.skyTempLimit ?? -4;
+    document.getElementById("watchdog-sq").value            = cfg.sqLimit      ?? 16;
+    document.getElementById("watchdog-retention").value     = cfg.retentionMin ?? 10;
+    document.getElementById("watchdog-max-bad").value       = cfg.maxBadMin    ?? 90;
+    updateWatchdogStatusPanel(cfg);
+  } catch {}
+}
+
+function updateWatchdogStatusPanel(cfg) {
+  const dot   = document.getElementById("watchdog-state-dot");
+  const text  = document.getElementById("watchdog-state-text");
+  const last  = document.getElementById("watchdog-last-check");
+  const badge = document.getElementById("watchdog-status-badge");
+  if (!dot) return;
+
+  const colors = { off: "#6b7280", clear: "#22c55e", bad: "#ef4444", recovering: "#f59e0b" };
+  const labels = { off: "Disabled", clear: "Clear ✓", bad: "⚠ Bad conditions — mount parked", recovering: "Recovering…" };
+
+  const state = cfg.state || "off";
+  dot.style.background = colors[state] || "#6b7280";
+  text.textContent     = labels[state] || state;
+  if (cfg.lastMsg && state !== "off") text.textContent += `  (${cfg.lastMsg})`;
+  if (state === "bad" && cfg.badSince) {
+    const badMin = Math.round((Date.now() - new Date(cfg.badSince).getTime()) / 60_000);
+    text.textContent += `  — bad for ${badMin} min / max ${cfg.maxBadMin ?? 90} min`;
+  }
+  if (cfg.lastCheck) {
+    const d = new Date(cfg.lastCheck);
+    last.textContent = `Last check: ${d.toLocaleTimeString()}`;
+  } else {
+    last.textContent = cfg.enabled ? "Not checked yet" : "";
+  }
+
+  // Mount park monitor row
+  const mmDot  = document.getElementById("mount-monitor-dot");
+  const mmText = document.getElementById("mount-monitor-text");
+  const mmLast = document.getElementById("mount-monitor-last");
+  if (mmDot && mmText) {
+    const mm = cfg.mountMonitor;
+    const atPark = mm?.lastAtPark;
+    if (atPark === null || atPark === undefined) {
+      mmDot.style.background = "#6b7280";
+      mmText.textContent = "Park monitor: NINA unreachable";
+      mmText.style.color = "#6b7280";
+    } else if (atPark === true) {
+      mmDot.style.background = "#f59e0b";
+      mmText.textContent = "Park monitor: Mount PARKED — cover closed";
+      mmText.style.color = "#f59e0b";
+    } else {
+      mmDot.style.background = "#22c55e";
+      mmText.textContent = "Park monitor: Mount tracking ✓";
+      mmText.style.color = "#94a3b8";
+    }
+    if (mm?.lastCheck && mmLast) {
+      mmLast.textContent = `Last: ${new Date(mm.lastCheck).toLocaleTimeString()}`;
+    }
+  }
+
+  // Header badge
+  if (badge) {
+    if (state === "bad") {
+      badge.textContent = "⛅ Watchdog: bad";
+      badge.className   = "watchdog-badge watchdog-badge-bad";
+      badge.style.display = "";
+    } else if (state === "recovering") {
+      badge.textContent = "⏳ Recovering";
+      badge.className   = "watchdog-badge watchdog-badge-recovering";
+      badge.style.display = "";
+    } else if (state === "clear") {
+      badge.textContent = "☀ Clear";
+      badge.className   = "watchdog-badge watchdog-badge-clear";
+      badge.style.display = "";
+    } else {
+      badge.style.display = "none";
+    }
+  }
+}
+
+document.getElementById("watchdog-save")?.addEventListener("click", async () => {
+  const body = {
+    enabled:      document.getElementById("watchdog-enable").checked,
+    skyTempLimit: Number(document.getElementById("watchdog-sky-temp").value),
+    sqLimit:      Number(document.getElementById("watchdog-sq").value),
+    retentionMin: Number(document.getElementById("watchdog-retention").value),
+    maxBadMin:    Number(document.getElementById("watchdog-max-bad").value),
+  };
+  try {
+    const res = await fetch("/api/watchdog", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    updateWatchdogStatusPanel(data.watchdog ?? data);
+    // Flash the button to confirm
+    const btn = document.getElementById("watchdog-save");
+    btn.textContent = "Saved ✓";
+    setTimeout(() => { btn.textContent = "Save Watchdog"; }, 2000);
+  } catch {}
+});
+
+// Poll watchdog status every 30 s when settings tab is active
+let _watchdogPollInterval = null;
+function startWatchdogPolling() {
+  if (_watchdogPollInterval) return;
+  _watchdogPollInterval = setInterval(async () => {
+    try {
+      const res = await fetch("/api/watchdog");
+      if (res.ok) updateWatchdogStatusPanel(await res.json());
+    } catch {}
+  }, 30_000);
+}
+function stopWatchdogPolling() {
+  if (_watchdogPollInterval) { clearInterval(_watchdogPollInterval); _watchdogPollInterval = null; }
+}
+
+// Also poll when header badge is visible (any tab)
+setInterval(async () => {
+  try {
+    const res = await fetch("/api/watchdog");
+    if (res.ok) updateWatchdogStatusPanel(await res.json());
+  } catch {}
+}, 60_000);
+
+// ── Astro-COLIBRI UID: save to server DB on blur ──────────────────────────────
+document.getElementById("colibri-uid")?.addEventListener("change", async () => {
+  const uid = document.getElementById("colibri-uid").value.trim();
+  await fetch("/api/settings", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ key: "colibri_uid", value: uid }),
+  }).catch(() => {});
+});
+["tonight-days", "tonight-minalt"].forEach(id => {
+  document.getElementById(id)?.addEventListener("change", () => {
+    localStorage.setItem(id, document.getElementById(id).value);
+  });
+});
+
+// ── Plan Tonight ──────────────────────────────────────────────────────────────
+
+function formatErr(deg) {
+  if (deg == null || deg <= 0) return "—";
+  const arcsec = deg * 3600;
+  if (arcsec < 60)   return arcsec.toFixed(0) + "″";
+  if (arcsec < 3600) return (arcsec / 60).toFixed(1) + "′";
+  return deg.toFixed(2) + "°";
+}
+
+function formatAge(hours) {
+  if (hours == null || hours < 0) return "—";
+  if (hours < 1)   return Math.round(hours * 60) + "m";
+  if (hours < 24)  return hours.toFixed(1) + "h";
+  return (hours / 24).toFixed(1) + "d";
+}
+
+function tonightSortBy(col) {
+  if (_tonightSort.col === col) {
+    _tonightSort.dir *= -1;
+  } else {
+    _tonightSort.col = col;
+    // Default: descending for numbers, ascending for strings
+    _tonightSort.dir = ["maxAlt", "windowMin"].includes(col) ? -1 : 1;
+  }
+  renderTonightTable();
+}
+
+function renderTonightTable() {
+  const table      = document.getElementById("tonight-table");
+  const tbody      = document.getElementById("tonight-tbody");
+  const empty      = document.getElementById("tonight-empty");
+  const filtersDiv = document.getElementById("tonight-filters");
+
+  // Collect active type filters
+  const checkboxes  = filtersDiv ? filtersDiv.querySelectorAll("input[type=checkbox]") : [];
+  const activeTypes = new Set();
+  checkboxes.forEach(cb => { if (cb.checked) activeTypes.add(cb.value); });
+
+  let rows = _tonightEvents.filter(e =>
+    activeTypes.size === 0 || activeTypes.has(e.type)
+  );
+
+  // Sort
+  const { col, dir } = _tonightSort;
+  rows.sort((a, b) => {
+    let av = a[col], bv = b[col];
+    // Treat dash / null / -1 (unknown mag) as worst
+    const isNull = v => v == null || v === "—" || v === -1;
+    if (isNull(av) && isNull(bv)) return 0;
+    if (isNull(av)) return 1;
+    if (isNull(bv)) return -1;
+    if (typeof av === "number" && typeof bv === "number") return (av - bv) * dir;
+    return String(av).localeCompare(String(bv)) * dir;
+  });
+
+  // Update sort indicators
+  document.querySelectorAll("#tonight-table th[data-col]").forEach(th => {
+    const ind = th.querySelector(".sort-ind");
+    if (!ind) return;
+    ind.textContent = th.dataset.col === col ? (dir === 1 ? " ▲" : " ▼") : " ⇅";
+    th.classList.toggle("sorted", th.dataset.col === col);
+  });
+
+  tbody.innerHTML = "";
+  if (!rows.length) {
+    empty.textContent  = "No transients match the selected filters.";
+    empty.style.display = "block";
+    table.style.display = "none";
+    return;
+  }
+  empty.style.display = "none";
+
+  rows.forEach(e => {
+    const winTxt = e.windowStart !== "—" ? `${e.windowStart}–${e.windowEnd} UTC` : "—";
+    const durTxt = e.windowMin > 0 ? `${e.windowMin} min` : "—";
+    const altTxt = e.maxAlt != null ? `${e.maxAlt}°` : "—";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><a href="${e.tnsUrl}" target="_blank" style="color:#60a5fa;">${e.name}</a></td>
+      <td style="white-space:nowrap;">
+        <button class="btn-small tonight-add-btn"
+                data-name="${e.name.replace(/"/g,'&quot;').replace(/'/g,'&#39;')}"
+                data-ra="${e.ra}" data-dec="${e.dec}">+ Add</button>
+        <a href="${e.colUrl}" target="_blank" class="btn-small" style="text-decoration:none;display:inline-block;" title="${e.acId || e.colUrl}">🔗 AC</a>
+      </td>
+      <td><span class="tonight-type-badge tonight-type-${e.type}">${e.type}</span></td>
+      <td style="white-space:nowrap;">${formatAge(e.ageHours)}</td>
+      <td style="white-space:nowrap;">${formatErr(e.errDeg)}</td>
+      <td>${altTxt}</td>
+      <td>${winTxt}</td>
+      <td>${durTxt}</td>
+      <td>${e.transitUtc !== "—" ? e.transitUtc + " UTC" : "—"}</td>
+      <td>${e.lastMag !== "-1.0" && e.lastMag !== "-1" ? e.lastMag : "—"}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  table.style.display = "table";
+}
+
+async function planTonight() {
+  const uid    = (document.getElementById("colibri-uid")?.value || "").trim();
+  const days   = parseInt(document.getElementById("tonight-days")?.value)   || 7;
+  const minAlt = parseInt(document.getElementById("tonight-minalt")?.value) || 20;
+
+  if (!uid) {
+    alert("Please enter your Astro-COLIBRI User ID first.\nFind it at astro-colibri.com/account");
+    return;
+  }
+
+  const btn  = document.getElementById("plan-tonight-btn");
+  const orig = btn.textContent;
+  btn.disabled    = true;
+  btn.textContent = "⏳ Loading…";
+
+  const panel      = document.getElementById("tonight-panel");
+  const header     = document.getElementById("tonight-header");
+  const empty      = document.getElementById("tonight-empty");
+  const table      = document.getElementById("tonight-table");
+  const filtersDiv = document.getElementById("tonight-filters");
+
+  panel.style.display  = "block";
+  table.style.display  = "none";
+  empty.style.display  = "none";
+  header.textContent   = "Querying Astro-COLIBRI…";
+
+  try {
+    let lat = "", lon = "";
+    if (typeof observerLocation !== "undefined" && observerLocation?.lat) {
+      lat = observerLocation.lat;
+      lon = observerLocation.lon;
+    } else {
+      try {
+        const eq = await postJson("/api/nina/devices/status", currentConfig());
+        const m  = eq?.equipmentInfo?.Mount;
+        if (m?.SiteLatitude && m?.SiteLongitude &&
+            !(m.SiteLatitude === 0 && m.SiteLongitude === 0)) {
+          lat = m.SiteLatitude;
+          lon = m.SiteLongitude;
+        }
+      } catch { /* no mount — proceed without location */ }
+    }
+
+    const params = new URLSearchParams({ uid, days, minAlt });
+    if (lat) { params.set("lat", lat); params.set("lon", lon); }
+
+    const data = await fetch(`/api/tonight?${params}`).then(r => r.json());
+
+    if (!data.success) {
+      header.textContent = `Error: ${data.error}${data.detail ? " — " + data.detail : ""}`;
+      return;
+    }
+
+    const hasPos = lat !== "";
+    const n      = data.events.length;
+    header.textContent = `${n} transient${n !== 1 ? "s" : ""} in the last ${data.days} days` +
+      (hasPos ? ` · visible tonight (alt ≥ ${minAlt}°)` : " · no observer location for altitude filter") +
+      ` — ${new Date().toLocaleTimeString()}`;
+
+    _tonightEvents = data.events || [];
+
+    if (!_tonightEvents.length) {
+      empty.textContent  = hasPos
+        ? `No transients above ${minAlt}° altitude tonight. Try increasing "Days back" or lowering "Min altitude".`
+        : "No transients found for this time range.";
+      empty.style.display = "block";
+      return;
+    }
+
+    // Build type filter checkboxes from unique types in this result set
+    if (filtersDiv) {
+      const typeCounts = {};
+      _tonightEvents.forEach(e => { typeCounts[e.type] = (typeCounts[e.type] || 0) + 1; });
+      const types = Object.keys(typeCounts).sort();
+      filtersDiv.innerHTML =
+        `<span class="tonight-filter-label">Filter:</span>` +
+        types.map(t =>
+          `<label class="tonight-filter-chip">` +
+          `<input type="checkbox" value="${t}" checked onchange="renderTonightTable()">` +
+          `<span class="tonight-type-badge tonight-type-${t}">${t}</span>` +
+          `<span class="tonight-filter-count">${typeCounts[t]}</span>` +
+          `</label>`
+        ).join("") +
+        `<button class="btn-small" style="margin-left:8px;" onclick="tonightSelectAllTypes(true)">All</button>` +
+        `<button class="btn-small" onclick="tonightSelectAllTypes(false)">None</button>`;
+      filtersDiv.style.display = "flex";
+    }
+
+    renderTonightTable();
+  } catch (err) {
+    header.textContent = `Error: ${err.message}`;
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = orig;
+  }
+}
+
+function tonightSelectAllTypes(checked) {
+  const filtersDiv = document.getElementById("tonight-filters");
+  if (!filtersDiv) return;
+  filtersDiv.querySelectorAll("input[type=checkbox]").forEach(cb => { cb.checked = checked; });
+  renderTonightTable();
+}
+
+function addTonightTarget(name, raDeg, decDeg, btn) {
+  const raH  = raDeg / 15;
+  const raHH = Math.floor(raH);
+  const raM  = Math.floor((raH - raHH) * 60);
+  const raS  = (((raH - raHH) * 60 - raM) * 60).toFixed(1);
+  const raStr = `${String(raHH).padStart(2,"0")}:${String(raM).padStart(2,"0")}:${String(raS).padStart(4,"0")}`;
+  const sign  = decDeg < 0 ? "-" : "+";
+  const absD  = Math.abs(decDeg);
+  const dD    = Math.floor(absD);
+  const dM    = Math.floor((absD - dD) * 60);
+  const dS    = (((absD - dD) * 60 - dM) * 60).toFixed(0);
+  const decStr= `${sign}${String(dD).padStart(2,"0")}:${String(dM).padStart(2,"0")}:${String(dS).padStart(2,"0")}`;
+
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+
+  fetch("/api/sequence/queue", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ name, ra: raStr, dec: decStr, raDeg, decDeg }),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        if (btn) { btn.textContent = "✓ Added"; }
+        if (typeof refreshSeqState === "function") refreshSeqState();
+      } else {
+        if (btn) { btn.disabled = false; btn.textContent = "+ Add"; }
+        alert("Failed to add: " + (d.error || "unknown error"));
+      }
+    })
+    .catch(err => {
+      if (btn) { btn.disabled = false; btn.textContent = "+ Add"; }
+      alert("Error: " + err.message);
+    });
+}
+
+document.getElementById("plan-tonight-btn")?.addEventListener("click", planTonight);
+
+document.getElementById("tonight-tbody")?.addEventListener("click", function(ev) {
+  const btn = ev.target.closest(".tonight-add-btn");
+  if (!btn) return;
+  addTonightTarget(btn.dataset.name, parseFloat(btn.dataset.ra), parseFloat(btn.dataset.dec), btn);
+});
 
 // ── Sequence / ToDo tab ──────────────────────────────────────────────────────
 
 function seqConfig() {
   const filterRaw = document.getElementById("seq-filters").value;
   return {
-    duration:       Number(document.getElementById("seq-duration").value)       || 120,
+    duration:       Number(document.getElementById("seq-duration").value)       || 30,
     gain:           Number(document.getElementById("seq-gain").value)           || 10,
-    count:          Number(document.getElementById("seq-count").value)          || 10,
+    count:          Number(document.getElementById("seq-count").value)          || 40,
     filters:        filterRaw.split(",").map(s => s.trim()).filter(Boolean),
     solveEnabled:              document.getElementById("seq-solve-enable").checked,
     solveExp:                  Number(document.getElementById("seq-solve-exp").value)                  || 5,
     solveThreshold:            Number(document.getElementById("seq-solve-threshold").value)            || 60,
-    frameCheckEnabled:         document.getElementById("seq-frame-check-enable").checked,
-    frameCheckThresholdArcmin: Number(document.getElementById("seq-frame-check-threshold").value)     || 5,
+    frameCheckEnabled:         document.getElementById("set-frame-check-enable")?.checked    ?? false,
+    frameCheckThresholdArcmin: Number(document.getElementById("set-frame-check-threshold")?.value) || 5,
     manualMode:                document.getElementById("seq-manual-mode").checked,
+    minAlt:                    Number(document.getElementById("set-minalt")?.value)          || 20,
+    meridianGap:               Number(document.getElementById("set-meridian-gap")?.value)   || 10,
+    zenithLimit:               Number(document.getElementById("set-zenith-limit")?.value)   || 70,
+    minStars:                  Number(document.getElementById("set-min-stars")?.value)      ?? 10,
   };
 }
+
+// ── Arbiter / Safety limits — load from DB, save to DB ───────────────────────
+async function loadArbiterConfig() {
+  try {
+    const keys = ["minAlt","zenithLimit","meridianGap","minStars","frameCheckEnabled","frameCheckThreshold"];
+    const results = await Promise.all(keys.map(k =>
+      fetch(`/api/settings/${k}`).then(r => r.ok ? r.json() : null).catch(() => null)
+    ));
+    const [minAlt, zenithLimit, meridianGap, minStars, frameCheckEnabled, frameCheckThreshold] = results;
+    if (minAlt          != null) document.getElementById("set-minalt").value                   = minAlt.value          ?? 20;
+    if (zenithLimit     != null) document.getElementById("set-zenith-limit").value             = zenithLimit.value     ?? 70;
+    if (meridianGap     != null) document.getElementById("set-meridian-gap").value             = meridianGap.value     ?? 10;
+    if (minStars        != null) document.getElementById("set-min-stars").value                = minStars.value        ?? 10;
+    if (frameCheckEnabled != null) document.getElementById("set-frame-check-enable").checked  = frameCheckEnabled.value === "true";
+    if (frameCheckThreshold != null) document.getElementById("set-frame-check-threshold").value = frameCheckThreshold.value ?? 5;
+  } catch { /* non-fatal */ }
+}
+
+document.getElementById("arbiter-save")?.addEventListener("click", async () => {
+  const settings = {
+    minAlt:               document.getElementById("set-minalt").value,
+    zenithLimit:          document.getElementById("set-zenith-limit").value,
+    meridianGap:          document.getElementById("set-meridian-gap").value,
+    minStars:             document.getElementById("set-min-stars").value,
+    frameCheckEnabled:    String(document.getElementById("set-frame-check-enable").checked),
+    frameCheckThreshold:  document.getElementById("set-frame-check-threshold").value,
+  };
+  try {
+    await Promise.all(Object.entries(settings).map(([key, value]) =>
+      fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value }) })
+    ));
+    const btn = document.getElementById("arbiter-save");
+    const orig = btn.textContent;
+    btn.textContent = "Saved ✓"; btn.disabled = true;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+  } catch (e) {
+    alert("Failed to save arbiter settings: " + e.message);
+  }
+});
 
 function renderSeqQueue(queue) {
   // Don't tear down the list while the user is mid-drag — it would destroy the
@@ -728,17 +1458,67 @@ function renderSeqQueue(queue) {
           : `<button class="seq-queue-remove" data-idx="${i}" type="button">×</button>`}
       `;
     } else {
-      const raH     = (t.raDeg || 0) / 15;
-      const raHH    = Math.floor(raH);
-      const raM     = String(Math.floor((raH - raHH) * 60)).padStart(2, "0");
-      const decSign = (t.decDeg || 0) >= 0 ? "+" : "";
+      const raH      = (t.raDeg || 0) / 15;
+      const raHH     = Math.floor(raH);
+      const raM      = String(Math.floor((raH - raHH) * 60)).padStart(2, "0");
+      const decSign  = (t.decDeg || 0) >= 0 ? "+" : "";
+
+      const gCount    = Number(document.getElementById("seq-count").value)    || 40;
+      const gDuration = Number(document.getElementById("seq-duration").value) || 30;
+      const gFilters  = (document.getElementById("seq-filters").value || "G,BP,RP")
+                          .split(",").map(s => s.trim()).filter(Boolean);
+
+      // Filter checkboxes — null means "use all global filters" (show all checked)
+      // A subset array means explicit override (only those filters checked)
+      const hasFilterOverride = Array.isArray(t.filters) && t.filters.length > 0;
+      const activeFilters     = hasFilterOverride ? t.filters : gFilters;
+      const filterCheckboxes  = gFilters.map(f => {
+        const checked = activeFilters.includes(f) ? "checked" : "";
+        return `<label class="seq-filter-cb-label">
+          <input type="checkbox" class="seq-filter-cb" data-filter="${f}" data-idx="${i}" ${checked} />
+          <span>${f}</span>
+        </label>`;
+      }).join("");
+
+      // Badge summarising active overrides (filter badge only when a real subset is set)
+      const overrideParts = [];
+      if (hasFilterOverride) overrideParts.push(t.filters.join(","));
+      if (t.count    != null) overrideParts.push(`${t.count}fr`);
+      if (t.duration != null) overrideParts.push(`${t.duration}s`);
+      const badge = overrideParts.length
+        ? `<span class="seq-queue-override-badge" title="Per-target overrides">${overrideParts.join(" · ")}</span>`
+        : "";
+
       li.innerHTML = `
-        <span class="seq-queue-num">${i + 1}</span>
-        <span class="seq-queue-name">${t.name}</span>
-        <span class="seq-queue-coords">α&nbsp;${raHH}h${raM}m &nbsp;δ&nbsp;${decSign}${(t.decDeg || 0).toFixed(1)}°</span>
-        ${t.done
-          ? `<span class="seq-queue-done-badge">✓ Done</span>`
-          : `<button class="seq-queue-remove" data-idx="${i}" type="button">×</button>`}
+        <div class="seq-queue-row">
+          <span class="seq-queue-num">${i + 1}</span>
+          <span class="seq-queue-name">${t.name}</span>
+          <span class="seq-queue-coords">α&nbsp;${raHH}h${raM}m &nbsp;δ&nbsp;${decSign}${(t.decDeg || 0).toFixed(1)}°</span>
+          ${badge}
+          ${t.done
+            ? `<span class="seq-queue-done-badge">✓ Done</span>`
+            : `<button class="seq-queue-cfg-btn" data-idx="${i}" type="button" title="Per-target overrides">⚙</button>
+               <button class="seq-queue-remove"  data-idx="${i}" type="button">×</button>`}
+        </div>
+        ${!t.done ? `
+        <div class="seq-queue-override-panel" data-idx="${i}" style="display:none;">
+          <div class="seq-override-row">
+            <div class="seq-override-label">
+              <span>Filters <small style="color:#334155;font-style:italic;">(unchecked = use all)</small></span>
+              <div class="seq-filter-cb-group">${filterCheckboxes}</div>
+            </div>
+            <label class="seq-override-label">Frames / filter
+              <input class="seq-override-input" type="number" min="1" step="1"
+                     placeholder="${gCount}" value="${t.count ?? ""}"
+                     data-field="count" data-idx="${i}" />
+            </label>
+            <label class="seq-override-label">Duration (s)
+              <input class="seq-override-input" type="number" min="1" step="1"
+                     placeholder="${gDuration}" value="${t.duration ?? ""}"
+                     data-field="duration" data-idx="${i}" />
+            </label>
+          </div>
+        </div>` : ""}
       `;
     }
 
@@ -762,7 +1542,8 @@ function renderSeqQueue(queue) {
     });
     li.addEventListener("dragover", e => {
       e.preventDefault();
-      _seqDragInsertAfter = e.offsetY >= li.offsetHeight / 2;
+      const rowH = li.querySelector(".seq-queue-row")?.offsetHeight ?? li.offsetHeight;
+      _seqDragInsertAfter = e.offsetY >= rowH / 2;
       li.classList.toggle("drag-insert-before", !_seqDragInsertAfter);
       li.classList.toggle("drag-insert-after",   _seqDragInsertAfter);
     });
@@ -821,13 +1602,100 @@ function renderSeqQueue(queue) {
     inp.addEventListener("change", async () => {
       const idx = parseInt(inp.dataset.idx);
       const newTime = inp.value; // HH:MM
-      await fetch(`/api/sequence/queue/wait/${idx}`, {
+      await fetch(`/api/sequence/queue/${idx}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ waitTime: newTime }),
       });
       await refreshSeqState();
     });
+  }
+
+  // Restore panels that were open before re-render
+  for (const idx of _openOverridePanels) {
+    const panel = list.querySelector(`.seq-queue-override-panel[data-idx="${idx}"]`);
+    if (panel) panel.style.display = "block";
+  }
+
+  // ⚙ Toggle override panel
+  for (const btn of list.querySelectorAll(".seq-queue-cfg-btn")) {
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const idx   = btn.dataset.idx;
+      const panel = list.querySelector(`.seq-queue-override-panel[data-idx="${idx}"]`);
+      if (!panel) return;
+      const isOpen = panel.style.display !== "none";
+      panel.style.display = isOpen ? "none" : "block";
+      if (isOpen) _openOverridePanels.delete(idx);
+      else        _openOverridePanels.add(idx);
+    });
+  }
+
+  // Helper: update the override badge from current DOM state.
+  // "all global filters checked" = no filter override (badge hidden for filters).
+  function _updateOverrideBadge(li, idx) {
+    const gFiltersNow = (document.getElementById("seq-filters")?.value || "G,BP,RP")
+                          .split(",").map(s => s.trim()).filter(Boolean);
+    const checked  = Array.from(li.querySelectorAll(`.seq-filter-cb[data-idx="${idx}"]:checked`))
+                          .map(c => c.dataset.filter);
+    const allChecked = gFiltersNow.every(f => checked.includes(f)) && checked.length === gFiltersNow.length;
+    const countV    = li.querySelector(`[data-field="count"]`)?.value.trim()    || "";
+    const durationV = li.querySelector(`[data-field="duration"]`)?.value.trim() || "";
+    const parts = [];
+    if (!allChecked && checked.length) parts.push(checked.join(","));
+    if (countV)          parts.push(`${countV}fr`);
+    if (durationV)       parts.push(`${durationV}s`);
+    let badge = li.querySelector(".seq-queue-override-badge");
+    if (parts.length) {
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "seq-queue-override-badge";
+        li.querySelector(".seq-queue-cfg-btn")?.before(badge);
+      }
+      badge.textContent = parts.join(" · ");
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+
+  // Filter checkboxes — instant save on click.
+  // If all global filters are re-checked, save null to clear the override.
+  for (const cb of list.querySelectorAll(".seq-filter-cb")) {
+    cb.addEventListener("change", async () => {
+      const idx = parseInt(cb.dataset.idx);
+      const li  = cb.closest(".seq-queue-item");
+      const gFiltersNow = (document.getElementById("seq-filters")?.value || "G,BP,RP")
+                            .split(",").map(s => s.trim()).filter(Boolean);
+      const checked = Array.from(li.querySelectorAll(`.seq-filter-cb[data-idx="${idx}"]:checked`))
+                           .map(c => c.dataset.filter);
+      const allChecked = gFiltersNow.every(f => checked.includes(f)) && checked.length === gFiltersNow.length;
+      // Save null when all filters are checked (= use global default, no override needed)
+      const filtersPayload = allChecked ? null : (checked.length ? checked : null);
+      await fetch(`/api/sequence/queue/${idx}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filters: filtersPayload }),
+      });
+      _updateOverrideBadge(li, idx);
+    });
+  }
+
+  // Frames / duration inputs — save on blur or Enter
+  for (const inp of list.querySelectorAll(".seq-override-input")) {
+    const save = async () => {
+      const idx   = parseInt(inp.dataset.idx);
+      const field = inp.dataset.field;
+      const raw   = inp.value.trim();
+      const value = raw === "" ? null : Math.max(1, Number(raw));
+      await fetch(`/api/sequence/queue/${idx}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [field]: value }),
+      });
+      _updateOverrideBadge(inp.closest(".seq-queue-item"), idx);
+    };
+    inp.addEventListener("blur",    save);
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } });
   }
 }
 
@@ -940,7 +1808,9 @@ async function refreshSeqState() {
   try {
     const res = await fetch("/api/sequence/state");
     const state = await res.json();
-    renderSeqQueue(state.queue);
+    // Don't re-render the queue while the user is typing in an override panel
+    const editingOverride = document.activeElement?.closest(".seq-queue-override-panel");
+    if (!editingOverride) renderSeqQueue(state.queue);
     renderSeqStatus(state);
     renderSeqLog(state.log);
 
@@ -1859,14 +2729,21 @@ function renderPipelineJobs(jobs) {
                    style="margin-left:4px;color:#34d399;border-color:#065f46;" type="button"
                    title="Fetch photometry from STDWeb">📊</button>` : "";
 
-      // FITS download button (only when result is done)
-      const fitsBtn = r.status === "done"
-        ? `<a href="/api/pipeline/result/${r.id}/download"
+      // FITS download + preview — shown whenever the stack file exists on disk (even if STDWeb failed)
+      const stackDownload = r.stack_url
+        ? `<a href="${r.stack_url}"
               download
               class="btn-small"
               style="margin-left:4px;color:#a78bfa;border:1px solid #5b21b6;border-radius:4px;
                      padding:2px 6px;font-size:12px;text-decoration:none;display:inline-block;"
-              title="Download stacked FITS (${r.obs_date} · ${r.target} · ${r.filter} · ${r.exposure}s)">⭐</a>` : "";
+              title="Download stacked FITS (${r.obs_date} · ${r.target} · ${r.filter} · ${r.exposure}s)">⭐ FITS</a>` : "";
+      const previewThumb = r.preview_url
+        ? `<a href="${r.preview_url}" target="_blank" style="margin-left:6px;display:inline-block;vertical-align:middle;"
+              title="Preview stacked image">
+             <img src="${r.preview_url}" style="height:28px;width:28px;object-fit:cover;border-radius:3px;
+                        border:1px solid #374151;vertical-align:middle;" />
+           </a>` : "";
+      const fitsBtn = stackDownload + previewThumb;
 
       const rtr = document.createElement("tr");
       rtr.dataset.resultId = r.id;
@@ -2270,6 +3147,8 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
 
 setActiveTab("devices");
 loadDefaults().then(refreshStatus);
+loadWatchdogConfig();
+loadArbiterConfig();
 loadHistory();
 
 // ── Manual mode live toggle ───────────────────────────────────────────────────

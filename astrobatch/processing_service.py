@@ -449,10 +449,14 @@ def _run_siril_script(siril_exe: str, script_path: Path, folder: Path,
 
 def generate_frame_previews(folder: Path, jlog: JobLogger,
                             source_files: list[Path] | None = None,
-                            max_frames: int = 6) -> list[dict]:
+                            max_frames: int = 0) -> list[dict]:
     """
-    Generate PNG thumbnails for the first `max_frames` calibrated frames (pp_i_*.fit).
+    Generate PNG thumbnails for ALL calibrated frames (pp_i_*.fit).
+    Falls back to raw-converted frames (i_*.fit) when calibrated frames are
+    missing (e.g. deleted by an aborted retry).
     Saved in _previews/ subfolder so Siril's `convert i` never picks them up.
+
+    max_frames=0 means no limit (show all frames).
 
     Returns a list of dicts: [{"preview": "<rel_data_url>", "source": "<abs_path>"}]
     `source` is the original NAS FITS path so the user can re-trigger with a subset.
@@ -463,16 +467,25 @@ def generate_frame_previews(folder: Path, jlog: JobLogger,
     previews_dir = folder / "_previews"
     previews_dir.mkdir(exist_ok=True)
 
-    # pp_i_N maps positionally to source_files[N-1] (sorted order preserved by Siril)
-    pp_files = sorted(folder.glob("pp_i_*.fit"))[:max_frames]
+    # Prefer calibrated (pp_i_*.fit); fall back to raw-converted (i_*.fit)
+    pp_files = sorted(folder.glob("pp_i_*.fit"))
+    using_raw = False
     if not pp_files:
-        jlog.info("  No calibrated frames found for preview generation")
+        pp_files = sorted(folder.glob("i_0*.fit"))
+        using_raw = True
+    if not pp_files:
+        jlog.info("  No frames found for preview generation")
         return []
+    if max_frames and max_frames > 0:
+        pp_files = pp_files[:max_frames]
+    if using_raw:
+        jlog.info(f"  No calibrated frames found — using {len(pp_files)} raw converted frame(s) for preview")
 
     # Siril numbers frames from the sorted list of original files it converted
     # source_files is that same sorted list; index them in order.
+    n = len(pp_files)
     src_list: list[Path | None] = (
-        sorted(source_files)[:max_frames] if source_files else [None] * len(pp_files)
+        sorted(source_files)[:n] if source_files else [None] * n
     )
 
     jlog.info(f"  Generating {len(pp_files)} frame preview(s)...")
@@ -586,36 +599,72 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
 
         if not ok:
             if no_stars:
-                # Auto-drop the bad reference frame and retry until success or
-                # too few frames remain.
-                register_lines = [
-                    "requires 1.2.0", f'cd "{folder}"',
-                    "register pp_i -interp=cu",
-                    "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
-                    "load r_pp_i_stacked",
-                    "save res",
-                ]
+                # Registration failed because the default reference frame (index 1)
+                # has too few detectable stars (trailed, cloudy, or bad seeing).
+                # Strategy: cycle through all frames as reference using Siril's
+                # -ref=N flag.  We never delete calibrated frames so all data is
+                # preserved for the eventual stack.
+                pp_frames = sorted(folder.glob("pp_i_*.fit"))
+                n_pp = len(pp_frames)
+                jlog.info(
+                    f"  Reference frame has no detectable stars"
+                    f" — trying all {n_pp} frames as reference (no frames deleted)"
+                )
                 retry_script = folder / "_siril_retry.ssf"
-                while no_stars:
-                    pp_frames = sorted(folder.glob("pp_i_*.fit"))
-                    if len(pp_frames) < 3:
-                        jlog.error(f"  Only {len(pp_frames)} frames left — giving up")
-                        break
-                    bad = pp_frames[0]
-                    jlog.info(f"  Dropping frame with no stars: {bad.name}")
-                    bad.unlink(missing_ok=True)
-                    # Remove stale sequence files so Siril rescans
+                # Initial run already tried ref=1 (default); start from ref=2.
+                for ref_n in range(2, n_pp + 1):
+                    # Clear stale sequence files so Siril rescans the folder
                     for seq in folder.glob("*.seq"):
                         seq.unlink(missing_ok=True)
-                    retry_script.write_text("\n".join(register_lines) + "\n")
+                    retry_lines = [
+                        "requires 1.2.0", f'cd "{folder}"',
+                        f"register pp_i -interp=cu -ref={ref_n}",
+                        "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
+                        "load r_pp_i_stacked",
+                        "save res",
+                    ]
+                    retry_script.write_text("\n".join(retry_lines) + "\n")
                     ok, no_stars = _run_siril_script(
-                        siril_exe, retry_script, folder, "register+stack (retry)", jlog
+                        siril_exe, retry_script, folder, f"register+stack (ref={ref_n})", jlog
                     )
+                    if ok or not no_stars:
+                        break   # success, or different failure reason
                 retry_script.unlink(missing_ok=True)
+
                 if not ok:
-                    jlog.error("  Registration still failed — generating frame previews for diagnosis")
-                    previews = generate_frame_previews(folder, jlog, source_files=source_files)
-                    return False, previews
+                    # Every frame tried as reference — all have undetectable stars.
+                    # This indicates a hardware event (tracking issue, clouds, etc.)
+                    # that trailed all frames in this filter.
+                    # Last resort: use a single calibrated frame without registration.
+                    pp_remaining = sorted(folder.glob("pp_i_*.fit"))
+                    if pp_remaining:
+                        jlog.info(
+                            f"  ⚠️  All {n_pp} frames have undetectable stars"
+                            f" (trailing stars / clouds?) — falling back to single"
+                            f" unregistered frame: {pp_remaining[0].name}"
+                        )
+                        fallback_script = folder / "_siril_fallback.ssf"
+                        fallback_lines = [
+                            "requires 1.2.0", f'cd "{folder}"',
+                            f"load {pp_remaining[0].stem}",
+                            "save res",
+                        ]
+                        fallback_script.write_text("\n".join(fallback_lines) + "\n")
+                        for seq in folder.glob("*.seq"):
+                            seq.unlink(missing_ok=True)
+                        ok, _ = _run_siril_script(
+                            siril_exe, fallback_script, folder, "single-frame fallback", jlog
+                        )
+                        fallback_script.unlink(missing_ok=True)
+                        if ok:
+                            jlog.info(
+                                "  ⚠️  Result is a single unregistered frame"
+                                " — check mount tracking, frames appear trailed"
+                            )
+                    if not ok:
+                        jlog.error("  Registration still failed — generating frame previews for diagnosis")
+                        previews = generate_frame_previews(folder, jlog, source_files=source_files)
+                        return False, previews
             else:
                 return False, []
 
@@ -1428,8 +1477,8 @@ def resume():
     if from_step not in PIPELINE_STEP_ORDER:
         return jsonify({"success": False, "error": f"Invalid step. Valid: {PIPELINE_STEP_ORDER}"}), 400
 
-    _job_queue.put(lambda rid=int(result_id), fs=from_step:
-                   resume_pipeline(rid, fs))
+    rid = int(result_id)
+    _job_queue.put((rid, lambda rid=rid, fs=from_step: resume_pipeline(rid, fs)))
 
     queue_pos = _job_queue.qsize()
     return jsonify({"success": True, "result_id": result_id, "from_step": from_step,

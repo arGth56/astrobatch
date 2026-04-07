@@ -1873,7 +1873,15 @@ class PlateSolver:
                             os.rmdir(output_dir)
                         except:
                             pass
-                        
+
+                        # solve-field leaves tmp.ppm.* files in /tmp
+                        try:
+                            import glob
+                            for f in glob.glob("/tmp/tmp.ppm.*"):
+                                os.remove(f)
+                        except:
+                            pass
+
                         return solved_wcs, source_data
                 else:
                     print(f"⚠️  WCS file not found: {wcs_file}")
@@ -1892,7 +1900,15 @@ class PlateSolver:
                 shutil.rmtree(output_dir)
         except:
             pass
-            
+
+        # solve-field leaves tmp.ppm.* files in /tmp — clean them up
+        try:
+            import glob
+            for f in glob.glob("/tmp/tmp.ppm.*"):
+                os.remove(f)
+        except:
+            pass
+
         return None, None
     
     def _extract_source_positions(self, matches_file, corr_file):
