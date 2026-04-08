@@ -13,6 +13,7 @@ Endpoints:
   GET  /jobs/<job_id>/log
 """
 
+import json
 import logging
 import os
 import re
@@ -144,6 +145,73 @@ def _ensure_phot_columns():
                 pass  # already exists
 
 _ensure_phot_columns()
+
+
+def _ensure_selection_columns():
+    """Add manual-selection columns to pipeline_jobs if they don't exist yet."""
+    cols = [
+        ("manual_selection",    "INTEGER DEFAULT 0"),
+        ("selection_data",      "TEXT"),    # JSON: list of {file, preview, fwhm, roundness, stars}
+        ("selection_result",    "TEXT"),    # JSON: {confirmed: bool, files: [...]}
+    ]
+    with _db() as conn:
+        for col, typ in cols:
+            try:
+                conn.execute(f"ALTER TABLE pipeline_jobs ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+
+_ensure_selection_columns()
+
+
+def compute_frame_stats(fits_path: Path) -> dict:
+    """Return per-frame quality metrics (FWHM, roundness, star count) using sep."""
+    try:
+        import sep as _sep
+        import numpy as _np
+
+        with fits.open(str(fits_path)) as hdul:
+            data = hdul[0].data
+            if data is None and len(hdul) > 1:
+                data = hdul[1].data
+            data = data.astype(_np.float32)
+
+        # Rough background subtraction
+        bkg = _sep.Background(data)
+        data_sub = (data - bkg).astype(_np.float64)
+
+        # Extract sources
+        objects = _sep.extract(data_sub, thresh=3.0, err=bkg.globalrms,
+                               minarea=5, deblend_nthresh=32, deblend_cont=0.005)
+        if len(objects) == 0:
+            return {"stars": 0, "fwhm": None, "roundness": None}
+
+        a = objects["a"]
+        b = objects["b"]
+        # Roundness = minor/major axis ratio (1 = round, 0 = very elongated)
+        roundness = b / _np.where(a > 0, a, 1e-6)
+        # Approximate FWHM in pixels: 2.35 * RMS of semi-axes
+        fwhm_px = 2.35 * _np.sqrt((a**2 + b**2) / 2.0)
+
+        # Keep only star-like sources (roundness > 0.4, sensible size)
+        mask = (roundness > 0.4) & (a > 0.8) & (a < 25.0)
+        if mask.sum() < 3:
+            mask = (a > 0.5) & (a < 50.0)
+
+        if mask.sum() == 0:
+            return {"stars": int(len(objects)), "fwhm": None, "roundness": None}
+
+        # FITS pixel scale roughly 1 arcsec/px for many setups — report pixels
+        median_fwhm     = float(_np.median(fwhm_px[mask]))
+        median_roundness = float(_np.median(roundness[mask]))
+
+        return {
+            "stars":     int(mask.sum()),
+            "fwhm":      round(median_fwhm, 2),
+            "roundness": round(median_roundness, 3),
+        }
+    except Exception as exc:
+        return {"stars": 0, "fwhm": None, "roundness": None, "error": str(exc)}
 
 
 def create_result(job_id: int, filt: str, exposure: str, n_frames: int,
@@ -522,9 +590,12 @@ def generate_frame_previews(folder: Path, jlog: JobLogger,
 
 def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
               n_images: int, jlog: JobLogger,
-              source_files: list[Path] | None = None) -> tuple[bool, list[dict]]:
+              source_files: list[Path] | None = None,
+              skip_quality_filters: bool = False) -> tuple[bool, list[dict]]:
     """
     Calibrate + stack with Siril.
+    skip_quality_filters: when True (manual selection mode), omit -filter-fwhm / -filter-round
+      so Siril stacks exactly what the user picked without second-guessing.
     Returns (success, frame_previews).
     frame_previews is non-empty only when registration fails due to no stars —
     contains paths to individual calibrated frame previews for the user to diagnose.
@@ -586,11 +657,12 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
             cal_cmd += f" -flat={flat_arg}"
         if dark_arg:
             cal_cmd += f" -dark={dark_arg}"
+        stack_filters = "" if skip_quality_filters else " -filter-fwhm=80% -filter-round=80%"
         lines = [
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
             "register pp_i -interp=cu",
-            "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
+            f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
             "load r_pp_i_stacked",
             "save res",
         ]
@@ -619,7 +691,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                     retry_lines = [
                         "requires 1.2.0", f'cd "{folder}"',
                         f"register pp_i -interp=cu -ref={ref_n}",
-                        "stack r_pp_i rej 3 3 -norm=addscale -filter-fwhm=80% -filter-round=80%",
+                        f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
                         "load r_pp_i_stacked",
                         "save res",
                     ]
@@ -899,12 +971,14 @@ def _detect_date(fits_path: Path) -> str:
 
 def run_pipeline(job_id: int, fits_dir: str, target: str,
                  selected_files: list[str] | None = None,
-                 object_filter: str | None = None):
+                 object_filter: str | None = None,
+                 manual_selection: bool = False):
     """Full pipeline — runs in a background thread."""
     jlog = JobLogger(job_id)
     try:
         _run_pipeline(job_id, fits_dir, target, jlog,
-                      selected_files=selected_files, object_filter=object_filter)
+                      selected_files=selected_files, object_filter=object_filter,
+                      manual_selection=manual_selection)
     except Exception as exc:
         log.exception("Unhandled exception in job %s", job_id)
         jlog.error(f"UNHANDLED EXCEPTION: {exc}")
@@ -1090,16 +1164,139 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
     jlog.info(f"=== Resume of result {result_id} complete ===")
 
 
+def _manual_selection_pause(
+    job_id: int, filt: str, obj: str,
+    files: list[Path], jlog: JobLogger,
+    timeout_s: int = 7200
+) -> list[Path] | None:
+    """
+    Generate previews + quality stats for each input frame, store them in the
+    DB, set the job to 'selection_pending', and block until the user confirms a
+    selection (or times out).
+
+    Returns the (possibly filtered) list of Path objects to stack, or None on
+    timeout/cancellation.
+    """
+    import numpy as _np
+
+    jlog.info(f"  Manual selection: computing stats for {len(files)} frame(s)...")
+    previews_dir = Path(DATA_DIR) / f"_sel_{job_id}_{filt}"
+    previews_dir.mkdir(parents=True, exist_ok=True)
+
+    frames_data: list[dict] = []
+    for idx, src in enumerate(sorted(files), start=1):
+        # Generate a small PNG preview
+        preview_rel = ""
+        try:
+            with fits.open(str(src)) as hdul:
+                img_data = hdul[0].data
+                if img_data is None and len(hdul) > 1:
+                    img_data = hdul[1].data
+                img_data = img_data.astype(_np.float32)
+            from PIL import Image as _PIL
+            lo, hi = _np.percentile(img_data, (0.5, 99.5))
+            if hi > lo:
+                norm = _np.clip((img_data - lo) / (hi - lo), 0, 1)
+            else:
+                norm = _np.zeros_like(img_data)
+            pil_img = _PIL.fromarray((norm * 255).astype(_np.uint8))
+            w, h = pil_img.size
+            if max(w, h) > 800:
+                scale = 800 / max(w, h)
+                pil_img = pil_img.resize((int(w * scale), int(h * scale)), _PIL.LANCZOS)
+            out_png = previews_dir / f"frame_{idx:03d}.png"
+            pil_img.save(str(out_png), format="PNG", optimize=True)
+            try:
+                preview_rel = str(out_png.relative_to(DATA_DIR))
+            except ValueError:
+                preview_rel = str(out_png)
+        except Exception as exc:
+            jlog.info(f"  Preview {idx} failed: {exc}")
+
+        # Compute quality stats
+        stats = compute_frame_stats(src)
+        frames_data.append({
+            "idx":       idx,
+            "file":      str(src),
+            "name":      src.name,
+            "preview":   preview_rel,
+            "stars":     stats.get("stars"),
+            "fwhm":      stats.get("fwhm"),
+            "roundness": stats.get("roundness"),
+            "selected":  True,   # default: all selected
+        })
+        jlog.info(
+            f"  Frame {idx}/{len(files)}: {src.name}"
+            f"  stars={stats.get('stars')}  fwhm={stats.get('fwhm')}  "
+            f"roundness={stats.get('roundness')}"
+        )
+
+    # Store in DB and set selection_pending
+    try:
+        with _db() as conn:
+            conn.execute(
+                "UPDATE pipeline_jobs SET status=?, selection_data=?, "
+                "selection_result=NULL, updated_at=? WHERE id=?",
+                ("selection_pending",
+                 json.dumps({"filt": filt, "obj": obj, "frames": frames_data}),
+                 _now(), job_id)
+            )
+    except Exception as exc:
+        jlog.error(f"  DB update for selection_pending failed: {exc}")
+        return files   # fall back to using all files
+
+    jlog.info(f"  Paused — waiting for user to confirm frame selection (timeout {timeout_s//60} min)...")
+
+    # Poll until the user confirms a selection
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            with _db() as conn:
+                row = conn.execute(
+                    "SELECT selection_result FROM pipeline_jobs WHERE id=?",
+                    (job_id,)
+                ).fetchone()
+        except Exception:
+            continue
+        if row and row[0]:
+            try:
+                result = json.loads(row[0])
+                if result.get("confirmed"):
+                    chosen = result.get("files", [])
+                    if not chosen:
+                        jlog.info("  Selection confirmed: 0 frames — skipping this filter group")
+                        return []   # empty = caller should skip this group
+                    chosen_paths = [Path(f) for f in chosen if Path(f).exists()]
+                    jlog.info(f"  Selection confirmed: {len(chosen_paths)}/{len(files)} frame(s) kept")
+                    return chosen_paths if chosen_paths else []
+            except Exception as exc:
+                jlog.error(f"  selection_result parse error: {exc}")
+
+    jlog.error(f"  Manual selection timed out after {timeout_s//60} min — proceeding with all frames")
+    return files   # on timeout, use all frames
+
+
 def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
                   selected_files: list[str] | None = None,
-                  object_filter: str | None = None):
+                  object_filter: str | None = None,
+                  manual_selection: bool = False):
     update_job(job_id, "running")
+    # Persist the manual_selection flag so recovery can re-queue correctly
+    if manual_selection:
+        try:
+            with _db() as conn:
+                conn.execute("UPDATE pipeline_jobs SET manual_selection=1 WHERE id=?", (job_id,))
+        except Exception:
+            pass
     jlog.info(f"=== Job {job_id} started ===")
     jlog.info(f"Input dir : {fits_dir}")
     if object_filter:
         jlog.info(f"Object    : {object_filter} (filtering to this target only)")
     if selected_files:
         jlog.info(f"Selected  : {len(selected_files)} specific file(s)")
+    if manual_selection:
+        jlog.info("Manual selection mode — will pause before stacking for frame review")
 
     # Purge any stale result rows from a previous run of this job so we start
     # with a clean slate — avoids ghost errors in the UI from old failures.
@@ -1156,10 +1353,25 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         # Create a per-result row immediately
         result_id = create_result(job_id, filt, exp_str, len(files), target=obj, obs_date=date_str)
 
+        # ── Manual frame selection (optional) ────────────────────────────────
+        if manual_selection:
+            files = _manual_selection_pause(
+                job_id, filt, obj, files, jlog
+            )
+            if files is None:
+                # Timeout or cancelled
+                update_result(result_id, "error", error="Manual selection timed out or cancelled")
+                continue
+            if len(files) == 0:
+                # User explicitly skipped this filter group
+                update_result(result_id, "error", error="Skipped by user (no frames selected)")
+                jlog.info(f"  Skipping {obj}/{filt} — no frames selected")
+                continue
+
         # ── Step 2: Copy to work dir ──────────────────────────────────────────
         update_job(job_id, "splitting")
         work_dir = prepare_work_dir(obj, filt, exp_str, date_str, files, jlog,
-                                    clean_first=selected_files is not None)
+                                    clean_first=selected_files is not None or manual_selection)
 
         # ── Step 3: Calibrate + Stack ─────────────────────────────────────────
         update_job(job_id, "calibrating")
@@ -1194,7 +1406,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
             jlog.info(f"  ⚠️  No dark for {exp_str}s — calibrating without")
 
         ok, frame_previews = run_siril(work_dir, flat_path, dark_path, len(files), jlog,
-                                       source_files=files)
+                                       source_files=files,
+                                       skip_quality_filters=manual_selection)
         if not ok:
             err_msg = "No stars found — see frame previews" if frame_previews else "Siril calibration failed"
             jlog.error(f"Calibration failed for {obj}/{filt}/{exp_str}s — skipping")
@@ -1364,6 +1577,7 @@ def _recover_queued_jobs():
         'queued', 'running',
         'scanning', 'splitting', 'calibrating', 'solving',
         'uploading', 'inspecting', 'photometry', 'subtraction',
+        'selection_pending',   # re-queue so user can redo frame selection after restart
     }
     try:
         with _db() as conn:
@@ -1387,22 +1601,30 @@ def _recover_queued_jobs():
                     )
                 continue
             log.info("  Re-queuing job %s (%s) [was: %s]", job_id, target, old_status)
-            # Delete non-done results to avoid duplicate rows on re-run
+            # Preserve manual_selection flag and clear stale selection state
             with _db() as conn:
+                jrow = conn.execute(
+                    "SELECT manual_selection FROM pipeline_jobs WHERE id=?", (job_id,)
+                ).fetchone()
+                # If a job was in selection_pending it must have been manual
+                manual_sel = bool(jrow[0]) if jrow else False
+                if old_status == 'selection_pending':
+                    manual_sel = True
                 conn.execute(
                     "DELETE FROM pipeline_results WHERE job_id=? AND status != 'done'",
                     (job_id,)
                 )
                 conn.execute(
-                    "UPDATE pipeline_jobs SET status='queued', error=NULL WHERE id=?",
+                    "UPDATE pipeline_jobs SET status='queued', error=NULL, "
+                    "selection_data=NULL, selection_result=NULL WHERE id=?",
                     (job_id,)
                 )
             is_snapshot = fits_dir and Path(fits_dir).name.upper() == "SNAPSHOT"
             obj_filter  = (target_filter or target) if is_snapshot else None
             _enqueue_job(int(job_id),
                          lambda jid=int(job_id), fd=fits_dir, t=target or "Unknown",
-                                of=obj_filter:
-                         run_pipeline(jid, fd, t, object_filter=of))
+                                of=obj_filter, ms=manual_sel:
+                         run_pipeline(jid, fd, t, object_filter=of, manual_selection=ms))
     except Exception as exc:
         log.error("Job recovery failed: %s", exc)
 
@@ -1450,11 +1672,13 @@ def trigger():
     if not Path(fits_dir).exists():
         return jsonify({"success": False, "error": f"Directory not found: {fits_dir}"}), 400
 
+    manual_sel = bool(data.get("manual_selection"))
+
     enqueued = _enqueue_job(
         int(job_id),
         lambda jid=int(job_id), fd=fits_dir, t=target,
-               sf=selected_files, of=object_filter:
-        run_pipeline(jid, fd, t, selected_files=sf, object_filter=of)
+               sf=selected_files, of=object_filter, ms=manual_sel:
+        run_pipeline(jid, fd, t, selected_files=sf, object_filter=of, manual_selection=ms)
     )
     if not enqueued:
         return jsonify({"success": True, "job_id": job_id,
@@ -1491,6 +1715,53 @@ def job_log(job_id: int):
     if not log_path.exists():
         return jsonify({"success": False, "error": "Log not found"}), 404
     return jsonify({"success": True, "log": log_path.read_text()})
+
+
+@app.route("/jobs/<int:job_id>/selection", methods=["GET"])
+def get_selection(job_id: int):
+    """Return the frame list + stats for a job in selection_pending state."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT status, selection_data FROM pipeline_jobs WHERE id=?",
+                (job_id,)
+            ).fetchone()
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+    if not row:
+        return jsonify({"success": False, "error": f"Job {job_id} not found"}), 404
+    status, sel_data = row["status"], row["selection_data"]
+    if not sel_data:
+        return jsonify({"success": False, "error": "No selection data (not in manual selection mode)"}), 404
+    try:
+        data = json.loads(sel_data)
+    except Exception:
+        return jsonify({"success": False, "error": "Malformed selection_data"}), 500
+    return jsonify({"success": True, "job_id": job_id, "status": status, **data})
+
+
+@app.route("/jobs/<int:job_id>/selection", methods=["POST"])
+def confirm_selection(job_id: int):
+    """Confirm the user's frame selection and unblock the waiting pipeline thread."""
+    body = request.json or {}
+    files = body.get("files")   # list of absolute file paths to keep
+    if not isinstance(files, list):
+        return jsonify({"success": False, "error": "'files' must be a list"}), 400
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT status FROM pipeline_jobs WHERE id=?",
+                (job_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"success": False, "error": "Job not found"}), 404
+            conn.execute(
+                "UPDATE pipeline_jobs SET selection_result=?, updated_at=? WHERE id=?",
+                (json.dumps({"confirmed": True, "files": files}), _now(), job_id)
+            )
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+    return jsonify({"success": True, "job_id": job_id, "files_kept": len(files)})
 
 
 # ── Background STDWeb poller ───────────────────────────────────────────────────
