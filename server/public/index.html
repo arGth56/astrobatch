@@ -544,6 +544,10 @@
               Target name
               <input id="pipeline-target" type="text" placeholder="AT 2026abc"  autocomplete="off" />
             </label>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;">
+              <input type="checkbox" id="pipeline-manual-select" />
+              Select frames manually
+            </label>
             <button type="submit" id="pipeline-trigger-btn">&#9654; Trigger</button>
           </form>
           <p style="font-size:12px;color:#6b7280;margin:-8px 0 12px;">
@@ -570,6 +574,36 @@
               </div>
               <pre id="pipeline-log-content" style="font-size:12px;color:#d1fae5;
                    white-space:pre-wrap;max-height:60vh;overflow-y:auto;"></pre>
+            </div>
+          </div>
+
+          <!-- ── Frame selection modal ── -->
+          <div id="frame-selection-modal" style="display:none; position:fixed; inset:0;
+               background:rgba(0,0,0,.82); z-index:1100; overflow:auto; padding:20px;">
+            <div style="max-width:1100px; margin:0 auto; background:#111827; border-radius:10px; padding:24px;">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                <h3 style="margin:0;color:#f9fafb;flex:1;">🔍 Select frames to stack</h3>
+                <span id="fsm-count" style="font-size:13px;color:#9ca3af;"></span>
+                <button id="fsm-select-all"  type="button" class="btn-small">All</button>
+                <button id="fsm-deselect-all" type="button" class="btn-small">None</button>
+                <button id="fsm-confirm" type="button" class="btn-small"
+                        style="background:#16a34a;color:#fff;font-weight:600;">✓ Stack selected</button>
+                <button id="fsm-close" type="button"
+                        style="background:none;border:none;color:#9ca3af;font-size:22px;cursor:pointer;line-height:1;padding:0 4px;">✕</button>
+              </div>
+              <p style="font-size:12px;color:#6b7280;margin:0 0 14px;">
+                Hover over a thumbnail to zoom in. Check frames you want to keep, then click <strong>Stack selected</strong>.
+              </p>
+              <!-- Sort controls -->
+              <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;font-size:12px;color:#9ca3af;">
+                Sort by:
+                <button class="btn-small fsm-sort-btn" data-col="idx"       style="font-size:11px;">Frame #</button>
+                <button class="btn-small fsm-sort-btn" data-col="fwhm"      style="font-size:11px;">FWHM</button>
+                <button class="btn-small fsm-sort-btn" data-col="roundness" style="font-size:11px;">Roundness</button>
+                <button class="btn-small fsm-sort-btn" data-col="stars"     style="font-size:11px;">Stars</button>
+              </div>
+              <div id="fsm-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr));
+                                        gap:12px; max-height:72vh; overflow-y:auto;"></div>
             </div>
           </div>
 

@@ -2112,14 +2112,15 @@ const JOB_STATUS_CLASS = {
 };
 
 const JOB_STATUS_STEPS = {
-  queued:      "Queued…",
-  scanning:    "Scanning FITS files…",
-  splitting:   "Copying to work dir…",
-  calibrating: "Calibrating + stacking (Siril)…",
-  solving:     "Plate solving…",
-  uploading:   "Uploading to STDWeb…",
-  done:        "Complete",
-  error:       "Error",
+  queued:             "Queued…",
+  scanning:           "Scanning FITS files…",
+  splitting:          "Copying to work dir…",
+  calibrating:        "Calibrating + stacking (Siril)…",
+  solving:            "Plate solving…",
+  uploading:          "Uploading to STDWeb…",
+  selection_pending:  "⏸ Waiting for frame selection…",
+  done:               "Complete",
+  error:              "Error",
 };
 
 // ── NAS date / target picker ──────────────────────────────────────────────────
@@ -2621,6 +2622,7 @@ function renderPipelineJobs(jobs) {
   const running = activeJobs[0];
   if (running || queuedJobs.length) {
     statBar.style.display = "block";
+    const isPending = running?.status === "selection_pending";
     const step = JOB_STATUS_STEPS[running?.status] || running?.status || "Queued…";
     const queueSuffix = queuedJobs.length
       ? ` — ${queuedJobs.length} job${queuedJobs.length > 1 ? "s" : ""} waiting`
@@ -2628,6 +2630,7 @@ function renderPipelineJobs(jobs) {
     statTxt.textContent = running
       ? `Job #${running.id} — ${step}${queueSuffix}`
       : `${queuedJobs.length} job${queuedJobs.length > 1 ? "s" : ""} queued…`;
+    statBar.style.background = isPending ? "#1e3a2f" : "#1e3a5f";
     document.getElementById("pipeline-log-btn").dataset.jobId = running?.id || "";
     document.getElementById("pipeline-log-btn").style.display = running ? "" : "none";
   } else {
@@ -2695,6 +2698,9 @@ function renderPipelineJobs(jobs) {
         <button class="btn-small btn-job-log" data-id="${j.id}" type="button">Log</button>
         ${j.status === "error" ? `<button class="btn-small btn-rerun-job" data-id="${j.id}" type="button"
                 style="margin-left:4px;" title="Re-run with same parameters">↺ Re-run</button>` : ""}
+        ${j.status === "selection_pending" ? `<button class="btn-small btn-select-frames" data-id="${j.id}" type="button"
+                style="margin-left:4px;background:#1d4ed8;color:#fff;font-weight:600;"
+                title="Review frames and choose which ones to stack">🖼 Review & select</button>` : ""}
         <button class="btn-small btn-del-job" data-id="${j.id}" type="button"
                 style="color:#fca5a5;border-color:#7f1d1d;margin-left:4px;">✕</button>
       </td>
@@ -2890,6 +2896,9 @@ function renderPipelineJobs(jobs) {
   }
   for (const btn of tbody.querySelectorAll(".btn-job-log")) {
     btn.addEventListener("click", () => openLogModal(btn.dataset.id));
+  }
+  for (const btn of tbody.querySelectorAll(".btn-select-frames")) {
+    btn.addEventListener("click", () => openFrameSelectionModal(Number(btn.dataset.id)));
   }
   for (const btn of tbody.querySelectorAll(".btn-frames-toggle")) {
     btn.addEventListener("click", () => {
@@ -3118,8 +3127,9 @@ document.getElementById("pipeline-log-btn").addEventListener("click", (e) => {
 
 document.getElementById("pipeline-trigger-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const fits_dir = document.getElementById("pipeline-fits-dir").value.trim();
-  const target   = document.getElementById("pipeline-target").value.trim();
+  const fits_dir       = document.getElementById("pipeline-fits-dir").value.trim();
+  const target         = document.getElementById("pipeline-target").value.trim();
+  const manualSelectCb = document.getElementById("pipeline-manual-select");
   if (!fits_dir) return;
   const btn = document.getElementById("pipeline-trigger-btn");
   btn.disabled = true;
@@ -3132,6 +3142,7 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
       fits_dir,
       target: target || null,
       target_filter: isSnapshot ? (selOpt.dataset.name || target || null) : null,
+      manual_selection: manualSelectCb?.checked ? true : undefined,
     });
     setLog(result);
     document.getElementById("pipeline-target").value = "";
@@ -3144,6 +3155,172 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
     btn.textContent = "▶ Trigger";
   }
 });
+
+// ── Frame selection modal ─────────────────────────────────────────────────────
+(function initFrameSelectionModal() {
+  const modal    = document.getElementById("frame-selection-modal");
+  const grid     = document.getElementById("fsm-grid");
+  const countEl  = document.getElementById("fsm-count");
+  const btnAll   = document.getElementById("fsm-select-all");
+  const btnNone  = document.getElementById("fsm-deselect-all");
+  const btnConfirm = document.getElementById("fsm-confirm");
+  const btnClose = document.getElementById("fsm-close");
+
+  let _jobId  = null;
+  let _frames = [];       // [{idx, file, name, preview, stars, fwhm, roundness, selected}]
+  let _sortCol = "idx";
+  let _sortDir = 1;       // 1 = asc, -1 = desc
+
+  function updateCount() {
+    const total   = _frames.length;
+    const checked = _frames.filter(f => f._checked).length;
+    countEl.textContent = `${checked} / ${total} selected`;
+    btnConfirm.disabled = false;
+    btnConfirm.textContent = checked === 0
+      ? "⏭ Skip this filter"
+      : "✓ Stack selected";
+    btnConfirm.style.background = checked === 0 ? "#7f1d1d" : "#16a34a";
+  }
+
+  function qualityColor(val, goodThreshold, badThreshold, highIsGood) {
+    if (val == null) return "";
+    const isGood = highIsGood ? (val >= goodThreshold) : (val <= goodThreshold);
+    const isBad  = highIsGood ? (val <= badThreshold)  : (val >= badThreshold);
+    return isBad ? "fsm-bad" : isGood ? "fsm-good" : "";
+  }
+
+  function renderGrid() {
+    const sorted = [..._frames].sort((a, b) => {
+      let va = a[_sortCol], vb = b[_sortCol];
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return _sortDir * (va < vb ? -1 : va > vb ? 1 : 0);
+    });
+    grid.innerHTML = "";
+    for (const f of sorted) {
+      const fwhmCls  = qualityColor(f.fwhm, 3, 7, false);   // low FWHM = good
+      const roundCls = qualityColor(f.roundness, 0.8, 0.6, true); // high roundness = good
+      const card = document.createElement("div");
+      card.className = "fsm-card" + (f._checked ? " selected" : " deselected");
+      card.dataset.file = f.file;
+      const previewUrl = f.preview ? `/data/${f.preview}` : "";
+      card.innerHTML = `
+        <label class="fsm-card-check">
+          <input type="checkbox" class="fsm-cb" ${f._checked ? "checked" : ""} />
+          <span title="${f.file}">#${f.idx} ${f.name.replace(/^.*[\\/]/, "")}</span>
+        </label>
+        <div class="fsm-thumb-wrap">
+          ${previewUrl
+            ? `<img class="fsm-thumb frame-zoom-img" src="${previewUrl}" alt="frame ${f.idx}" loading="lazy" />`
+            : `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;font-size:11px;">No preview</div>`
+          }
+        </div>
+        <div class="fsm-stats">
+          <div>Stars: <strong>${f.stars ?? "–"}</strong></div>
+          <div>FWHM: <strong class="${fwhmCls}">${f.fwhm != null ? f.fwhm + " px" : "–"}</strong></div>
+          <div>Roundness: <strong class="${roundCls}">${f.roundness != null ? f.roundness.toFixed(3) : "–"}</strong></div>
+        </div>
+      `;
+      // Toggle selection
+      card.querySelector(".fsm-cb").addEventListener("change", (ev) => {
+        f._checked = ev.target.checked;
+        card.className = "fsm-card" + (f._checked ? " selected" : " deselected");
+        updateCount();
+      });
+      grid.appendChild(card);
+    }
+    updateCount();
+  }
+
+  // Attach zoom to newly added images
+  function attachZoom() {
+    for (const img of grid.querySelectorAll(".frame-zoom-img")) {
+      if (img._zoomAttached) continue;
+      img._zoomAttached = true;
+      img.addEventListener("mousemove", (e) => {
+        const rect = img.getBoundingClientRect();
+        const cx = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+        const cy = Math.max(0, Math.min(e.clientY - rect.top,  rect.height));
+        const scale = Math.max(2, (img.naturalWidth || 600) / rect.width);
+        img.style.transformOrigin = `${cx}px ${cy}px`;
+        img.style.transform = `scale(${scale})`;
+        img.style.zIndex = "10";
+      });
+      img.addEventListener("mouseleave", () => {
+        img.style.transform = "";
+        img.style.zIndex = "";
+      });
+    }
+  }
+
+  btnAll.addEventListener("click", () => {
+    _frames.forEach(f => { f._checked = true; });
+    renderGrid(); attachZoom();
+  });
+  btnNone.addEventListener("click", () => {
+    _frames.forEach(f => { f._checked = false; });
+    renderGrid(); attachZoom();
+  });
+
+  // Sort buttons
+  document.querySelectorAll(".fsm-sort-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const col = btn.dataset.col;
+      if (_sortCol === col) _sortDir *= -1;
+      else { _sortCol = col; _sortDir = 1; }
+      document.querySelectorAll(".fsm-sort-btn").forEach(b => b.style.fontWeight = "");
+      btn.style.fontWeight = "700";
+      renderGrid(); attachZoom();
+    });
+  });
+
+  btnClose.addEventListener("click", () => { modal.style.display = "none"; });
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+
+  btnConfirm.addEventListener("click", async () => {
+    const selectedFiles = _frames.filter(f => f._checked).map(f => f.file);
+    if (!selectedFiles.length) return;
+    btnConfirm.disabled = true;
+    btnConfirm.textContent = "Sending…";
+    try {
+      const r = await postJson(`/api/pipeline/jobs/${_jobId}/selection`, { files: selectedFiles });
+      if (r.success) {
+        modal.style.display = "none";
+        loadPipelineJobs();
+      } else {
+        btnConfirm.textContent = `✗ ${r.error}`;
+        btnConfirm.disabled = false;
+      }
+    } catch (err) {
+      btnConfirm.textContent = `✗ ${err.message}`;
+      btnConfirm.disabled = false;
+    }
+  });
+
+  window.openFrameSelectionModal = async function(jobId) {
+    _jobId = jobId;
+    grid.innerHTML = '<p style="color:#9ca3af;padding:20px;">Loading frame data…</p>';
+    modal.style.display = "block";
+    countEl.textContent = "";
+    btnConfirm.disabled = false;
+    btnConfirm.textContent = "✓ Stack selected";
+    btnConfirm.style.background = "#16a34a";
+    try {
+      const data = await (await fetch(`/api/pipeline/jobs/${jobId}/selection`)).json();
+      if (!data.success) {
+        grid.innerHTML = `<p style="color:#f87171;padding:20px;">Error: ${data.error}</p>`;
+        return;
+      }
+      _frames = (data.frames || []).map(f => ({ ...f, _checked: f.selected !== false }));
+      _sortCol = "idx"; _sortDir = 1;
+      renderGrid();
+      attachZoom();
+    } catch (err) {
+      grid.innerHTML = `<p style="color:#f87171;padding:20px;">Error: ${err.message}</p>`;
+    }
+  };
+})();
 
 setActiveTab("devices");
 loadDefaults().then(refreshStatus);
