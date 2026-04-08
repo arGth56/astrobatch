@@ -10,11 +10,12 @@ const Database = require("better-sqlite3");
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
 
-function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null) {
+function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false) {
   return new Promise((resolve, reject) => {
     const payload = { job_id, fits_dir, target };
     if (selected_files && selected_files.length) payload.selected_files = selected_files;
     if (target_filter) payload.target_filter = target_filter;
+    if (manual_selection) payload.manual_selection = true;
     // When the fits_dir is a SNAPSHOT folder, pass the target name as object_filter
     // so only frames matching that OBJECT header are processed (not all mixed targets).
     if (fits_dir && path.basename(fits_dir).toUpperCase() === "SNAPSHOT" && target) {
@@ -4198,7 +4199,7 @@ app.get("/api/pipeline/result/:id/download", (req, res) => {
 });
 
 app.post("/api/pipeline/trigger", async (req, res) => {
-  const { fits_dir, target, filter, exposure, selected_files, target_filter } = req.body;
+  const { fits_dir, target, filter, exposure, selected_files, target_filter, manual_selection } = req.body;
   if (!fits_dir) return res.status(400).json({ success: false, error: "fits_dir is required" });
 
   const result = db.prepare(
@@ -4207,7 +4208,7 @@ app.post("/api/pipeline/trigger", async (req, res) => {
 
   const job_id = result.lastInsertRowid;
 
-  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null)
+  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null, !!manual_selection)
     .then((svc) => {
       if (!svc.success) {
         db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")
@@ -4455,6 +4456,38 @@ app.get("/api/pipeline/job/:id/log", async (req, res) => {
 app.delete("/api/pipeline/jobs/:id", (req, res) => {
   db.prepare("DELETE FROM pipeline_jobs WHERE id = ?").run(req.params.id);
   res.json({ success: true });
+});
+
+// ── Manual frame selection endpoints ─────────────────────────────────────────
+// GET  /api/pipeline/jobs/:id/selection  → frame list + stats
+// POST /api/pipeline/jobs/:id/selection  → confirm selection
+
+app.get("/api/pipeline/jobs/:id/selection", async (req, res) => {
+  try {
+    const r = await fetch(`${PROCESSING_SERVICE_URL}/jobs/${req.params.id}/selection`);
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { success: false, error: `Service error ${r.status}` }; }
+    res.status(r.ok ? 200 : r.status).json(data);
+  } catch (err) {
+    res.status(502).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/pipeline/jobs/:id/selection", async (req, res) => {
+  try {
+    const r = await fetch(`${PROCESSING_SERVICE_URL}/jobs/${req.params.id}/selection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { success: false, error: `Service error ${r.status}` }; }
+    res.status(r.ok ? 200 : r.status).json(data);
+  } catch (err) {
+    res.status(502).json({ success: false, error: err.message });
+  }
 });
 
 // ── Integration test: filter-patch end-to-end ─────────────────────────────────
