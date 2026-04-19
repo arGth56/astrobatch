@@ -40,6 +40,7 @@
           <button id="tab-dome" class="tab-button" type="button">Dome</button>
           <button id="tab-target" class="tab-button" type="button">Target</button>
           <button id="tab-todo" class="tab-button" type="button">Night Plan</button>
+          <button id="tab-alerts" class="tab-button" type="button">Alerts</button>
           <button id="tab-pipeline" class="tab-button" type="button">Pipeline</button>
           <button id="tab-history" class="tab-button" type="button">History</button>
           <button id="tab-settings" class="tab-button" type="button">⚙ Settings</button>
@@ -720,6 +721,132 @@
         </div>
 
 
+
+        <!-- ── Alerts tab ──────────────────────────────────────────────── -->
+        <div id="panel-alerts" class="tab-panel">
+          <h2>Alerts <span id="alerts-badge" class="alerts-badge" style="display:none;"></span></h2>
+
+          <!-- Alert-Ready toggle -->
+          <div class="alert-ready-bar">
+            <label class="alert-ready-toggle">
+              <input id="alert-ready-cb" type="checkbox" />
+              <span class="alert-ready-label">Alert-Ready (ToO Interrupt)</span>
+            </label>
+            <span id="alert-ready-status" class="alert-ready-status">OFF</span>
+            <span class="alert-ready-hint">When enabled: incoming alerts that pass filters will <strong>interrupt</strong> the current imaging, slew to the target, image it, then resume.</span>
+          </div>
+
+          <!-- Ready Obs for Alert -->
+          <div class="alert-prep-bar">
+            <button id="alert-prep-btn" type="button" class="alert-prep-btn">Ready Obs for Alert</button>
+            <button id="alert-prep-abort-btn" type="button" class="alert-prep-abort-btn" style="display:none;">Abort Prep</button>
+            <span id="alert-prep-status" class="alert-prep-status"></span>
+            <p class="alert-prep-hint">Checks roof, unparks, homes, opens cover, cools camera, runs AF on every filter, then waits at home with tracking off. After prep, Alert-Ready is armed automatically.</p>
+          </div>
+
+          <!-- Per-broker strategy table -->
+          <details id="strategy-details" style="margin-bottom:16px;">
+            <summary style="cursor:pointer;color:#93c5fd;font-size:14px;font-weight:600;padding:6px 0;">Per-Broker Alert Strategies</summary>
+            <div style="overflow-x:auto;margin-top:10px;">
+              <table id="strategy-table" style="font-size:12px;border-collapse:collapse;width:100%;min-width:1100px;">
+                <thead>
+                  <tr style="color:#6b7280;border-bottom:1px solid #1e3a5f;">
+                    <th style="text-align:left;padding:6px;">Broker</th>
+                    <th style="text-align:center;padding:6px;">On</th>
+                    <th style="text-align:center;padding:6px;">Mode</th>
+                    <th style="text-align:right;padding:6px;">Exp (s)</th>
+                    <th style="text-align:right;padding:6px;">Gain</th>
+                    <th style="text-align:left;padding:6px;">Filter Cycle</th>
+                    <th style="text-align:right;padding:6px;">Rapid</th>
+                    <th style="text-align:center;padding:6px;">AF</th>
+                    <th style="text-align:center;padding:6px;">Guide</th>
+                    <th style="text-align:center;padding:6px;">Center</th>
+                    <th style="text-align:right;padding:6px;">Min Alt</th>
+                    <th style="text-align:right;padding:6px;">Max Err</th>
+                    <th style="text-align:left;padding:6px;">Notes</th>
+                    <th style="padding:6px;"></th>
+                  </tr>
+                </thead>
+                <tbody id="strategy-tbody"></tbody>
+              </table>
+            </div>
+            <span id="strategy-save-status" style="font-size:11px;color:#6b7280;margin-top:4px;display:inline-block;"></span>
+          </details>
+
+          <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px;">
+            <select id="alerts-filter-broker" style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;border-radius:4px;padding:5px 8px;font-size:13px;">
+              <option value="">All brokers</option>
+              <option value="Swift">Swift</option>
+              <option value="Fermi">Fermi</option>
+              <option value="IceCube">IceCube / AMON</option>
+              <option value="LVK">LVK</option>
+              <option value="EP">Einstein Probe</option>
+              <option value="SVOM">SVOM</option>
+              <option value="INTEGRAL">INTEGRAL</option>
+              <option value="AGILE">AGILE</option>
+              <option value="GECAM">GECAM</option>
+              <option value="MAXI">MAXI</option>
+              <option value="IPN">IPN</option>
+              <option value="SN-nu">SN neutrino</option>
+            </select>
+            <select id="alerts-filter-action" style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;border-radius:4px;padding:5px 8px;font-size:13px;">
+              <option value="">All actions</option>
+              <option value="queued">Queued</option>
+              <option value="rejected">Rejected</option>
+              <option value="too-observed">ToO Observed</option>
+              <option value="manual">Manual</option>
+              <option value="ignored">Ignored</option>
+            </select>
+            <button id="alerts-refresh" type="button" class="btn-small">Refresh</button>
+            <label class="seq-toggle-label" style="font-size:12px;margin-left:auto;">
+              <input id="alerts-auto-refresh" type="checkbox" checked />
+              Auto-refresh (30 s)
+            </label>
+          </div>
+
+          <p id="alerts-empty" style="color:#6b7280;font-size:13px;font-style:italic;">No alerts received yet.</p>
+
+          <div style="overflow-x:auto;">
+            <table id="alerts-table" style="display:none;font-size:12px;border-collapse:collapse;width:100%;">
+              <thead>
+                <tr style="color:#6b7280;border-bottom:1px solid #1e3a5f;">
+                  <th style="text-align:left;padding:6px 6px;">Time</th>
+                  <th style="text-align:left;padding:6px 6px;">Broker</th>
+                  <th style="text-align:left;padding:6px 6px;">Trigger</th>
+                  <th style="text-align:right;padding:6px 6px;">RA</th>
+                  <th style="text-align:right;padding:6px 6px;">Dec</th>
+                  <th style="text-align:right;padding:6px 6px;">Err</th>
+                  <th style="text-align:right;padding:6px 6px;">Alt</th>
+                  <th style="text-align:right;padding:6px 6px;">Moon</th>
+                  <th style="text-align:center;padding:6px 6px;">Action</th>
+                  <th style="padding:6px 6px;"></th>
+                </tr>
+              </thead>
+              <tbody id="alerts-tbody"></tbody>
+            </table>
+          </div>
+
+          <!-- Alert detail modal -->
+          <div id="alert-detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;overflow:auto;padding:20px;">
+            <div style="max-width:700px;margin:0 auto;background:#111827;border-radius:8px;padding:24px;">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">
+                <h3 id="alert-detail-title" style="margin:0;color:#f9fafb;flex:1;">Alert detail</h3>
+                <button id="alert-detail-close" type="button" style="background:none;border:none;color:#9ca3af;font-size:22px;cursor:pointer;line-height:1;padding:0 4px;">✕</button>
+              </div>
+              <table style="font-size:13px;width:100%;border-collapse:collapse;margin-bottom:16px;">
+                <tbody id="alert-detail-tbody"></tbody>
+              </table>
+              <div style="margin-bottom:12px;">
+                <strong style="font-size:12px;color:#6b7280;">Raw payload</strong>
+                <pre id="alert-detail-raw" style="font-size:11px;color:#94a3b8;white-space:pre-wrap;max-height:280px;overflow-y:auto;margin-top:6px;padding:10px;background:#0a0f1a;border-radius:6px;border:1px solid #1e293b;"></pre>
+              </div>
+              <div style="display:flex;gap:10px;justify-content:flex-end;">
+                <button id="alert-detail-queue" type="button" style="background:#065f46;border:1px solid #10b981;color:#a7f3d0;border-radius:5px;padding:7px 18px;font-size:13px;cursor:pointer;">+ Queue Target</button>
+                <button id="alert-detail-ignore" type="button" style="background:#1e293b;border:1px solid #475569;color:#9ca3af;border-radius:5px;padding:7px 18px;font-size:13px;cursor:pointer;">Ignore</button>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <!-- ── Settings tab ─────────────────────────────────────────────── -->
         <div id="panel-settings" class="tab-panel">

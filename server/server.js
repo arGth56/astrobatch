@@ -6,7 +6,9 @@ const http  = require("http");
 const fs    = require("fs");
 const { execSync } = require("child_process");
 const Database = require("better-sqlite3");
+const alerts = require("./alerts");
 
+const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
 
@@ -210,6 +212,17 @@ db.exec(`
 // Migration: add ir_sky column if DB was created before this version
 try { db.exec(`ALTER TABLE ocs_history ADD COLUMN ir_sky REAL`); } catch (_) {}
 
+// ── Autofocus log table ──────────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS autofocus_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    filter    TEXT    NOT NULL,
+    position  INTEGER NOT NULL,
+    ts        TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_af_filter_ts ON autofocus_log(filter, ts DESC);
+`);
+
 // ── Key-value settings table (persistent user preferences) ───────────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS settings (
@@ -224,6 +237,62 @@ const getSetting = (key, fallback = null) => {
 const setSetting = (key, value) => {
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)").run(key, String(value));
 };
+
+// ── Per-broker alert strategy table ──────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS alert_strategies (
+    broker       TEXT PRIMARY KEY,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    mode         TEXT    NOT NULL DEFAULT 'too',
+    exposure     REAL    NOT NULL DEFAULT 30,
+    gain         INTEGER NOT NULL DEFAULT 10,
+    filter_cycle TEXT    NOT NULL DEFAULT 'G,RP,BP',
+    rapid_count  INTEGER NOT NULL DEFAULT 15,
+    do_af        INTEGER NOT NULL DEFAULT 0,
+    do_guiding   INTEGER NOT NULL DEFAULT 0,
+    do_center    INTEGER NOT NULL DEFAULT 0,
+    min_alt      REAL    NOT NULL DEFAULT 25,
+    max_err_deg  REAL    NOT NULL DEFAULT 1.0,
+    notes        TEXT    DEFAULT ''
+  );
+`);
+
+const ALERT_STRATEGY_SEEDS = [
+  { broker: "Swift",    mode: "too",    exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 1.0,  notes: "Fast BAT localization — rapid color cycling" },
+  { broker: "Fermi",    mode: "ignore", exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 0.1,  notes: "Error box too large; only LAT-refined useful" },
+  { broker: "EP",       mode: "too",    exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "WXT ~4-8 arcmin — fits FOV" },
+  { broker: "IceCube",  mode: "queue",  exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Queue for manual review" },
+  { broker: "LVK",      mode: "ignore", exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Cannot tile GW skymaps" },
+  { broker: "INTEGRAL", mode: "ignore", exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 1.0,  notes: "Science ops ended Feb 2025 — re-entry 2029" },
+  { broker: "AGILE",    mode: "ignore", exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 1.0,  notes: "Decommissioned Feb 2024 — re-entered atmosphere" },
+  { broker: "GECAM",    mode: "too",    exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 1.0,  notes: "Good localization — rapid response" },
+  { broker: "MAXI",     mode: "queue",  exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Queue for review" },
+  { broker: "IPN",      mode: "queue",  exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Queue for review" },
+  { broker: "SN-nu",    mode: "queue",  exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Queue for review" },
+  { broker: "SVOM",     mode: "too",    exposure: 30,  filter_cycle: "G,RP,BP", rapid_count: 15, max_err_deg: 1.0,  notes: "ECLAIRs/MXT GRB — rapid response like Swift" },
+  { broker: "GCN",      mode: "queue",  exposure: 120, filter_cycle: "G,BP,RP", rapid_count: 10, max_err_deg: 1.0,  notes: "Fallback — queue for review" },
+];
+
+const _stratSeedStmt = db.prepare(`
+  INSERT OR IGNORE INTO alert_strategies
+    (broker, mode, exposure, filter_cycle, rapid_count, max_err_deg, notes)
+  VALUES (@broker, @mode, @exposure, @filter_cycle, @rapid_count, @max_err_deg, @notes)
+`);
+for (const s of ALERT_STRATEGY_SEEDS) _stratSeedStmt.run(s);
+
+const STRATEGY_DEFAULTS = {
+  enabled: 1, mode: "too", exposure: 30, gain: 10, filter_cycle: "G,RP,BP",
+  rapid_count: 15, do_af: 0, do_guiding: 0, do_center: 0, min_alt: 25, max_err_deg: 1.0, notes: "",
+};
+
+function getStrategy(broker) {
+  const row = db.prepare("SELECT * FROM alert_strategies WHERE broker = ?").get(broker);
+  return row || { broker, ...STRATEGY_DEFAULTS };
+}
+
+function getAllStrategies() {
+  return db.prepare("SELECT * FROM alert_strategies ORDER BY broker").all();
+}
 
 // ── OCS history poller ────────────────────────────────────────────────────────
 
@@ -421,7 +490,7 @@ app.get("/api/config/defaults", (req, res) => {
       botName: TNS_BOT_NAME,
       hasApiKey: Boolean(TNS_API_KEY),
     },
-    colibriUid: getSetting("colibri_uid", ""),
+    colibriUid: getSetting("colibri_uid", "") || process.env.COLIBRI_UID || "",
   });
 });
 
@@ -447,6 +516,143 @@ app.post("/api/settings", (req, res) => {
   const { key, value } = req.body || {};
   if (!key) return res.status(400).json({ success: false, error: "key required" });
   setSetting(key, value ?? "");
+  res.json({ success: true });
+});
+
+// ── Alerts API routes (registered early for Express 5 compatibility) ─────────
+
+app.get("/api/alerts/config", (req, res) => {
+  res.json({
+    success: true,
+    alertReady: seqState.alertReady,
+    tooRunning: seqState.tooRunning,
+    tooFovDeg: TOO_FOV_DEG,
+    alertPrepRunning: seqState.alertPrepRunning,
+    alertPrepStep: seqState.alertPrepStep,
+  });
+});
+
+app.post("/api/alerts/config", (req, res) => {
+  if (req.body?.alertReady !== undefined) {
+    seqState.alertReady = Boolean(req.body.alertReady);
+    setSetting("alertReady", seqState.alertReady ? "true" : "false");
+    seqLog(`Alert-Ready mode ${seqState.alertReady ? "ENABLED" : "DISABLED"}`, seqState.alertReady ? "warn" : "info");
+  }
+  res.json({ success: true, alertReady: seqState.alertReady });
+});
+
+app.post("/api/alerts/prep", async (req, res) => {
+  if (seqState.alertPrepRunning) {
+    return res.status(409).json({ success: false, error: "alert prep already running" });
+  }
+  if (seqState.running) {
+    return res.status(409).json({ success: false, error: "a sequence is already running — abort it first" });
+  }
+  const ninaConfig = normalizeTargetConfig(req.body);
+  const seqConfig = {
+    filters: req.body?.filters || ["L", "G", "BP", "RP"],
+    gain:    parseInt(req.body?.gain) || 30,
+  };
+  res.json({ success: true, message: "alert prep started" });
+  runAlertPrep(ninaConfig, seqConfig).catch(e => {
+    console.error("[alert-prep] uncaught:", e);
+  });
+});
+
+app.post("/api/alerts/prep/abort", (req, res) => {
+  if (!seqState.alertPrepRunning) {
+    return res.json({ success: true, message: "not running" });
+  }
+  seqState.aborted = true;
+  res.json({ success: true, message: "abort requested" });
+});
+
+// ── Alert strategy routes ────────────────────────────────────────────────────
+
+app.get("/api/alert-strategies", (req, res) => {
+  res.json({ success: true, strategies: getAllStrategies() });
+});
+
+app.put("/api/alert-strategies/:broker", (req, res) => {
+  const broker = req.params.broker;
+  const existing = getStrategy(broker);
+  if (!existing) return res.status(404).json({ success: false, error: "unknown broker" });
+
+  const fields = {};
+  const allowed = {
+    enabled:      v => { const n = parseInt(v); return (n === 0 || n === 1) ? n : undefined; },
+    mode:         v => ["too", "queue", "ignore"].includes(v) ? v : undefined,
+    exposure:     v => { const n = parseFloat(v); return (n > 0 && n <= 600) ? n : undefined; },
+    gain:         v => { const n = parseInt(v);   return (n >= 0 && n <= 100) ? n : undefined; },
+    filter_cycle: v => (typeof v === "string" && v.trim()) ? v.trim() : undefined,
+    rapid_count:  v => { const n = parseInt(v);   return (n >= 1 && n <= 200) ? n : undefined; },
+    do_af:        v => { const n = parseInt(v); return (n === 0 || n === 1) ? n : undefined; },
+    do_guiding:   v => { const n = parseInt(v); return (n === 0 || n === 1) ? n : undefined; },
+    do_center:    v => { const n = parseInt(v); return (n === 0 || n === 1) ? n : undefined; },
+    min_alt:      v => { const n = parseFloat(v); return (n >= 0 && n <= 90) ? n : undefined; },
+    max_err_deg:  v => { const n = parseFloat(v); return (n > 0 && n <= 180) ? n : undefined; },
+    notes:        v => (typeof v === "string") ? v.slice(0, 500) : undefined,
+  };
+
+  for (const [key, validate] of Object.entries(allowed)) {
+    if (req.body?.[key] !== undefined) {
+      const clean = validate(req.body[key]);
+      if (clean !== undefined) fields[key] = clean;
+    }
+  }
+
+  if (Object.keys(fields).length === 0) {
+    return res.status(400).json({ success: false, error: "no valid fields to update" });
+  }
+
+  const sets = Object.keys(fields).map(k => `${k} = @${k}`).join(", ");
+  db.prepare(`UPDATE alert_strategies SET ${sets} WHERE broker = @broker`).run({ ...fields, broker });
+  res.json({ success: true, strategy: getStrategy(broker) });
+});
+
+app.post("/api/alert-strategies/:broker/reset", (req, res) => {
+  const broker = req.params.broker;
+  const seed = ALERT_STRATEGY_SEEDS.find(s => s.broker === broker);
+  if (!seed) return res.status(404).json({ success: false, error: "unknown broker" });
+  db.prepare("DELETE FROM alert_strategies WHERE broker = ?").run(broker);
+  _stratSeedStmt.run(seed);
+  res.json({ success: true, strategy: getStrategy(broker) });
+});
+
+// ── Alerts list/detail routes ────────────────────────────────────────────────
+
+app.get("/api/alerts", (req, res) => {
+  const limit  = Math.min(500, Math.max(1, parseInt(req.query.limit)  || 100));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const rows   = alerts.listAlerts(db, { limit, offset });
+  res.json({ success: true, alerts: rows });
+});
+
+app.get("/api/alerts/:id", (req, res) => {
+  const row = alerts.getAlert(db, parseInt(req.params.id));
+  if (!row) return res.status(404).json({ success: false, error: "not found" });
+  res.json({ success: true, alert: row });
+});
+
+app.post("/api/alerts/:id/queue", (req, res) => {
+  const row = alerts.getAlert(db, parseInt(req.params.id));
+  if (!row) return res.status(404).json({ success: false, error: "not found" });
+  if (!Number.isFinite(row.ra) || !Number.isFinite(row.dec)) {
+    return res.status(400).json({ success: false, error: "alert has no coordinates" });
+  }
+  seqState.queue.push({
+    name:   `${row.broker}-${row.trigger_id || row.id}`,
+    raDeg:  row.ra, decDeg: row.dec, ra: "", dec: "",
+    done: false, addedAt: Date.now(),
+  });
+  saveQueue();
+  db.prepare("UPDATE alerts SET action = 'manual', action_reason = 'queued-by-operator' WHERE id = ?").run(row.id);
+  res.json({ success: true });
+});
+
+app.post("/api/alerts/:id/ignore", (req, res) => {
+  db.prepare("UPDATE alerts SET action = 'ignored', action_reason = ? WHERE id = ?")
+    .run(String(req.body?.reason || "operator"), parseInt(req.params.id));
   res.json({ success: true });
 });
 
@@ -613,7 +819,7 @@ async function runWatchdogCheck() {
                 try {
                   const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
                   if (ok) {
-                    const roofRaw = ocsClean(fields?.stat_roof ?? "").toLowerCase();
+                    const roofRaw = ocsClean(fields?.roof_sta ?? "").toLowerCase();
                     if (roofRaw && !roofRaw.includes("open")) roofOpen = false;
                   }
                 } catch { /* OCS unreachable — assume open */ }
@@ -1086,12 +1292,12 @@ async function flatDeviceAction(req, res, action) {
       try {
         const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
         if (ok) {
-          const roofRaw = ocsClean(fields?.stat_roof ?? "").toLowerCase();
+          const roofRaw = ocsClean(fields?.roof_sta ?? "").toLowerCase();
           if (roofRaw && !roofRaw.includes("open")) {
             return res.status(403).json({
               success: false,
-              error: `Roof is not open (OCS: "${ocsClean(fields.stat_roof)}") — cover open blocked for safety`,
-              roofStatus: ocsClean(fields.stat_roof),
+              error: `Roof is not open (OCS: "${ocsClean(fields.roof_sta)}") — cover open blocked for safety`,
+              roofStatus: ocsClean(fields.roof_sta),
             });
           }
         }
@@ -1228,26 +1434,41 @@ const seqState = {
   manualMode: false,
   waitingForStep: null, // non-null when paused waiting for /api/sequence/next
   ninaConfig: null,    // set when sequence starts, used by abort to reach NINA
+  // ── ToO (Target-of-Opportunity) interrupt state ──────────────────────────
+  alertReady: getSetting("alertReady", "false") === "true",
+  tooInterrupt: null,     // set to { alert } when a ToO fires; checked by checkAbort
+  tooRunning: false,      // true while the ToO sub-sequence is executing
+  tooResumeState: null,   // saved state of the interrupted target for resume
 };
 
 loadQueue();
 
-// ── Per-filter autofocus cache ────────────────────────────────────────────────
-// Stores the best known focuser position per filter, with timestamp.
-// Entries expire after FILTER_AF_CACHE_MS; within that window the focuser
-// is simply moved to the cached position instead of running a full AF run.
+// ── Per-filter autofocus cache (DB-backed) ────────────────────────────────────
 const FILTER_AF_CACHE_MS = 2 * 60 * 60 * 1000; // 2 hours
-let filterAfCache = {};  // { filterName: { pos: number, ts: number } }
 
-(function loadFilterAfCache() {
-  try {
-    const v = getSetting("filterAfCache");
-    if (v) filterAfCache = JSON.parse(v);
-  } catch { filterAfCache = {}; }
-})();
+const _afInsertStmt = db.prepare(
+  `INSERT INTO autofocus_log (filter, position, ts) VALUES (?, ?, datetime('now'))`
+);
+const _afLatestStmt = db.prepare(
+  `SELECT position, ts FROM autofocus_log WHERE filter = ? ORDER BY ts DESC LIMIT 1`
+);
 
-function saveFilterAfCache() {
-  try { setSetting("filterAfCache", JSON.stringify(filterAfCache)); } catch {}
+function saveAfResult(filterName, pos) {
+  if (!Number.isFinite(pos)) return;
+  _afInsertStmt.run(filterName, pos);
+}
+
+function getLatestAfResult(filterName) {
+  const row = _afLatestStmt.get(filterName);
+  if (!row) return null;
+  return { pos: row.position, ts: new Date(row.ts + "Z").getTime() };
+}
+
+function getAfResultIfFresh(filterName, maxAgeMs = FILTER_AF_CACHE_MS) {
+  const entry = getLatestAfResult(filterName);
+  if (!entry) return null;
+  if ((Date.now() - entry.ts) > maxAgeMs) return null;
+  return entry;
 }
 
 async function stepMoveFocuserAbsolute(target, pos) {
@@ -1321,6 +1542,12 @@ function seqLog(msg, level = "info") {
 
 function checkAbort() {
   if (seqState.aborted) throw new Error("__ABORTED__");
+  if (seqState.tooInterrupt && !seqState.tooRunning) {
+    const err = new Error("__ALERT_INTERRUPT__");
+    err.code = "__ALERT_INTERRUPT__";
+    err.alert = seqState.tooInterrupt;
+    throw err;
+  }
 }
 
 /**
@@ -2026,9 +2253,9 @@ async function stepParkMount(target) {
 /**
  * Run autofocus for a specific filter.
  * - Changes the filterwheel to filterName first (so NINA AF uses the right filter).
- * - If a cached position exists that is < FILTER_AF_CACHE_MS old, just moves the
- *   focuser to that position instead of running a full AF sequence.
- * - On a full run, saves the result to filterAfCache for future reuse.
+ * - If a fresh DB entry exists (< FILTER_AF_CACHE_MS old), just moves the focuser
+ *   to that position instead of running a full AF sequence.
+ * - On a full run, saves the result to autofocus_log DB table for future reuse.
  * availableFilters: the filterwheel filter list from NINA equipment info.
  */
 async function stepAutofocusForFilter(target, filterName, availableFilters) {
@@ -2039,12 +2266,11 @@ async function stepAutofocusForFilter(target, filterName, availableFilters) {
     checkAbort();
   }
 
-  // ── 2. Check per-filter cache ─────────────────────────────────────────────
-  const cached = filterAfCache[filterName];
-  const now    = Date.now();
-  if (cached && Number.isFinite(cached.pos) && (now - cached.ts) < FILTER_AF_CACHE_MS) {
-    const ageMin = Math.round((now - cached.ts) / 60000);
-    seqLog(`AF [${filterName}]: cached pos ${cached.pos} (${ageMin} min ago) — moving focuser ✓`);
+  // ── 2. Check DB cache ──────────────────────────────────────────────────────
+  const cached = getAfResultIfFresh(filterName);
+  if (cached) {
+    const ageMin = Math.round((Date.now() - cached.ts) / 60000);
+    seqLog(`AF [${filterName}]: DB pos ${cached.pos} (${ageMin} min ago) — moving focuser ✓`);
     seqState.currentStep = `AF [${filterName}]: moving to cached position ${cached.pos}...`;
     await stepMoveFocuserAbsolute(target, cached.pos);
     return;
@@ -2113,27 +2339,20 @@ async function stepAutofocusForFilter(target, filterName, availableFilters) {
       const elapsed = Date.now() - afStartMs;
       if (moveCount >= MIN_MOVES && stableCount >= STABLE_NEEDED && elapsed >= MIN_AF_MS) {
         seqLog(`  Autofocus [${filterName}] complete — position: ${startPos} → ${pos} (${moveCount} moves) ✓`);
-        filterAfCache[filterName] = { pos, ts: Date.now() };
-        saveFilterAfCache();
+        saveAfResult(filterName, pos);
         return;
       }
 
       if (moveCount === 0 && pollCount >= NO_MOVE_LIMIT) {
         seqLog(`  No focuser movement — assuming AF skipped/complete [${filterName}]`);
-        if (Number.isFinite(finalPos)) {
-          filterAfCache[filterName] = { pos: finalPos, ts: Date.now() };
-          saveFilterAfCache();
-        }
+        if (Number.isFinite(finalPos)) saveAfResult(filterName, finalPos);
         return;
       }
     } catch { /* ignore transient errors */ }
   }
 
   seqLog(`  AF [${filterName}] timed out (12 min) — proceeding`, "warn");
-  if (Number.isFinite(finalPos)) {
-    filterAfCache[filterName] = { pos: finalPos, ts: Date.now() };
-    saveFilterAfCache();
-  }
+  if (Number.isFinite(finalPos)) saveAfResult(filterName, finalPos);
 }
 
 /** Legacy wrapper — kept for any direct call sites outside the filter loop */
@@ -2690,16 +2909,16 @@ async function runSequence(ninaConfig, seqConfig) {
     try {
       // Verify OCS roof is open before moving anything
       const { ok: ocsOk, fields } = await ocsStatus(DEFAULT_OCS_HOST).catch(() => ({ ok: false, fields: {} }));
-      const roofStatus = ocsClean(fields?.stat_roof ?? "").toLowerCase();
+      const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
       const isClosed   = ocsOk && roofStatus && !roofStatus.includes("open");
       if (isClosed) {
-        seqLog(`✗ Roof appears closed (OCS: "${ocsClean(fields.stat_roof)}") — aborting sequence for safety`, "error");
+        seqLog(`✗ Roof appears closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting sequence for safety`, "error");
         return;
       }
       if (!ocsOk) {
         seqLog("OCS unreachable — cannot verify roof status, proceeding with caution", "warn");
       } else {
-        seqLog(`Roof status: ${ocsClean(fields.stat_roof)} ✓`);
+        seqLog(`Roof status: ${ocsClean(fields.roof_sta)} ✓`);
       }
 
       // Unpark + go home
@@ -2971,6 +3190,75 @@ async function runSequence(ninaConfig, seqConfig) {
       } catch (err) {
         if (err.message === "__ABORTED__") throw err;
 
+        // ── ToO alert interrupt ───────────────────────────────────────────
+        if (err.code === "__ALERT_INTERRUPT__") {
+          const alertData = err.alert;
+          seqLog(`🚨 ToO INTERRUPT: ${alertData.broker} ${alertData.trigger_id} — pausing ${t.name}`, "warn");
+
+          // Save resume state
+          seqState.tooResumeState = {
+            target: t,
+            completedFilters: [...completedFilters],
+            targetFilters,
+            targetCount,
+            targetDuration,
+          };
+
+          // Abort the current exposure
+          try {
+            await callNinaLong(ninaConfig, "/v2/api/equipment/camera/abort", {}, 8000);
+            seqLog("  Camera exposure aborted");
+          } catch { /* best effort */ }
+
+          // Run the ToO sub-sequence
+          try {
+            await runTooSequence(ninaConfig, alertData, seqConfig);
+          } catch (tooErr) {
+            seqLog(`  ToO sub-sequence error: ${tooErr.message}`, "error");
+          }
+
+          // Clear interrupt flag
+          seqState.tooInterrupt = null;
+          seqState.tooResumeState = null;
+
+          // Resume: re-slew to the paused target and continue with remaining filters
+          seqLog(`↩ Resuming ${t.name} after ToO...`);
+          try {
+            await stepUnparkMount(ninaConfig);
+            await checkTargetAboveHorizon(ninaConfig, t.raDeg, t.decDeg, t.name);
+            const useCenter = solveEnabled !== false;
+            await stepSlewWithCloudRetry(ninaConfig, t.raDeg, t.decDeg, t.name, {
+              center: useCenter, cloudWaitMs: 2 * 60 * 1000, maxRetries: 4,
+            });
+            await stepStartGuiding(ninaConfig);
+
+            const { equipmentInfo: reInfo } = await getEquipmentInfo(ninaConfig);
+            const reFilters = reInfo?.FilterWheel?.AvailableFilters || [];
+            const remainingFilters = targetFilters.filter(f => !completedFilters.has(f));
+            if (remainingFilters.length > 0) {
+              seqLog(`  Resuming filters: [${remainingFilters.join(", ")}] (done: [${[...completedFilters].join(", ")}])`);
+              for (const filterName of remainingFilters) {
+                checkAbort();
+                await stepAutofocusForFilter(ninaConfig, filterName, reFilters);
+                checkAbort();
+                await assertCameraIdle(ninaConfig, `before ${filterName} captures (resume)`);
+                await stepCaptureFilter(ninaConfig, t.name, filterName, targetCount, targetDuration, gain, reFilters, safetyLimits, t.raDeg, t.decDeg);
+                completedFilters.add(filterName);
+              }
+            }
+            t.done = true;
+            remaining.delete(t);
+            saveQueue();
+            seqLog(`${t.name} — resumed and complete ✓`);
+          } catch (resumeErr) {
+            if (resumeErr.message === "__ABORTED__") throw resumeErr;
+            seqLog(`  Resume of ${t.name} failed: ${resumeErr.message}`, "error");
+            t.paused = true;
+            await safeHome();
+          }
+          continue;
+        }
+
         // ── Safety limit hit mid-capture ──────────────────────────────────
         if (err.code === "__LIMIT_REACHED__") {
           seqLog(`⚠ ${t.name} paused (limit): ${err.message}`, "warn");
@@ -3086,6 +3374,396 @@ async function runSequence(ninaConfig, seqConfig) {
   }
 }
 
+// ── Alert Prep: "Ready Obs for Alert" ────────────────────────────────────────
+// Pre-flight that gets the telescope into standby: roof check, unpark, home,
+// open cover, cool camera, AF every filter, then park at home with tracking off.
+// After this the telescope is ready to react in seconds: just slew and shoot.
+
+async function runAlertPrep(ninaConfig, seqConfig) {
+  if (seqState.alertPrepRunning) {
+    seqLog("Alert prep already running — ignoring duplicate request", "warn");
+    return;
+  }
+  seqState.alertPrepRunning = true;
+  seqState.alertPrepStep = "Starting...";
+  seqState.ninaConfig = ninaConfig;
+  const { filters: filterNames = [], gain } = seqConfig;
+
+  seqLog("═══ ALERT PREP: Ready Obs for Alert ═══");
+
+  function prepStep(msg) {
+    seqState.alertPrepStep = msg;
+    seqLog(`  ${msg}`);
+  }
+
+  try {
+    // ── 1. Roof check (manual — just warn) ─────────────────────────────────
+    prepStep("Checking roof status...");
+    try {
+      const { ok: ocsOk, fields } = await ocsStatus(DEFAULT_OCS_HOST).catch(() => ({ ok: false, fields: {} }));
+      const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+      const isClosed = ocsOk && roofStatus && !roofStatus.includes("open");
+      if (isClosed) {
+        seqLog(`✗ Roof appears CLOSED (OCS: "${ocsClean(fields.roof_sta)}") — aborting alert prep for safety`, "error");
+        seqState.alertPrepStep = "ABORTED: Roof closed";
+        return;
+      }
+      if (!ocsOk) {
+        seqLog("  OCS unreachable — cannot verify roof. Proceeding with caution.", "warn");
+      } else {
+        seqLog(`  Roof: ${ocsClean(fields.roof_sta)} ✓`);
+      }
+    } catch (e) {
+      seqLog(`  Roof check error: ${e.message} — proceeding with caution`, "warn");
+    }
+    if (seqState.aborted) return;
+
+    // ── 2. Unpark ──────────────────────────────────────────────────────────
+    prepStep("Unparking mount...");
+    await stepUnparkMount(ninaConfig);
+    if (seqState.aborted) return;
+
+    // ── 3. Home ────────────────────────────────────────────────────────────
+    prepStep("Homing mount...");
+    // Inline safeHome logic (safeHome is scoped inside runSequence)
+    try {
+      const { equipmentInfo: preInfo } = await getEquipmentInfo(ninaConfig);
+      const mountPre = preInfo?.Mount;
+      if (mountPre?.AtPark === true || mountPre?.AtHome === true) {
+        const reason = mountPre.AtPark ? "parked" : "already at home flag";
+        seqLog(`    Mount ${reason} — unparking before FindHome...`);
+        await callNinaLong(ninaConfig, "/v2/api/equipment/mount/unpark", {}, 30000);
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 1500));
+          const { equipmentInfo: ei2 } = await getEquipmentInfo(ninaConfig);
+          if (ei2?.Mount?.AtPark === false) break;
+        }
+      }
+      seqLog("    Sending FindHome command...");
+      const result = await callNinaLong(ninaConfig, "/v2/api/equipment/mount/home", {}, 15000);
+      const resp = result.body?.Response ?? "";
+      if (typeof resp === "string" && /already.?hom/i.test(resp)) {
+        seqLog("    Mount homed ✓ (already at home position)");
+      } else {
+        const HOME_TIMEOUT = 5 * 60 * 1000;
+        const deadline = Date.now() + HOME_TIMEOUT;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 3000));
+          if (seqState.aborted) return;
+          const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
+          const m = equipmentInfo?.Mount;
+          seqState.alertPrepStep = `Homing: slewing=${m?.Slewing} atHome=${m?.AtHome}`;
+          if (m?.AtHome === true && m?.Slewing !== true) {
+            seqLog("    Mount homed ✓");
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      seqLog(`    Home failed: ${e.message}`, "warn");
+    }
+    if (seqState.aborted) return;
+
+    // ── 4. Open dust cover ─────────────────────────────────────────────────
+    prepStep("Opening dust cover...");
+    try {
+      await stepOpenCover(ninaConfig);
+    } catch (e) {
+      seqLog(`    Cover open failed: ${e.message} — continuing`, "warn");
+    }
+    if (seqState.aborted) return;
+
+    // ── 5. Cool camera ─────────────────────────────────────────────────────
+    prepStep("Cooling camera...");
+    try {
+      await stepCoolCamera(ninaConfig, -5);
+    } catch (e) {
+      seqLog(`    Camera cooling failed: ${e.message} — continuing`, "warn");
+    }
+    if (seqState.aborted) return;
+
+    // ── 6. AF on each filter (results are cached for 2 hours) ──────────────
+    const { equipmentInfo: fwInfo } = await getEquipmentInfo(ninaConfig);
+    const availableFilters = fwInfo?.FilterWheel?.AvailableFilters || [];
+    const availableNames = availableFilters.map(f => f.Name).filter(Boolean);
+    seqLog(`  Filterwheel: ${availableNames.join(", ") || "(none)"}`);
+
+    // Need to enable tracking + slew to a bright area for AF to work
+    prepStep("Enabling tracking for autofocus...");
+    const { equipmentInfo: mInfo } = await getEquipmentInfo(ninaConfig);
+    if (!mInfo?.Mount?.TrackingEnabled) {
+      await callNinaLong(ninaConfig, "/v2/api/equipment/mount/tracking", { on: true }, 15000);
+    }
+    if (seqState.aborted) return;
+
+    // Slew to a good AF target: current meridian, observatory latitude (near zenith)
+    const site = resolveObserverSite();
+    const jd = _toJD(new Date());
+    const lstDeg = (_gmstDeg(jd) + site.lon + 360) % 360;
+    const afRaDeg  = lstDeg;
+    const afDecDeg = Math.min(80, Math.max(-80, site.lat));
+    prepStep(`Slewing to AF position (RA=${(afRaDeg/15).toFixed(2)}h Dec=${afDecDeg.toFixed(1)}°)...`);
+    await stepSlewToTarget(ninaConfig, afRaDeg, afDecDeg, "AlertPrep-AF", { center: false });
+    await new Promise(r => setTimeout(r, 3000));
+    if (seqState.aborted) return;
+
+    const validFilters = filterNames.filter(f => findFilterByName(availableFilters, f));
+    if (!validFilters.length && availableNames.length) {
+      seqLog("  No configured filters match filterwheel — using all available", "warn");
+      validFilters.push(...availableNames);
+    }
+
+    for (let i = 0; i < validFilters.length; i++) {
+      if (seqState.aborted) return;
+      const filterName = validFilters[i];
+      prepStep(`Autofocus [${filterName}] (${i + 1}/${validFilters.length})...`);
+      try {
+        await stepAutofocusForFilter(ninaConfig, filterName, availableFilters);
+        seqLog(`  AF [${filterName}] complete ✓`);
+      } catch (e) {
+        seqLog(`  AF [${filterName}] failed: ${e.message} — continuing`, "warn");
+      }
+    }
+    if (seqState.aborted) return;
+
+    // ── 7. Go home, disable tracking, wait ─────────────────────────────────
+    prepStep("Returning to home position...");
+    try {
+      await callNinaLong(ninaConfig, "/v2/api/equipment/mount/home", {}, 15000);
+      const deadline = Date.now() + 3 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 3000));
+        const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
+        if (equipmentInfo?.Mount?.AtHome === true && !equipmentInfo?.Mount?.Slewing) break;
+      }
+    } catch (e) {
+      seqLog(`    Home failed: ${e.message}`, "warn");
+    }
+
+    prepStep("Disabling tracking...");
+    try {
+      await callNinaLong(ninaConfig, "/v2/api/equipment/mount/tracking", { on: false }, 15000);
+      seqLog("  Tracking disabled ✓");
+    } catch (e) {
+      seqLog(`  Tracking disable failed: ${e.message}`, "warn");
+    }
+
+    // Auto-enable alert-ready mode
+    seqState.alertReady = true;
+    setSetting("alertReady", "true");
+
+    seqLog("═══ ALERT PREP COMPLETE — Observatory is ready ═══");
+    seqLog("  Cover: open  |  Camera: cooled  |  AF: cached  |  Mount: home, tracking off");
+    seqLog("  Alert-Ready mode: ARMED — waiting for alerts...", "warn");
+    seqState.alertPrepStep = "READY — Waiting for alerts";
+
+  } catch (e) {
+    if (e.message === "__ABORTED__") {
+      seqLog("═══ ALERT PREP ABORTED ═══", "warn");
+      seqState.alertPrepStep = "Aborted";
+    } else {
+      seqLog(`═══ ALERT PREP ERROR: ${e.message} ═══`, "error");
+      seqState.alertPrepStep = `Error: ${e.message}`;
+    }
+  } finally {
+    seqState.alertPrepRunning = false;
+    seqState.aborted = false;
+    seqState.ninaConfig = ninaConfig;
+  }
+}
+
+// ── Target-of-Opportunity (ToO) sub-sequence ─────────────────────────────────
+// Runs when an alert interrupt fires. Uses the same camera settings as the main
+// sequence. Implements a mosaic strategy based on the error box vs FOV.
+//
+// Mosaic rules:
+//   err_deg <= FOV/2      → single pointing (target inside one frame)
+//   err_deg <= FOV * 1.5  → 2×2 spiral (4 pointings, each offset by FOV/2)
+//   err_deg > FOV * 1.5   → 4 pointings centered on the alert, loop them
+//
+function computeMosaicGrid(raDeg, decDeg, errDeg, fovDeg) {
+  const halfFov = fovDeg / 2;
+  const cosDec = Math.cos(decDeg * Math.PI / 180) || 1;
+
+  if (!Number.isFinite(errDeg) || errDeg <= halfFov) {
+    return [{ ra: raDeg, dec: decDeg, label: "center" }];
+  }
+
+  // Spiral: NE, NW, SW, SE — each offset by half a FOV from center
+  const offsets = [
+    { dra: +halfFov, ddec: +halfFov, label: "NE" },
+    { dra: -halfFov, ddec: +halfFov, label: "NW" },
+    { dra: -halfFov, ddec: -halfFov, label: "SW" },
+    { dra: +halfFov, ddec: -halfFov, label: "SE" },
+  ];
+
+  return offsets.map(o => ({
+    ra:  raDeg  + o.dra / cosDec,
+    dec: decDeg + o.ddec,
+    label: o.label,
+  }));
+}
+
+async function runTooSequence(ninaConfig, alertData, seqConfig) {
+  seqState.tooRunning = true;
+  const { duration, gain, count, filters: filterNames } = seqConfig;
+  const { ra, dec, err_deg, broker, trigger_id, strategy } = alertData;
+  const tooName = `ToO-${broker}-${trigger_id || "alert"}`;
+
+  // ── Resolve strategy params (fallback to seqConfig if no strategy) ──────
+  const strat = strategy || getStrategy(broker);
+  const rapidExposure  = strat.exposure     || duration;
+  const rapidGain      = strat.gain         ?? gain;
+  const rapidCount     = Math.min(count, strat.rapid_count || 15);
+  const filterCycle    = (strat.filter_cycle || "G,RP,BP").split(",").map(s => s.trim()).filter(Boolean);
+  const doAf           = Boolean(strat.do_af);
+  const doGuiding      = Boolean(strat.do_guiding);
+  const doCenter       = Boolean(strat.do_center);
+
+  seqLog(`🚨 ═══ ToO SUB-SEQUENCE: ${tooName} ═══`);
+  seqLog(`  RA=${ra.toFixed(4)}° Dec=${dec.toFixed(4)}° err=${(err_deg || 0).toFixed(3)}° FOV=${TOO_FOV_DEG}°`);
+  seqLog(`  Strategy: mode=${strat.mode} exp=${rapidExposure}s gain=${rapidGain} filters=[${filterCycle}] rapid=${rapidCount} AF=${doAf} guide=${doGuiding} center=${doCenter}`);
+
+  try {
+    const grid = computeMosaicGrid(ra, dec, err_deg || 0, TOO_FOV_DEG);
+    const needsLoop = grid.length > 1 && (err_deg || 0) > TOO_FOV_DEG * 1.5;
+    seqLog(`  Mosaic: ${grid.length} pointing(s)${needsLoop ? " (looped)" : " (spiral)"} — ${grid.map(g => g.label).join(", ")}`);
+
+    const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
+    const availFilters = equipmentInfo?.FilterWheel?.AvailableFilters || [];
+
+    // ── Phase 1 fast-path: first filter from cycle + focuser restore ────────
+    const firstFilterName = filterCycle[0] || "G";
+    const firstFilter = findFilterByName(availFilters, firstFilterName);
+    if (firstFilter) {
+      await changeFilterVerified(ninaConfig, firstFilter);
+      if (doAf) {
+        seqLog(`  Phase 1 AF: running autofocus for ${firstFilterName}`);
+        await stepAutofocusForFilter(ninaConfig, firstFilterName, availFilters);
+      } else {
+        const lastAf = getLatestAfResult(firstFilterName);
+        if (lastAf) {
+          const ageMin = Math.round((Date.now() - lastAf.ts) / 60000);
+          seqLog(`  Fast focus: restoring ${firstFilterName} focuser pos ${lastAf.pos} from DB (${ageMin} min ago)`);
+          await stepMoveFocuserAbsolute(ninaConfig, lastAf.pos);
+        } else {
+          seqLog(`  No prior AF for ${firstFilterName} in DB — proceeding with current focuser position`, "warn");
+        }
+      }
+    } else {
+      seqLog(`  ${firstFilterName} filter not found — using first available`, "warn");
+    }
+    const fastFilter = firstFilter ? firstFilterName : (filterCycle.find(f => findFilterByName(availFilters, f)) || filterNames[0] || null);
+    if (!fastFilter) {
+      seqLog("  No valid filters — aborting ToO", "error");
+      return;
+    }
+
+    await stepUnparkMount(ninaConfig);
+
+    // ── Phase 1: rapid filter-cycle imaging (time-critical) ─────────────────
+    const validCycleFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
+    const cycleLen = validCycleFilters.length || 1;
+    seqLog(`  Phase 1: rapid cycling [${validCycleFilters.join(",")}] — ${rapidCount} × ${rapidExposure}s (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
+
+    for (const pt of grid) {
+      if (seqState.aborted) break;
+      seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
+      await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
+      if (!doCenter) await new Promise(r => setTimeout(r, 2000));
+
+      for (let i = 1; i <= rapidCount; i++) {
+        if (seqState.aborted) break;
+        const cycleFilter = validCycleFilters[(i - 1) % cycleLen] || fastFilter;
+        const cFilter = findFilterByName(availFilters, cycleFilter);
+        if (cFilter) await changeFilterVerified(ninaConfig, cFilter);
+
+        seqState.currentStep = `ToO ${pt.label} ${cycleFilter}: ${i}/${rapidCount} [RAPID]`;
+        seqState.progress = { filter: cycleFilter, frame: i, frames: rapidCount };
+        seqLog(`  ${pt.label} ${cycleFilter} ${i}/${rapidCount}: ${rapidExposure}s`);
+        await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+          { duration: rapidExposure, gain: rapidGain, save: true, targetName: tooName, filter: cycleFilter }, 30000);
+        await waitExposure(rapidExposure);
+        try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+      }
+    }
+
+    // ── Phase 2: multi-filter deep follow-up (remaining frames, with AF) ────
+    const tooFilters = filterNames.filter(f => findFilterByName(availFilters, f));
+    const remainingCount = Math.max(0, count - rapidCount);
+    if (remainingCount > 0 && tooFilters.length > 0 && !seqState.aborted) {
+      seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} frames × [${tooFilters.join(", ")}]`);
+
+      if (needsLoop) {
+        const perPointing = Math.max(1, Math.floor(remainingCount / grid.length));
+        for (const filterName of tooFilters) {
+          if (seqState.aborted) break;
+          const filter = findFilterByName(availFilters, filterName);
+          if (!filter) continue;
+          await changeFilterVerified(ninaConfig, filter);
+          await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+
+          for (const pt of grid) {
+            if (seqState.aborted) break;
+            seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
+            await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
+            await new Promise(r => setTimeout(r, 2000));
+
+            for (let i = 1; i <= perPointing; i++) {
+              if (seqState.aborted) break;
+              seqState.currentStep = `ToO ${pt.label} ${filterName}: ${i}/${perPointing}`;
+              seqState.progress = { filter: filterName, frame: i, frames: perPointing };
+              seqLog(`  ${pt.label} ${filterName} ${i}/${perPointing}: ${duration}s`);
+              await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+                { duration, gain, save: true, targetName: tooName, filter: filterName }, 30000);
+              await waitExposure(duration);
+              try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+            }
+          }
+        }
+      } else {
+        for (const pt of grid) {
+          if (seqState.aborted) break;
+          seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
+          await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
+          await new Promise(r => setTimeout(r, 2000));
+
+          for (const filterName of tooFilters) {
+            if (seqState.aborted) break;
+            const filter = findFilterByName(availFilters, filterName);
+            if (!filter) continue;
+            await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+            await changeFilterVerified(ninaConfig, filter);
+
+            for (let i = 1; i <= remainingCount; i++) {
+              if (seqState.aborted) break;
+              seqState.currentStep = `ToO ${pt.label} ${filterName}: ${i}/${remainingCount}`;
+              seqState.progress = { filter: filterName, frame: i, frames: remainingCount };
+              seqLog(`  ${pt.label} ${filterName} ${i}/${remainingCount}: ${duration}s`);
+              await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+                { duration, gain, save: true, targetName: tooName, filter: filterName }, 30000);
+              await waitExposure(duration);
+              try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+            }
+          }
+        }
+      }
+    }
+
+    seqLog(`🚨 ═══ ToO ${tooName} COMPLETE ═══`);
+
+    try {
+      db.prepare("UPDATE alerts SET action = 'too-observed', action_reason = ? WHERE trigger_id = ?")
+        .run(`${grid.length}-pointings`, String(trigger_id));
+    } catch { /* non-fatal */ }
+
+  } finally {
+    seqState.tooRunning = false;
+    seqState.tooInterrupt = null;
+  }
+}
+
 // ── Sequence routes ───────────────────────────────────────────────────────────
 
 app.get("/api/sequence/state", (req, res) => {
@@ -3101,6 +3779,10 @@ app.get("/api/sequence/state", (req, res) => {
     log: seqState.log,
     lastAutofocusTime: seqState.lastAutofocusTime,
     error: seqState.error,
+    alertReady: seqState.alertReady,
+    tooRunning: seqState.tooRunning,
+    alertPrepRunning: seqState.alertPrepRunning,
+    alertPrepStep: seqState.alertPrepStep,
   });
 });
 
@@ -3293,6 +3975,26 @@ app.post("/api/sequence/reset-af", (req, res) => {
   seqState.lastAutofocusTime = null;
   setSetting("lastAutofocusTime", "");
   return res.json({ success: true, message: "Autofocus timer reset — AF will run on next sequence" });
+});
+
+app.get("/api/autofocus/history", (req, res) => {
+  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+  const filter = req.query.filter;
+  let rows;
+  if (filter) {
+    rows = db.prepare(
+      `SELECT id, filter, position, ts FROM autofocus_log WHERE filter = ? ORDER BY ts DESC LIMIT ?`
+    ).all(filter, limit);
+  } else {
+    rows = db.prepare(
+      `SELECT id, filter, position, ts FROM autofocus_log ORDER BY ts DESC LIMIT ?`
+    ).all(limit);
+  }
+  const latest = {};
+  for (const r of rows) {
+    if (!latest[r.filter]) latest[r.filter] = { position: r.position, ts: r.ts };
+  }
+  res.json({ success: true, latest, history: rows });
 });
 
 app.post("/api/sequence/restart", (req, res) => {
@@ -3574,7 +4276,7 @@ app.get("/api/weather/openmeteo", async (req, res) => {
 // helper.  Only events with maxAlt ≥ minAlt are returned, sorted by maxAlt desc.
 
 app.get("/api/tonight", async (req, res) => {
-  const uid    = String(req.query.uid  || getSetting("colibri_uid", "") || "").trim();
+  const uid    = String(req.query.uid || getSetting("colibri_uid", "") || process.env.COLIBRI_UID || "").trim();
   const days   = Math.min(30, Math.max(1, parseInt(req.query.days)  || 7));
   const lat    = parseFloat(req.query.lat);
   const lon    = parseFloat(req.query.lon);
@@ -4114,6 +4816,9 @@ app.delete("/api/targets/:id", (req, res) => {
   db.prepare("DELETE FROM targets WHERE id = ?").run(req.params.id);
   res.json({ success: true });
 });
+
+// ── Alerts (GCN + AstroColibri) ──────────────────────────────────────────────
+alerts.initAlertsTable(db);
 
 // ── Pipeline jobs routes ──────────────────────────────────────────────────────
 
@@ -4738,6 +5443,39 @@ app.get("/api/pipeline/history", (req, res) => {
 
 app.use((req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+// ── GCN-Kafka alert listener ─────────────────────────────────────────────────
+function resolveObserverSite() {
+  const envLat = parseFloat(process.env.OBS_LAT || "");
+  const envLon = parseFloat(process.env.OBS_LON || "");
+  if (Number.isFinite(envLat) && Number.isFinite(envLon)) return { lat: envLat, lon: envLon };
+  const sLat = parseFloat(getSetting("obs_lat", ""));
+  const sLon = parseFloat(getSetting("obs_lon", ""));
+  if (Number.isFinite(sLat) && Number.isFinite(sLon)) return { lat: sLat, lon: sLon };
+  return { lat: 47.7, lon: -3.0 };
+}
+
+alerts.startGcnListener({
+  db,
+  getStrategy,
+  pushToQueue: ({ name, raDeg, decDeg, alert, mode }) => {
+    const isToo = (mode === "too");
+    if (isToo && seqState.alertReady && seqState.running && !seqState.tooRunning && alert) {
+      seqState.tooInterrupt = alert;
+      seqLog(`🚨 ToO ALERT received: ${alert.broker} ${alert.trigger_id} — interrupt will fire at next checkAbort`, "warn");
+      return;
+    }
+    seqState.queue.push({
+      name, raDeg, decDeg, ra: "", dec: "",
+      done: false, addedAt: Date.now(),
+    });
+  },
+  saveQueue,
+  computeAltAz:  serverComputeAltAz,
+  getMountSite:  resolveObserverSite,
+  minAltDeg:     parseFloat(process.env.ALERT_MIN_ALT_DEG || "25"),
+  minMoonSepDeg: parseFloat(process.env.ALERT_MIN_MOON_SEP_DEG || "20"),
 });
 
 app.listen(PORT, () => {

@@ -9,6 +9,7 @@ const tabActionsBtn   = document.getElementById("tab-actions");
 const tabDomeBtn      = document.getElementById("tab-dome");
 const tabTargetBtn    = document.getElementById("tab-target");
 const tabTodoBtn      = document.getElementById("tab-todo");
+const tabAlertsBtn    = document.getElementById("tab-alerts");
 const tabPipelineBtn  = document.getElementById("tab-pipeline");
 const tabHistoryBtn   = document.getElementById("tab-history");
 const tabSettingsBtn  = document.getElementById("tab-settings");
@@ -17,6 +18,7 @@ const panelActions    = document.getElementById("panel-actions");
 const panelDome       = document.getElementById("panel-dome");
 const panelTarget     = document.getElementById("panel-target");
 const panelTodo       = document.getElementById("panel-todo");
+const panelAlerts     = document.getElementById("panel-alerts");
 const panelPipeline   = document.getElementById("panel-pipeline");
 const panelHistory    = document.getElementById("panel-history");
 const panelSettings   = document.getElementById("panel-settings");
@@ -86,13 +88,14 @@ function setLog(value) {
 }
 
 function setActiveTab(tab) {
-  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, pipeline: false, history: false, settings: false };
+  const tabs = { devices: false, actions: false, dome: false, target: false, todo: false, alerts: false, pipeline: false, history: false, settings: false };
   tabs[tab] = true;
   tabDevicesBtn.classList.toggle("active",  tabs.devices);
   tabActionsBtn.classList.toggle("active",  tabs.actions);
   tabDomeBtn.classList.toggle("active",     tabs.dome);
   tabTargetBtn.classList.toggle("active",   tabs.target);
   tabTodoBtn.classList.toggle("active",     tabs.todo);
+  tabAlertsBtn.classList.toggle("active",   tabs.alerts);
   tabPipelineBtn.classList.toggle("active", tabs.pipeline);
   tabHistoryBtn.classList.toggle("active",  tabs.history);
   tabSettingsBtn.classList.toggle("active", tabs.settings);
@@ -101,6 +104,7 @@ function setActiveTab(tab) {
   panelDome.classList.toggle("active",      tabs.dome);
   panelTarget.classList.toggle("active",    tabs.target);
   panelTodo.classList.toggle("active",      tabs.todo);
+  panelAlerts.classList.toggle("active",    tabs.alerts);
   panelPipeline.classList.toggle("active",  tabs.pipeline);
   panelHistory.classList.toggle("active",   tabs.history);
   panelSettings.classList.toggle("active",  tabs.settings);
@@ -771,6 +775,7 @@ tabDevicesBtn.addEventListener("click",  () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click",  () => setActiveTab("actions"));
 tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
 tabTargetBtn.addEventListener("click",   () => setActiveTab("target"));
+tabAlertsBtn.addEventListener("click",   () => { setActiveTab("alerts"); loadAlerts(); loadAlertConfig(); loadStrategies(); });
 tabSettingsBtn.addEventListener("click", () => {
   setActiveTab("settings");
   loadWatchdogConfig();
@@ -3976,3 +3981,335 @@ async function loadIrImage() {
 }
 
 document.getElementById("ocs-ir-refresh")?.addEventListener("click", loadIrImage);
+
+// ── Alerts tab ───────────────────────────────────────────────────────────────
+
+let _alertsCache = [];
+let _alertsAutoTimer = null;
+
+const BROKER_COLORS = {
+  Swift: "#f59e0b", Fermi: "#f97316", IceCube: "#38bdf8", LVK: "#a78bfa",
+  EP: "#34d399", SVOM: "#2dd4bf", INTEGRAL: "#e879f9", AGILE: "#fb923c",
+  GECAM: "#facc15", MAXI: "#f472b6", IPN: "#94a3b8", "SN-nu": "#ef4444",
+  GCN: "#6b7280",
+};
+
+const ACTION_LABELS = {
+  queued:         { text: "QUEUED",   cls: "alert-action-queued"   },
+  rejected:       { text: "REJECTED", cls: "alert-action-rejected" },
+  manual:         { text: "MANUAL",   cls: "alert-action-manual"   },
+  ignored:        { text: "IGNORED",  cls: "alert-action-ignored"  },
+  "too-observed": { text: "ToO OBS",  cls: "alert-action-too"      },
+};
+
+function fmtDeg(v, prec = 3) { return v != null ? Number(v).toFixed(prec) : "—"; }
+function fmtDeg1(v) { return v != null ? Number(v).toFixed(1) + "°" : "—"; }
+
+async function loadAlertConfig() {
+  try {
+    const r = await fetch("/api/alerts/config");
+    const d = await r.json();
+    if (!d.success) return;
+    const cb = document.getElementById("alert-ready-cb");
+    const st = document.getElementById("alert-ready-status");
+    if (cb) cb.checked = d.alertReady;
+    if (st) {
+      st.textContent = d.alertReady ? "ARMED" : "OFF";
+      st.className = "alert-ready-status " + (d.alertReady ? "armed" : "");
+    }
+
+    // Prep state
+    const prepBtn    = document.getElementById("alert-prep-btn");
+    const abortBtn   = document.getElementById("alert-prep-abort-btn");
+    const prepStatus = document.getElementById("alert-prep-status");
+    if (prepBtn && prepStatus) {
+      if (d.alertPrepRunning) {
+        prepBtn.disabled = true;
+        prepBtn.classList.add("running");
+        prepBtn.textContent = "Prep Running...";
+        abortBtn.style.display = "";
+        prepStatus.textContent = d.alertPrepStep || "Running...";
+        prepStatus.className = "alert-prep-status";
+        if (!_alertPrepPollTimer) {
+          _alertPrepPollTimer = setInterval(loadAlertConfig, 3000);
+        }
+      } else {
+        prepBtn.disabled = false;
+        prepBtn.classList.remove("running");
+        prepBtn.textContent = "Ready Obs for Alert";
+        abortBtn.style.display = "none";
+        if (_alertPrepPollTimer) { clearInterval(_alertPrepPollTimer); _alertPrepPollTimer = null; }
+        if (d.alertPrepStep) {
+          const isDone = d.alertPrepStep.startsWith("READY");
+          const isErr  = d.alertPrepStep.startsWith("Error") || d.alertPrepStep.startsWith("ABORTED");
+          prepStatus.textContent = d.alertPrepStep;
+          prepStatus.className = "alert-prep-status" + (isDone ? " done" : isErr ? " error" : "");
+        }
+      }
+    }
+  } catch {}
+}
+
+document.getElementById("alert-ready-cb")?.addEventListener("change", async (e) => {
+  const val = e.target.checked;
+  try {
+    await fetch("/api/alerts/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alertReady: val }),
+    });
+    loadAlertConfig();
+  } catch {}
+});
+
+document.getElementById("alert-prep-btn")?.addEventListener("click", async () => {
+  const hostEl = document.getElementById("nina-host");
+  const portEl = document.getElementById("nina-port");
+  const protocolEl = document.getElementById("nina-protocol");
+  const host = hostEl?.value || "192.168.1.174";
+  const port = portEl?.value || "1888";
+  const protocol = protocolEl?.value || "http";
+  try {
+    const r = await fetch("/api/alerts/prep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host, port, protocol }),
+    });
+    const d = await r.json();
+    if (!d.success) alert(d.error || "Failed to start alert prep");
+    // Start polling the config to show progress
+    if (!_alertPrepPollTimer) {
+      _alertPrepPollTimer = setInterval(loadAlertConfig, 3000);
+    }
+    loadAlertConfig();
+  } catch (e) { alert("Error: " + e.message); }
+});
+
+let _alertPrepPollTimer = null;
+
+document.getElementById("alert-prep-abort-btn")?.addEventListener("click", async () => {
+  try {
+    await fetch("/api/alerts/prep/abort", { method: "POST" });
+    loadAlertConfig();
+  } catch {}
+});
+
+// ── Per-broker strategy table ─────────────────────────────────────────────────
+let _strategiesCache = [];
+
+async function loadStrategies() {
+  try {
+    const r = await fetch("/api/alert-strategies");
+    const d = await r.json();
+    if (d.success) { _strategiesCache = d.strategies || []; renderStrategies(); }
+  } catch (e) { console.warn("[strategies-ui]", e); }
+}
+
+function renderStrategies() {
+  const tbody = document.getElementById("strategy-tbody");
+  if (!tbody) return;
+
+  tbody.innerHTML = _strategiesCache.map(s => {
+    const bc = BROKER_COLORS[s.broker] || "#6b7280";
+    const dimCls = (!s.enabled || s.mode === "ignore") ? "strat-disabled-row" : "";
+    return `<tr class="strat-row ${dimCls}" data-broker="${s.broker}">
+      <td style="padding:5px 6px;white-space:nowrap;"><span class="alert-broker-dot" style="background:${bc};"></span>${s.broker}</td>
+      <td style="padding:5px 6px;text-align:center;">
+        <input type="checkbox" class="strat-cb" data-field="enabled" ${s.enabled ? "checked" : ""} />
+      </td>
+      <td style="padding:5px 6px;text-align:center;">
+        <select class="strat-sel" data-field="mode" style="background:#0d1929;border:1px solid #1e3a5f;color:#e2e8f0;border-radius:3px;padding:2px 4px;font-size:11px;">
+          <option value="too" ${s.mode==="too"?"selected":""}>too</option>
+          <option value="queue" ${s.mode==="queue"?"selected":""}>queue</option>
+          <option value="ignore" ${s.mode==="ignore"?"selected":""}>ignore</option>
+        </select>
+      </td>
+      <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="exposure" value="${s.exposure}" min="1" max="600" step="1" style="width:50px;" /></td>
+      <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="gain" value="${s.gain}" min="0" max="100" step="1" style="width:42px;" /></td>
+      <td style="padding:5px 6px;"><input type="text" class="strat-inp" data-field="filter_cycle" value="${s.filter_cycle}" style="width:80px;" /></td>
+      <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="rapid_count" value="${s.rapid_count}" min="1" max="200" step="1" style="width:42px;" /></td>
+      <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="do_af" ${s.do_af ? "checked" : ""} /></td>
+      <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="do_guiding" ${s.do_guiding ? "checked" : ""} /></td>
+      <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="do_center" ${s.do_center ? "checked" : ""} /></td>
+      <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="min_alt" value="${s.min_alt}" min="0" max="90" step="1" style="width:42px;" /></td>
+      <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="max_err_deg" value="${s.max_err_deg}" min="0.01" max="180" step="0.1" style="width:50px;" /></td>
+      <td style="padding:5px 6px;"><input type="text" class="strat-inp" data-field="notes" value="${(s.notes||"").replace(/"/g,"&quot;")}" style="width:160px;font-size:11px;" /></td>
+      <td style="padding:5px 6px;"><button class="btn-small strat-reset-btn" data-broker="${s.broker}" title="Reset to defaults">↺</button></td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll(".strat-cb, .strat-sel, .strat-inp").forEach(el => {
+    const evt = el.tagName === "SELECT" || el.type === "checkbox" ? "change" : "change";
+    el.addEventListener(evt, () => saveStrategyField(el));
+  });
+  tbody.querySelectorAll(".strat-reset-btn").forEach(btn => {
+    btn.addEventListener("click", () => resetStrategy(btn.dataset.broker));
+  });
+}
+
+async function saveStrategyField(el) {
+  const row = el.closest("tr");
+  const broker = row?.dataset.broker;
+  if (!broker) return;
+  const field = el.dataset.field;
+  let value;
+  if (el.type === "checkbox") value = el.checked ? 1 : 0;
+  else value = el.value;
+
+  const status = document.getElementById("strategy-save-status");
+  try {
+    const r = await fetch(`/api/alert-strategies/${encodeURIComponent(broker)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: value }),
+    });
+    const d = await r.json();
+    if (d.success) {
+      const idx = _strategiesCache.findIndex(s => s.broker === broker);
+      if (idx >= 0) _strategiesCache[idx] = d.strategy;
+      if (field === "enabled" || field === "mode") renderStrategies();
+      if (status) { status.textContent = `Saved ${broker}.${field}`; setTimeout(() => status.textContent = "", 2000); }
+    } else {
+      if (status) { status.textContent = `Error: ${d.error}`; status.style.color = "#f87171"; setTimeout(() => { status.textContent = ""; status.style.color = "#6b7280"; }, 3000); }
+    }
+  } catch (e) {
+    if (status) { status.textContent = `Network error`; status.style.color = "#f87171"; setTimeout(() => { status.textContent = ""; status.style.color = "#6b7280"; }, 3000); }
+  }
+}
+
+async function resetStrategy(broker) {
+  try {
+    const r = await fetch(`/api/alert-strategies/${encodeURIComponent(broker)}/reset`, { method: "POST" });
+    const d = await r.json();
+    if (d.success) {
+      const idx = _strategiesCache.findIndex(s => s.broker === broker);
+      if (idx >= 0) _strategiesCache[idx] = d.strategy;
+      renderStrategies();
+      const status = document.getElementById("strategy-save-status");
+      if (status) { status.textContent = `${broker} reset to defaults`; setTimeout(() => status.textContent = "", 2000); }
+    }
+  } catch (e) { console.warn("[strategy-reset]", e); }
+}
+
+async function loadAlerts() {
+  try {
+    const r = await fetch("/api/alerts?limit=200");
+    const d = await r.json();
+    if (d.success) { _alertsCache = d.alerts || []; renderAlerts(); }
+  } catch (e) { console.warn("[alerts-ui]", e); }
+}
+
+function renderAlerts() {
+  const tbody = document.getElementById("alerts-tbody");
+  const table = document.getElementById("alerts-table");
+  const empty = document.getElementById("alerts-empty");
+  const badge = document.getElementById("alerts-badge");
+  if (!tbody) return;
+
+  const brokerFilter = document.getElementById("alerts-filter-broker")?.value || "";
+  const actionFilter = document.getElementById("alerts-filter-action")?.value || "";
+
+  let rows = _alertsCache;
+  if (brokerFilter) rows = rows.filter(a => a.broker === brokerFilter);
+  if (actionFilter) rows = rows.filter(a => (a.action || "").startsWith(actionFilter));
+
+  const queuedCount = _alertsCache.filter(a => a.action === "queued" || a.action === "too-observed").length;
+  if (badge) {
+    if (queuedCount > 0) { badge.textContent = queuedCount; badge.style.display = "inline-block"; }
+    else { badge.style.display = "none"; }
+  }
+
+  if (!rows.length) {
+    table.style.display = "none";
+    empty.style.display = "";
+    empty.textContent = _alertsCache.length ? "No alerts match the current filter." : "No alerts received yet.";
+    return;
+  }
+  table.style.display = "";
+  empty.style.display = "none";
+
+  tbody.innerHTML = rows.map(a => {
+    const bc = BROKER_COLORS[a.broker] || "#6b7280";
+    const al = ACTION_LABELS[a.action] || ACTION_LABELS.rejected;
+    const actionText = a.action === "rejected" && a.action_reason
+      ? `REJ: ${a.action_reason.split(":")[0]}` : al.text;
+    const age = a.received_at ? timeAgo(a.received_at) : "";
+    return `<tr class="alert-row" data-id="${a.id}">
+      <td style="padding:5px 6px;white-space:nowrap;" title="${a.received_at || ""}">${age}</td>
+      <td style="padding:5px 6px;"><span class="alert-broker-dot" style="background:${bc};"></span>${a.broker || "?"}</td>
+      <td style="padding:5px 6px;color:#93c5fd;">${a.trigger_id || "—"}</td>
+      <td style="padding:5px 6px;text-align:right;font-family:monospace;">${fmtDeg(a.ra)}</td>
+      <td style="padding:5px 6px;text-align:right;font-family:monospace;">${fmtDeg(a.dec)}</td>
+      <td style="padding:5px 6px;text-align:right;">${a.err_deg != null ? (a.err_deg < 0.01667 ? (a.err_deg*3600).toFixed(0)+"″" : (a.err_deg*60).toFixed(1)+"′") : "—"}</td>
+      <td style="padding:5px 6px;text-align:right;">${fmtDeg1(a.alt_now)}</td>
+      <td style="padding:5px 6px;text-align:right;">${fmtDeg1(a.moon_sep)}</td>
+      <td style="padding:5px 6px;text-align:center;"><span class="alert-action-pill ${al.cls}">${actionText}</span></td>
+      <td style="padding:5px 6px;"><button class="btn-small alert-detail-btn" data-id="${a.id}">Detail</button></td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll(".alert-detail-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => { e.stopPropagation(); openAlertDetail(Number(btn.dataset.id)); });
+  });
+}
+
+function timeAgo(utcStr) {
+  const d = new Date(utcStr + (utcStr.endsWith("Z") ? "" : "Z"));
+  const sec = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (sec < 60)    return sec + "s ago";
+  if (sec < 3600)  return Math.floor(sec / 60) + "m ago";
+  if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
+  return Math.floor(sec / 86400) + "d ago";
+}
+
+async function openAlertDetail(id) {
+  const modal = document.getElementById("alert-detail-modal");
+  const title = document.getElementById("alert-detail-title");
+  const tbody = document.getElementById("alert-detail-tbody");
+  const rawEl = document.getElementById("alert-detail-raw");
+  const qBtn  = document.getElementById("alert-detail-queue");
+  const iBtn  = document.getElementById("alert-detail-ignore");
+  if (!modal) return;
+  try {
+    const r = await fetch(`/api/alerts/${id}`);
+    const d = await r.json();
+    if (!d.success || !d.alert) return;
+    const a = d.alert;
+    title.textContent = `${a.broker || "?"} — ${a.trigger_id || "Alert #" + a.id}`;
+    const kv = [
+      ["Received", a.received_at], ["Event time", a.event_time], ["Broker", a.broker],
+      ["Topic", a.topic], ["Trigger ID", a.trigger_id], ["Classification", a.classification],
+      ["RA (deg)", fmtDeg(a.ra, 5)], ["Dec (deg)", fmtDeg(a.dec, 5)],
+      ["Error radius", a.err_deg != null ? (a.err_deg*60).toFixed(2)+"′" : "—"],
+      ["Altitude", fmtDeg1(a.alt_now)], ["Moon sep", fmtDeg1(a.moon_sep)],
+      ["Action", a.action], ["Reason", a.action_reason || "—"],
+      ["AstroColibri ID", a.colibri_id || "—"],
+    ];
+    tbody.innerHTML = kv.map(([k,v]) =>
+      `<tr><td style="color:#6b7280;padding:4px 10px 4px 0;white-space:nowrap;">${k}</td><td style="color:#e2e8f0;padding:4px 0;">${v||"—"}</td></tr>`
+    ).join("");
+    try { rawEl.textContent = JSON.stringify(JSON.parse(a.raw), null, 2); }
+    catch { rawEl.textContent = a.raw || "(empty)"; }
+    const canQueue = (a.action !== "queued" && a.action !== "manual" && a.action !== "too-observed") && a.ra != null;
+    qBtn.style.display = canQueue ? "" : "none";
+    iBtn.style.display = a.action !== "ignored" ? "" : "none";
+    qBtn.onclick = async () => { await fetch(`/api/alerts/${id}/queue`, { method: "POST" }); modal.style.display = "none"; loadAlerts(); };
+    iBtn.onclick = async () => { await fetch(`/api/alerts/${id}/ignore`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason: "operator-dismissed" }) }); modal.style.display = "none"; loadAlerts(); };
+    modal.style.display = "";
+  } catch (e) { console.warn("[alert-detail]", e); }
+}
+
+document.getElementById("alert-detail-close")?.addEventListener("click", () => { document.getElementById("alert-detail-modal").style.display = "none"; });
+document.getElementById("alert-detail-modal")?.addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.style.display = "none"; });
+document.getElementById("alerts-refresh")?.addEventListener("click", loadAlerts);
+document.getElementById("alerts-filter-broker")?.addEventListener("change", renderAlerts);
+document.getElementById("alerts-filter-action")?.addEventListener("change", renderAlerts);
+
+function startAlertsAutoRefresh() { stopAlertsAutoRefresh(); const cb = document.getElementById("alerts-auto-refresh"); if (cb?.checked) _alertsAutoTimer = setInterval(loadAlerts, 30000); }
+function stopAlertsAutoRefresh() { if (_alertsAutoTimer) { clearInterval(_alertsAutoTimer); _alertsAutoTimer = null; } }
+document.getElementById("alerts-auto-refresh")?.addEventListener("change", (e) => { if (e.target.checked) startAlertsAutoRefresh(); else stopAlertsAutoRefresh(); });
+
+loadAlerts();
+loadAlertConfig();
+loadStrategies();
+startAlertsAutoRefresh();
