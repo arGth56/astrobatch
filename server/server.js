@@ -12,12 +12,13 @@ const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
 
-function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false) {
+function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false, force_fresh = false) {
   return new Promise((resolve, reject) => {
     const payload = { job_id, fits_dir, target };
     if (selected_files && selected_files.length) payload.selected_files = selected_files;
     if (target_filter) payload.target_filter = target_filter;
     if (manual_selection) payload.manual_selection = true;
+    if (force_fresh) payload.force_fresh = true;
     // When the fits_dir is a SNAPSHOT folder, pass the target name as object_filter
     // so only frames matching that OBJECT header are processed (not all mixed targets).
     if (fits_dir && path.basename(fits_dir).toUpperCase() === "SNAPSHOT" && target) {
@@ -2096,6 +2097,45 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       }
     }
 
+    const MAX_ACCEPTABLE_OFFSET = 120;
+    if (lastErrArcsec !== null && lastErrArcsec > MAX_ACCEPTABLE_OFFSET) {
+      seqLog(`  ⚠ Centering offset ${lastErrArcsec}" exceeds ${MAX_ACCEPTABLE_OFFSET}" — plate solve may have failed. Retrying...`, "warn");
+      try {
+        await callNinaLong(target, "/v2/api/equipment/mount/slew", {
+          ra: raDeg, dec: decDeg, waitForResult: true, center: true, name,
+        }, 10 * 60 * 1000);
+      } catch { /* best effort */ }
+
+      const retryDeadline = Date.now() + 3 * 60 * 1000;
+      let retryStable = 0;
+      let retryErr = null;
+      while (Date.now() < retryDeadline) {
+        checkAbort();
+        await new Promise(r => setTimeout(r, POLL_INTERVAL));
+        const { equipmentInfo: ei2 } = await getEquipmentInfo(target);
+        const m2 = ei2?.Mount;
+        if (!m2) continue;
+        if (m2.RightAscension != null && m2.Declination != null) {
+          retryErr = _angularSepArcsec(m2.RightAscension * 15, m2.Declination, raDeg, decDeg);
+          const rr = Math.round(retryErr);
+          seqLog(`  Retry centering: offset ${rr}"  (Slewing=${m2.Slewing})`);
+          seqState.currentStep = `Retry centering ${name} — offset ${rr}"`;
+        }
+        if (m2.Slewing === true) { retryStable = 0; } else {
+          retryStable += POLL_INTERVAL;
+          if (retryStable >= SETTLE_STABLE) break;
+        }
+      }
+      const finalRetryErr = retryErr !== null ? Math.round(retryErr) : null;
+      if (finalRetryErr !== null && finalRetryErr > MAX_ACCEPTABLE_OFFSET) {
+        seqLog(`  ✗ Centering failed: offset ${finalRetryErr}" after retry (>${MAX_ACCEPTABLE_OFFSET}"). Falling back to blind slew.`, "error");
+        await plainSlew();
+      } else {
+        lastErrArcsec = finalRetryErr;
+        seqLog(`  Retry centering converged ✓  offset ${finalRetryErr}"`);
+      }
+    }
+
     const finalErrTxt = lastErrArcsec !== null ? `  final offset ${lastErrArcsec}"` : "";
     seqLog(`Slew + centering complete ✓${finalErrTxt}`);
   } else {
@@ -2185,7 +2225,15 @@ function normCoverState(raw) {
   return map[String(raw).toLowerCase().trim()] ?? 100;
 }
 
+function isCoverDisabled() {
+  return getSetting("coverDisabled", "false") === "true";
+}
+
 async function stepOpenCover(target) {
+  if (isCoverDisabled()) {
+    seqLog("Dust cover disabled (maintenance mode) — skipping open");
+    return;
+  }
   seqState.currentStep = "Opening dust cover...";
   seqLog("Opening dust cover...");
   await ensureFlatDeviceConnected(target);
@@ -2206,6 +2254,10 @@ async function stepOpenCover(target) {
 }
 
 async function stepCloseCover(target, { strict = true } = {}) {
+  if (isCoverDisabled()) {
+    seqLog("Dust cover disabled (maintenance mode) — skipping close");
+    return true;
+  }
   seqState.currentStep = "Closing dust cover...";
   seqLog("Closing dust cover...");
   await ensureFlatDeviceConnected(target);
@@ -2849,15 +2901,17 @@ async function runSequence(ninaConfig, seqConfig) {
   async function safeHome() {
     seqState.currentStep = "Homing mount...";
     try {
-      // FindHome is skipped when AtHome=true, and blocked when AtPark=true.
-      // Unpark in both cases to let FindHome execute physically.
       const { equipmentInfo: preInfo } = await getEquipmentInfo(ninaConfig);
       const mountPre = preInfo?.Mount;
-      if (mountPre?.AtPark === true || mountPre?.AtHome === true) {
-        const reason = mountPre.AtPark ? "parked" : "already at home flag";
-        seqLog(`  Mount ${reason} — unparking before FindHome...`);
+
+      if (mountPre?.AtHome === true && mountPre?.AtPark !== true) {
+        seqLog("Mount already at home ✓");
+        return;
+      }
+
+      if (mountPre?.AtPark === true) {
+        seqLog(`  Mount parked — unparking before FindHome...`);
         await callNinaLong(ninaConfig, "/v2/api/equipment/mount/unpark", {}, 30000);
-        // Poll until actually unparked (up to 20 s)
         const deadline2 = Date.now() + 20000;
         while (Date.now() < deadline2) {
           await new Promise(r => setTimeout(r, 1500));
@@ -2866,25 +2920,22 @@ async function runSequence(ninaConfig, seqConfig) {
         }
       }
 
-      // Trigger the (non-blocking) FindHome
       seqLog("  Sending FindHome command...");
       const result = await callNinaLong(ninaConfig, "/v2/api/equipment/mount/home", {}, 15000);
       const resp = result.body?.Response ?? "";
       seqLog(`  Home command accepted: ${resp}`);
 
-      // If NINA says the mount was already homed (skipped physical movement),
-      // accept immediately — the unpark cleared AtHome but the mount didn't move.
       if (typeof resp === "string" && /already.?hom/i.test(resp)) {
         seqLog("Mount homed ✓ (already at home position)");
         return;
       }
 
-      // Poll until the mount is no longer slewing AND AtHome is true
       const HOME_TIMEOUT = 5 * 60 * 1000;
       const POLL_INTERVAL = 3000;
       const deadline = Date.now() + HOME_TIMEOUT;
 
       while (Date.now() < deadline) {
+        try { checkAbort(); } catch { seqLog("  Home interrupted by abort — stopping", "warn"); return; }
         await new Promise(r => setTimeout(r, POLL_INTERVAL));
         const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
         const m = equipmentInfo?.Mount;
@@ -4904,7 +4955,7 @@ app.get("/api/pipeline/result/:id/download", (req, res) => {
 });
 
 app.post("/api/pipeline/trigger", async (req, res) => {
-  const { fits_dir, target, filter, exposure, selected_files, target_filter, manual_selection } = req.body;
+  const { fits_dir, target, filter, exposure, selected_files, target_filter, manual_selection, force_fresh } = req.body;
   if (!fits_dir) return res.status(400).json({ success: false, error: "fits_dir is required" });
 
   const result = db.prepare(
@@ -4913,7 +4964,7 @@ app.post("/api/pipeline/trigger", async (req, res) => {
 
   const job_id = result.lastInsertRowid;
 
-  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null, !!manual_selection)
+  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null, !!manual_selection, !!force_fresh)
     .then((svc) => {
       if (!svc.success) {
         db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")

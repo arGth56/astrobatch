@@ -549,6 +549,10 @@
               <input type="checkbox" id="pipeline-manual-select" />
               Select frames manually
             </label>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;" title="Re-copy source files from NAS and process in a fresh working directory (ignores previous results)">
+              <input type="checkbox" id="pipeline-force-fresh" />
+              Force fresh
+            </label>
             <button type="submit" id="pipeline-trigger-btn">&#9654; Trigger</button>
           </form>
           <p style="font-size:12px;color:#6b7280;margin:-8px 0 12px;">
@@ -948,6 +952,16 @@
               <span id="mount-monitor-text" style="color:#94a3b8;">Park monitor: —</span>
               <span id="mount-monitor-last" style="color:#475569;font-size:12px;margin-left:auto;"></span>
             </div>
+          </div>
+
+          <!-- Maintenance -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Maintenance</h3>
+          <div class="inline-form" style="margin-bottom:12px;align-items:center;gap:10px;">
+            <label class="seq-toggle-label" style="align-self:center;" title="Disable all automatic dust cover open/close operations (for maintenance)">
+              <input id="set-cover-disabled" type="checkbox" />
+              Disable dust cover (maintenance mode)
+            </label>
           </div>
         </div>
 

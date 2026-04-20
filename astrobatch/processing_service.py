@@ -386,14 +386,19 @@ def scan_fits(fits_dir: Path, jlog: JobLogger,
 
 def prepare_work_dir(target: str, filt: str, exp_str: str, date_str: str,
                      files: list[Path], jlog: JobLogger,
-                     clean_first: bool = False) -> Path:
+                     clean_first: bool = False,
+                     run_tag: str | None = None) -> Path:
     """Copy raw files into the work tree and return the folder path.
 
     When clean_first=True (re-process a subset), remove existing science FITS
     from the work dir so only the selected files are present for Siril.
     Uses up to 4 parallel copy threads to saturate NAS bandwidth.
+
+    When run_tag is set (force-fresh mode), the exposure leaf folder gets a
+    unique suffix so multiple runs produce isolated working directories.
     """
-    work_folder = DATA_DIR / date_str / target / filt / f"{exp_str}s"
+    exp_leaf = f"{exp_str}s" if not run_tag else f"{exp_str}s_run{run_tag}"
+    work_folder = DATA_DIR / date_str / target / filt / exp_leaf
     work_folder.mkdir(parents=True, exist_ok=True)
 
     if clean_first:
@@ -972,13 +977,14 @@ def _detect_date(fits_path: Path) -> str:
 def run_pipeline(job_id: int, fits_dir: str, target: str,
                  selected_files: list[str] | None = None,
                  object_filter: str | None = None,
-                 manual_selection: bool = False):
+                 manual_selection: bool = False,
+                 force_fresh: bool = False):
     """Full pipeline — runs in a background thread."""
     jlog = JobLogger(job_id)
     try:
         _run_pipeline(job_id, fits_dir, target, jlog,
                       selected_files=selected_files, object_filter=object_filter,
-                      manual_selection=manual_selection)
+                      manual_selection=manual_selection, force_fresh=force_fresh)
     except Exception as exc:
         log.exception("Unhandled exception in job %s", job_id)
         jlog.error(f"UNHANDLED EXCEPTION: {exc}")
@@ -1280,8 +1286,10 @@ def _manual_selection_pause(
 def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
                   selected_files: list[str] | None = None,
                   object_filter: str | None = None,
-                  manual_selection: bool = False):
+                  manual_selection: bool = False,
+                  force_fresh: bool = False):
     update_job(job_id, "running")
+    run_tag = str(job_id) if force_fresh else None
     # Persist the manual_selection flag so recovery can re-queue correctly
     if manual_selection:
         try:
@@ -1297,6 +1305,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         jlog.info(f"Selected  : {len(selected_files)} specific file(s)")
     if manual_selection:
         jlog.info("Manual selection mode — will pause before stacking for frame review")
+    if force_fresh:
+        jlog.info(f"Force-fresh mode — using isolated work dir (run{job_id})")
 
     # Purge any stale result rows from a previous run of this job so we start
     # with a clean slate — avoids ghost errors in the UI from old failures.
@@ -1371,7 +1381,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         # ── Step 2: Copy to work dir ──────────────────────────────────────────
         update_job(job_id, "splitting")
         work_dir = prepare_work_dir(obj, filt, exp_str, date_str, files, jlog,
-                                    clean_first=selected_files is not None or manual_selection)
+                                    clean_first=force_fresh or selected_files is not None or manual_selection,
+                                    run_tag=run_tag)
 
         # ── Step 3: Calibrate + Stack ─────────────────────────────────────────
         update_job(job_id, "calibrating")
@@ -1665,6 +1676,7 @@ def trigger():
     # object_filter: when set, only FITS files whose OBJECT header matches this
     # name are processed — prevents SNAPSHOT dirs from processing all targets.
     object_filter  = data.get("object_filter") or None
+    force_fresh    = bool(data.get("force_fresh"))
 
     if not job_id or not fits_dir:
         return jsonify({"success": False, "error": "job_id and fits_dir are required"}), 400
@@ -1677,8 +1689,9 @@ def trigger():
     enqueued = _enqueue_job(
         int(job_id),
         lambda jid=int(job_id), fd=fits_dir, t=target,
-               sf=selected_files, of=object_filter, ms=manual_sel:
-        run_pipeline(jid, fd, t, selected_files=sf, object_filter=of, manual_selection=ms)
+               sf=selected_files, of=object_filter, ms=manual_sel, ff=force_fresh:
+        run_pipeline(jid, fd, t, selected_files=sf, object_filter=of,
+                     manual_selection=ms, force_fresh=ff)
     )
     if not enqueued:
         return jsonify({"success": True, "job_id": job_id,

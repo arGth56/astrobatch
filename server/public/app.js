@@ -781,6 +781,21 @@ tabSettingsBtn.addEventListener("click", () => {
   loadWatchdogConfig();
   loadArbiterConfig();
   startWatchdogPolling();
+  loadCoverDisabled();
+});
+
+async function loadCoverDisabled() {
+  try {
+    const res = await fetch("/api/settings/coverDisabled");
+    const data = await res.json();
+    document.getElementById("set-cover-disabled").checked = data.value === "true";
+  } catch { /* ignore */ }
+}
+
+document.getElementById("set-cover-disabled").addEventListener("change", async (e) => {
+  try {
+    await postJson("/api/settings", { key: "coverDisabled", value: e.target.checked ? "true" : "false" });
+  } catch { /* ignore */ }
 });
 
 document.getElementById("target-lookup-form").addEventListener("submit", async (event) => {
@@ -3135,6 +3150,7 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
   const fits_dir       = document.getElementById("pipeline-fits-dir").value.trim();
   const target         = document.getElementById("pipeline-target").value.trim();
   const manualSelectCb = document.getElementById("pipeline-manual-select");
+  const forceFreshCb   = document.getElementById("pipeline-force-fresh");
   if (!fits_dir) return;
   const btn = document.getElementById("pipeline-trigger-btn");
   btn.disabled = true;
@@ -3148,6 +3164,7 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
       target: target || null,
       target_filter: isSnapshot ? (selOpt.dataset.name || target || null) : null,
       manual_selection: manualSelectCb?.checked ? true : undefined,
+      force_fresh: forceFreshCb?.checked ? true : undefined,
     });
     setLog(result);
     document.getElementById("pipeline-target").value = "";
