@@ -4014,11 +4014,12 @@ const BROKER_COLORS = {
 };
 
 const ACTION_LABELS = {
-  queued:         { text: "QUEUED",   cls: "alert-action-queued"   },
-  rejected:       { text: "REJECTED", cls: "alert-action-rejected" },
-  manual:         { text: "MANUAL",   cls: "alert-action-manual"   },
-  ignored:        { text: "IGNORED",  cls: "alert-action-ignored"  },
-  "too-observed": { text: "ToO OBS",  cls: "alert-action-too"      },
+  queued:           { text: "QUEUED",   cls: "alert-action-queued"      },
+  rejected:         { text: "REJECTED", cls: "alert-action-rejected"    },
+  "no-position":    { text: "NO POS",   cls: "alert-action-no-position" },
+  manual:           { text: "MANUAL",   cls: "alert-action-manual"      },
+  ignored:          { text: "IGNORED",  cls: "alert-action-ignored"     },
+  "too-observed":   { text: "ToO OBS",  cls: "alert-action-too"         },
 };
 
 function fmtDeg(v, prec = 3) { return v != null ? Number(v).toFixed(prec) : "—"; }
@@ -4251,7 +4252,10 @@ function renderAlerts() {
     const bc = BROKER_COLORS[a.broker] || "#6b7280";
     const al = ACTION_LABELS[a.action] || ACTION_LABELS.rejected;
     const actionText = a.action === "rejected" && a.action_reason
-      ? `REJ: ${a.action_reason.split(":")[0]}` : al.text;
+      ? `REJ: ${a.action_reason.split(":")[0]}`
+      : a.action === "no-position" && a.action_reason
+        ? `NO POS`
+        : al.text;
     const age = a.received_at ? timeAgo(a.received_at) : "";
     return `<tr class="alert-row" data-id="${a.id}">
       <td style="padding:5px 6px;white-space:nowrap;" title="${a.received_at || ""}">${age}</td>

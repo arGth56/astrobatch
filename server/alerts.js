@@ -327,7 +327,8 @@ function startGcnListener(opts) {
       getMountSite, computeAltAz,
     });
 
-    let action = "rejected";
+    // "no-coords" means the notice has no position (e.g. GRM spectrometer) — distinct from "rejected by criteria"
+    let action = decision.reason === "no-coords" ? "no-position" : "rejected";
     let action_reason = decision.reason || null;
     const stratMode = strategy?.mode || "too";
 

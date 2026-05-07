@@ -1139,11 +1139,12 @@ td:last-child {
   display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
   letter-spacing: 0.04em; padding: 2px 8px; border-radius: 4px; white-space: nowrap;
 }
-.alert-action-queued   { background: #065f46; color: #6ee7b7; }
-.alert-action-rejected { background: #7f1d1d; color: #fca5a5; }
-.alert-action-manual   { background: #1e3a5f; color: #93c5fd; }
-.alert-action-ignored  { background: #1e293b; color: #6b7280; }
-.alert-action-too      { background: #4c1d95; color: #c4b5fd; }
+.alert-action-queued      { background: #065f46; color: #6ee7b7; }
+.alert-action-rejected    { background: #7f1d1d; color: #fca5a5; }
+.alert-action-no-position { background: #78350f; color: #fcd34d; }
+.alert-action-manual      { background: #1e3a5f; color: #93c5fd; }
+.alert-action-ignored     { background: #1e293b; color: #6b7280; }
+.alert-action-too         { background: #4c1d95; color: #c4b5fd; }
 
 .alert-row { transition: background .15s; }
 .alert-row:hover { background: rgba(59, 130, 246, 0.08); }
