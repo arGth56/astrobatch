@@ -56,10 +56,9 @@ const TOPICS = [
   "gcn.classic.text.SNEWS",
   // Einstein Probe (JSON)
   "gcn.notices.einstein_probe.wxt.alert",
-  // SVOM (VOEvent XML)
+  // SVOM (VOEvent XML) — GRM omitted: spectrometer, never carries coordinates
   "gcn.notices.svom.voevent.eclairs",
   "gcn.notices.svom.voevent.mxt",
-  "gcn.notices.svom.voevent.grm",
 ];
 
 // ── DB table ────────────────────────────────────────────────────────────────
