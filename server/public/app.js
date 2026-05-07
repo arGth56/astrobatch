@@ -2946,29 +2946,27 @@ function renderPipelineJobs(jobs) {
         return;
       }
 
-      // Bust cache if it has no subtraction data — re-fetch to get the full result
-      if (_photCache[taskId] && !_photCache[taskId].sub && !_photCache[taskId].sub_ul) {
-        delete _photCache[taskId];
-      }
+      // Always force a live re-fetch from STDWeb when the user clicks the
+      // measure button — they may have just changed photometry params on
+      // STDWeb (color term, S/N threshold, catalog, …) and want the new
+      // numbers, not whatever we cached earlier.
+      delete _photCache[taskId];
 
-      // Fetch if not yet cached
       const cell = photRow.querySelector("td");
-      if (!_photCache[taskId]) {
-        btn.disabled = true;
-        btn.textContent = "⏳";
-        cell.textContent = "Fetching…";
-        photRow.style.display = "";
+      btn.disabled = true;
+      btn.textContent = "⏳";
+      cell.textContent = "Fetching live from STDWeb…";
+      photRow.style.display = "";
 
-        try {
-          const resp = await fetch(`/api/stdweb/task/${taskId}/photometry`);
-          _photCache[taskId] = await resp.json();
-        } catch (e) {
-          cell.textContent = `Error: ${e.message}`;
-          btn.disabled = false; btn.textContent = "📊";
-          return;
-        }
+      try {
+        const resp = await fetch(`/api/stdweb/task/${taskId}/photometry?refresh=1`);
+        _photCache[taskId] = await resp.json();
+      } catch (e) {
+        cell.textContent = `Error: ${e.message}`;
         btn.disabled = false; btn.textContent = "📊";
+        return;
       }
+      btn.disabled = false; btn.textContent = "📊";
 
       const resultObj = jobs.flatMap(j => j.results || []).find(x => String(x.id) === String(rid));
       _renderPhotRow(photRow, _photCache[taskId], resultObj);
@@ -3151,6 +3149,8 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
   const target         = document.getElementById("pipeline-target").value.trim();
   const manualSelectCb = document.getElementById("pipeline-manual-select");
   const forceFreshCb   = document.getElementById("pipeline-force-fresh");
+  const useColorCb     = document.getElementById("pipeline-use-color");
+  const refineWcsCb    = document.getElementById("pipeline-refine-wcs");
   if (!fits_dir) return;
   const btn = document.getElementById("pipeline-trigger-btn");
   btn.disabled = true;
@@ -3165,6 +3165,8 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
       target_filter: isSnapshot ? (selOpt.dataset.name || target || null) : null,
       manual_selection: manualSelectCb?.checked ? true : undefined,
       force_fresh: forceFreshCb?.checked ? true : undefined,
+      use_color: !!useColorCb?.checked,
+      refine_wcs: !!refineWcsCb?.checked,
     });
     setLog(result);
     document.getElementById("pipeline-target").value = "";

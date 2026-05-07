@@ -484,12 +484,15 @@ def finalise_work_dir(work_dir: Path, date_str: str, target: str,
 # ── Siril calibration + stacking ──────────────────────────────────────────────
 
 def _run_siril_script(siril_exe: str, script_path: Path, folder: Path,
-                      label: str, jlog: JobLogger) -> tuple[bool, bool]:
+                      label: str, jlog: JobLogger,
+                      job_id: int | None = None) -> tuple[bool, bool]:
     """
     Execute a Siril script, stream output to jlog.
     Returns (success, no_stars) — no_stars=True when registration failed
     specifically because no stars were found in the reference frame.
+    If job_id is given, checks for cancellation and kills the process.
     """
+    global _current_siril_proc
     jlog.info(f"  Siril script ({label}): {script_path}")
     jlog.info("  --- Siril output ---")
     no_stars = False
@@ -503,17 +506,29 @@ def _run_siril_script(siril_exe: str, script_path: Path, folder: Path,
             text=True,
             env=env,
         )
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                jlog.info(f"  [siril] {line}")
-                if "not enough stars" in line.lower() or "found 0 stars" in line.lower():
-                    no_stars = True
-        proc.wait()
+        _current_siril_proc = proc
+        try:
+            for line in proc.stdout:
+                if job_id is not None:
+                    check_cancelled(job_id)
+                line = line.rstrip()
+                if line:
+                    jlog.info(f"  [siril] {line}")
+                    if "not enough stars" in line.lower() or "found 0 stars" in line.lower():
+                        no_stars = True
+            proc.wait()
+        except JobCancelled:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            _current_siril_proc = None
         jlog.info("  --- Siril end ---")
         if proc.returncode != 0:
             jlog.error(f"  Siril exited with code {proc.returncode}")
             return False, no_stars
+    except JobCancelled:
+        raise
     except Exception as exc:
         jlog.error(f"  Siril launch error: {exc}")
         return False, no_stars
@@ -596,7 +611,8 @@ def generate_frame_previews(folder: Path, jlog: JobLogger,
 def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
               n_images: int, jlog: JobLogger,
               source_files: list[Path] | None = None,
-              skip_quality_filters: bool = False) -> tuple[bool, list[dict]]:
+              skip_quality_filters: bool = False,
+              job_id: int | None = None) -> tuple[bool, list[dict]]:
     """
     Calibrate + stack with Siril.
     skip_quality_filters: when True (manual selection mode), omit -filter-fwhm / -filter-round
@@ -651,7 +667,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
         lines = ["requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
                  cal_cmd, "load pp_i_00001", "save res"]
         script_path.write_text("\n".join(lines) + "\n")
-        ok, _ = _run_siril_script(siril_exe, script_path, folder, "single-frame", jlog)
+        ok, _ = _run_siril_script(siril_exe, script_path, folder, "single-frame", jlog, job_id=job_id)
         if not ok:
             return False, []
 
@@ -672,7 +688,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
             "save res",
         ]
         script_path.write_text("\n".join(lines) + "\n")
-        ok, no_stars = _run_siril_script(siril_exe, script_path, folder, "calibrate+register+stack", jlog)
+        ok, no_stars = _run_siril_script(siril_exe, script_path, folder, "calibrate+register+stack", jlog, job_id=job_id)
 
         if not ok:
             if no_stars:
@@ -702,7 +718,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                     ]
                     retry_script.write_text("\n".join(retry_lines) + "\n")
                     ok, no_stars = _run_siril_script(
-                        siril_exe, retry_script, folder, f"register+stack (ref={ref_n})", jlog
+                        siril_exe, retry_script, folder, f"register+stack (ref={ref_n})", jlog, job_id=job_id
                     )
                     if ok or not no_stars:
                         break   # success, or different failure reason
@@ -730,7 +746,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                         for seq in folder.glob("*.seq"):
                             seq.unlink(missing_ok=True)
                         ok, _ = _run_siril_script(
-                            siril_exe, fallback_script, folder, "single-frame fallback", jlog
+                            siril_exe, fallback_script, folder, "single-frame fallback", jlog, job_id=job_id
                         )
                         fallback_script.unlink(missing_ok=True)
                         if ok:
@@ -872,14 +888,20 @@ def stdweb_upload(res_fit: Path, title: str, jlog: JobLogger,
     """Upload res.fit to STDWeb. Returns task_id or None."""
     jlog.info(f"  Uploading to STDWeb: {title}" + (f" (target={target})" if target else ""))
     try:
+        # Do NOT pass do_inspect=true / do_photometry=true here. The pipeline
+        # explicitly POSTs each action below (inspect → photometry → subtraction)
+        # with our chosen parameters. Auto-triggering at upload time also fires
+        # those steps with STDWeb defaults, which then makes the explicit POSTs
+        # fail with HTTP 400 ("already running") and leaves wait_state polling
+        # for a state STDWeb has already moved past.
         cmd = [
             "curl", "-s",
             "-H", f"Authorization: Token {STDWEB_TOKEN}",
             "-F", f"file=@{res_fit}",
             "-F", f"title={title}",
             "-F", f"gain={STDWEB_GAIN}",
-            "-F", "do_inspect=true",
-            "-F", "do_photometry=true",
+            "-F", "do_inspect=false",
+            "-F", "do_photometry=false",
         ]
         if target:
             cmd += ["-F", f"target={target}"]
@@ -937,18 +959,56 @@ def stdweb_action(task_id: str, action: str, jlog: JobLogger,
             json=payload,
             timeout=30,
         )
-        jlog.info(f"  {action} → HTTP {r.status_code}")
-        return r.status_code < 400
+        if r.status_code < 400:
+            jlog.info(f"  {action} → HTTP {r.status_code}")
+            return True
+        # Surface the response body so 400 errors aren't silently swallowed.
+        body = (r.text or "").strip().replace("\n", " ")[:300]
+        jlog.warning(f"  {action} → HTTP {r.status_code} body={body}")
+        return False
     except Exception as exc:
         jlog.error(f"STDWeb action {action} error: {exc}")
         return False
 
 
+# Linear progression of STDWeb task states. Used by wait_state so we don't
+# get stuck polling for an earlier state when the task has already advanced
+# past it (e.g. user clicked a later step manually, or auto-trigger raced us).
+_STDWEB_PROGRESS = [
+    "running", "uploaded",
+    "inspecting", "inspect_done",
+    "photometry", "photometry_done",
+    "subtraction", "subtraction_done",
+    "done", "completed",
+]
+
+
+def _state_index(state: str) -> int:
+    try:
+        return _STDWEB_PROGRESS.index(state)
+    except ValueError:
+        return -1
+
+
 def wait_state(task_id: str, target_states: list[str],
-               jlog: JobLogger, timeout: int = 300) -> str:
-    """Poll STDWeb task until it reaches one of target_states. Returns final state."""
+               jlog: JobLogger, timeout: int = 300,
+               job_id: int | None = None) -> str:
+    """Poll STDWeb task until it reaches a target_state OR has advanced past it.
+
+    target_states is a mix of "success" states (in _STDWEB_PROGRESS) and failure
+    states ("inspect_failed", "failed", "error"). The success target is the
+    minimum progression we need; if the task is already at-or-past that point
+    we return the current state immediately. Returns "timeout" if neither
+    condition is reached before the deadline.
+    """
     deadline = time.time() + timeout
+    success_targets = [t for t in target_states if _state_index(t) >= 0]
+    fail_targets    = [t for t in target_states if _state_index(t) < 0]
+    min_idx = min((_state_index(t) for t in success_targets), default=-1)
+    last_state = None
     while time.time() < deadline:
+        if job_id is not None:
+            check_cancelled(job_id)
         try:
             r = requests.get(
                 f"{STDWEB_URL}/api/tasks/{task_id}/",
@@ -956,7 +1016,14 @@ def wait_state(task_id: str, target_states: list[str],
                 timeout=15,
             )
             state = r.json().get("state", "unknown")
+            if state != last_state:
+                jlog.info(f"  task {task_id} state: {state}")
+                last_state = state
+            if state in fail_targets:
+                return state
             if state in target_states:
+                return state
+            if min_idx >= 0 and _state_index(state) >= min_idx:
                 return state
         except Exception:
             pass
@@ -985,6 +1052,9 @@ def run_pipeline(job_id: int, fits_dir: str, target: str,
         _run_pipeline(job_id, fits_dir, target, jlog,
                       selected_files=selected_files, object_filter=object_filter,
                       manual_selection=manual_selection, force_fresh=force_fresh)
+    except JobCancelled:
+        jlog.info("Job cancelled by user")
+        update_job(job_id, "error", error="Cancelled by user")
     except Exception as exc:
         log.exception("Unhandled exception in job %s", job_id)
         jlog.error(f"UNHANDLED EXCEPTION: {exc}")
@@ -1023,6 +1093,9 @@ def resume_pipeline(result_id: int, from_step: str):
     jlog = JobLogger(job_id)
     try:
         _resume_pipeline(result, job, from_step, jlog)
+    except JobCancelled:
+        jlog.info("Job cancelled by user")
+        update_job(job_id, "error", error="Cancelled by user")
     except Exception as exc:
         log.exception("Unhandled exception resuming result %s from %s", result_id, from_step)
         jlog.error(f"UNHANDLED EXCEPTION: {exc}")
@@ -1038,9 +1111,15 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
     exp_str   = result["exposure"] or "?"
     obj       = result["target"] or job["target"] or "unknown"
     date_str  = result.get("obs_date") or _detect_date(Path(job["fits_dir"]))
+    use_color  = bool(job.get("use_color"))
+    refine_wcs = bool(job.get("refine_wcs")) if job.get("refine_wcs") is not None else True
 
     jlog.info(f"=== Resuming result {result_id} from step '{from_step}' ===")
     jlog.info(f"  object={obj}  filter={filt}  exp={exp_str}s")
+    if use_color:
+        jlog.info("  Color term enabled — photometry will be triggered with use_color=true")
+    if refine_wcs:
+        jlog.info("  Refine astrometry enabled — photometry will be triggered with refine_wcs=true")
 
     # Clear previous error explicitly and reset job to running
     try:
@@ -1075,7 +1154,7 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
         update_result(result_id, "calibrating")
         update_job(job_id, "calibrating")
         ok, frame_previews = run_siril(work_dir, flat_path, dark_path, len(files), jlog,
-                                       source_files=files)
+                                       source_files=files, job_id=job_id)
         if not ok:
             err_msg = "No stars found — see frame previews" if frame_previews else "Siril calibration failed"
             update_result(result_id, "error", error=err_msg,
@@ -1140,7 +1219,7 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
         update_result(result_id, "inspecting")
         jlog.info("Triggering inspection…")
         stdweb_action(task_id, "inspect", jlog)
-        state = wait_state(task_id, ["inspect_done", "inspect_failed", "failed", "error"], jlog, timeout=300)
+        state = wait_state(task_id, ["inspect_done", "inspect_failed", "failed", "error"], jlog, timeout=300, job_id=job_id)
         jlog.info(f"  Inspection state: {state}")
         if state in ("inspect_failed", "failed", "error", "timeout"):
             update_result(result_id, "error", error=f"Inspection {state}")
@@ -1151,19 +1230,27 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
 
     # ── photometry ────────────────────────────────────────────────────────────
     if step_idx <= PIPELINE_STEP_ORDER.index("photometry"):
+        check_cancelled(job_id)
         update_result(result_id, "photometry")
         jlog.info("Triggering photometry…")
-        stdweb_action(task_id, "photometry", jlog)
-        wait_state(task_id, ["photometry_done", "done", "completed", "failed", "error"], jlog, timeout=600)
+        phot_extra = {}
+        if use_color:
+            phot_extra["use_color"] = True
+        if refine_wcs:
+            phot_extra["refine_wcs"] = True
+        stdweb_action(task_id, "photometry", jlog,
+                      extra=phot_extra or None)
+        wait_state(task_id, ["photometry_done", "done", "completed", "failed", "error"], jlog, timeout=600, job_id=job_id)
         from_step = "subtraction"
         step_idx  = PIPELINE_STEP_ORDER.index("subtraction")
 
     # ── subtraction ───────────────────────────────────────────────────────────
     if step_idx <= PIPELINE_STEP_ORDER.index("subtraction"):
+        check_cancelled(job_id)
         update_result(result_id, "subtraction")
         jlog.info("Triggering template subtraction…")
         stdweb_action(task_id, "subtraction", jlog)
-        wait_state(task_id, ["subtraction_done", "done", "completed", "failed", "error"], jlog, timeout=600)
+        wait_state(task_id, ["subtraction_done", "done", "completed", "failed", "error"], jlog, timeout=600, job_id=job_id)
 
     update_result(result_id, "done", stdweb_task_id=task_id, stdweb_url=task_url)
     update_job(job_id, "done")
@@ -1297,6 +1384,18 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
                 conn.execute("UPDATE pipeline_jobs SET manual_selection=1 WHERE id=?", (job_id,))
         except Exception:
             pass
+    use_color = True
+    refine_wcs = True
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT use_color, refine_wcs FROM pipeline_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row:
+                use_color = bool(row["use_color"])
+                refine_wcs = bool(row["refine_wcs"]) if row["refine_wcs"] is not None else True
+    except Exception:
+        pass
     jlog.info(f"=== Job {job_id} started ===")
     jlog.info(f"Input dir : {fits_dir}")
     if object_filter:
@@ -1307,6 +1406,10 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         jlog.info("Manual selection mode — will pause before stacking for frame review")
     if force_fresh:
         jlog.info(f"Force-fresh mode — using isolated work dir (run{job_id})")
+    if use_color:
+        jlog.info("Color term enabled — photometry will be triggered with use_color=true")
+    if refine_wcs:
+        jlog.info("Refine astrometry enabled — photometry will be triggered with refine_wcs=true")
 
     # Purge any stale result rows from a previous run of this job so we start
     # with a clean slate — avoids ghost errors in the UI from old failures.
@@ -1344,6 +1447,7 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
     jlog.info(f"Objects found: {objects}  —  {total_groups} group(s)")
 
     for (obj, filt, exp_str), files in groups.items():
+        check_cancelled(job_id)
         jlog.info(f"\n--- Processing object={obj}  filter={filt}  exp={exp_str}s ({len(files)} frames) ---")
 
         # Skip groups that already completed successfully in a previous run
@@ -1418,7 +1522,8 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
 
         ok, frame_previews = run_siril(work_dir, flat_path, dark_path, len(files), jlog,
                                        source_files=files,
-                                       skip_quality_filters=manual_selection)
+                                       skip_quality_filters=manual_selection,
+                                       job_id=job_id)
         if not ok:
             err_msg = "No stars found — see frame previews" if frame_previews else "Siril calibration failed"
             jlog.error(f"Calibration failed for {obj}/{filt}/{exp_str}s — skipping")
@@ -1460,12 +1565,13 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         update_job(job_id, "uploading", stdweb_task_id=task_id, stdweb_url=task_url)
 
         # ── Step 6: Inspect ───────────────────────────────────────────────────
+        check_cancelled(job_id)
         jlog.info("Step 6: Triggering inspection...")
         update_result(result_id, "inspecting")
         stdweb_action(task_id, "inspect", jlog)
         state = wait_state(task_id,
                            ["inspect_done", "inspect_failed", "failed", "error"],
-                           jlog, timeout=300)
+                           jlog, timeout=300, job_id=job_id)
         jlog.info(f"  Inspection state: {state}")
         if state in ("inspect_failed", "failed", "error", "timeout"):
             jlog.error(f"  Inspection did not complete (state={state}) — aborting STDWeb steps")
@@ -1473,21 +1579,29 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
             continue
 
         # ── Step 7: Photometry ────────────────────────────────────────────────
+        check_cancelled(job_id)
         jlog.info("Step 7: Triggering photometry...")
         update_result(result_id, "photometry")
-        stdweb_action(task_id, "photometry", jlog)
+        phot_extra = {}
+        if use_color:
+            phot_extra["use_color"] = True
+        if refine_wcs:
+            phot_extra["refine_wcs"] = True
+        stdweb_action(task_id, "photometry", jlog,
+                      extra=phot_extra or None)
         state = wait_state(task_id,
                            ["photometry_done", "done", "completed", "failed", "error"],
-                           jlog, timeout=600)
+                           jlog, timeout=600, job_id=job_id)
         jlog.info(f"  Photometry state: {state}")
 
         # ── Step 8: Template subtraction ──────────────────────────────────────
+        check_cancelled(job_id)
         jlog.info("Step 8: Triggering template subtraction...")
         update_result(result_id, "subtraction")
         stdweb_action(task_id, "subtraction", jlog)
         state = wait_state(task_id,
                            ["subtraction_done", "done", "completed", "failed", "error"],
-                           jlog, timeout=600)
+                           jlog, timeout=600, job_id=job_id)
         jlog.info(f"  Subtraction state: {state}")
 
         update_result(result_id, "done", stdweb_task_id=task_id, stdweb_url=task_url)
@@ -1508,6 +1622,36 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
     else:
         update_job(job_id, "error", error="All groups failed")
         jlog.error(f"\n=== Job {job_id} failed ===")
+
+# ── Job cancellation ──────────────────────────────────────────────────────────
+
+class JobCancelled(Exception):
+    """Raised inside a running pipeline when the job has been cancelled."""
+
+_cancelled_jobs: set[int] = set()
+_cancel_lock = threading.Lock()
+_current_siril_proc: subprocess.Popen | None = None
+
+
+def cancel_job(job_id: int):
+    """Mark a job for cancellation. If it's the currently running job, kill
+    its Siril subprocess (if any) so it unblocks immediately."""
+    with _cancel_lock:
+        _cancelled_jobs.add(job_id)
+    if _current_job_id == job_id and _current_siril_proc is not None:
+        try:
+            _current_siril_proc.kill()
+        except Exception:
+            pass
+    log.info("Job %s marked for cancellation", job_id)
+
+
+def check_cancelled(job_id: int):
+    """Call periodically inside the pipeline. Raises JobCancelled if the job
+    has been cancelled via the API."""
+    if job_id in _cancelled_jobs:
+        raise JobCancelled(f"Job {job_id} cancelled by user")
+
 
 # ── Sequential job queue ──────────────────────────────────────────────────────
 # A single worker thread drains this queue so jobs run one at a time.
@@ -1538,13 +1682,33 @@ def _queue_worker():
         except queue.Empty:
             continue
         job_id, task = item
+        # Skip if already cancelled while sitting in the queue
+        if job_id in _cancelled_jobs:
+            log.info("Job %s was cancelled while queued — skipping", job_id)
+            with _cancel_lock:
+                _cancelled_jobs.discard(job_id)
+            with _active_lock:
+                _active_jobs.discard(job_id)
+            try:
+                _job_queue.task_done()
+            except Exception:
+                pass
+            continue
         _current_job_id = job_id
         try:
             task()
+        except JobCancelled:
+            log.info("Job %s cancelled — moving to next job", job_id)
+            try:
+                update_job(job_id, "error", error="Cancelled by user")
+            except Exception:
+                pass
         except BaseException as exc:
             log.exception("Unhandled exception in queue worker task: %s", exc)
         finally:
             _current_job_id = None
+            with _cancel_lock:
+                _cancelled_jobs.discard(job_id)
             with _active_lock:
                 _active_jobs.discard(job_id)
             try:
@@ -1664,6 +1828,20 @@ def health():
         "worker_alive": _worker_thread.is_alive(),
         "db_ok": db_ok,
     })
+
+
+@app.route("/cancel/<int:job_id>", methods=["POST"])
+def cancel(job_id):
+    cancel_job(job_id)
+    # Also remove from the queue if it's waiting (not yet running)
+    with _active_lock:
+        was_active = job_id in _active_jobs
+    # Mark in DB right away so the UI reflects it instantly
+    try:
+        update_job(job_id, "error", error="Cancelled by user")
+    except Exception:
+        pass
+    return jsonify({"success": True, "job_id": job_id, "was_active": was_active})
 
 
 @app.route("/process", methods=["POST"])
@@ -1827,10 +2005,18 @@ def _fetch_stdweb_photometry(task_id: str) -> dict:
     filt   = task_json.get("config", {}).get("filter")
     target = task_json.get("config", {}).get("target")
 
+    # Magnitude lines come in two flavours depending on use_color:
+    #   without color term: "Primary target magnitude is BPmag = 14.26 +/- 0.01"
+    #   with    color term: "Primary target magnitude is BPmag - 0.03 (BPmag - RPmag) = 14.26 +/- 0.01"
+    # Use a non-greedy ".+?" so both forms match. The "Target magnitude is..."
+    # pattern is anchored at line-start so it doesn't accidentally swallow the
+    # "Primary target magnitude is..." line above it.
     mjd_m     = re.search(r"MJD is ([\d.]+)", html)
-    direct_m  = re.search(r"Primary target magnitude is \w+ = ([\d.]+) \+/- ([\d.]+)", html)
-    sub_m     = re.search(r"Target magnitude is \w+ = ([\d.]+) \+/- ([\d.]+)", html)
-    sub_ul_m  = re.search(r"Target magnitude upper limit is \w+ > ([\d.]+)", html) if not sub_m else None
+    direct_m  = re.search(r"Primary target magnitude is .+? = ([\d.]+) \+/- ([\d.]+)", html)
+    sub_m     = re.search(r"(?:^|\n)\s*Target magnitude is .+? = ([\d.]+) \+/- ([\d.]+)", html)
+    # The ">" in the upper-limit message may be escaped as "&gt;" inside <pre>.
+    sub_ul_m  = (re.search(r"(?:^|\n)\s*Target magnitude upper limit is .+? (?:>|&gt;) ([\d.]+)", html)
+                 if not sub_m else None)
 
     return {
         "filter":  filt,
@@ -1851,13 +2037,34 @@ def _stdweb_poller_loop():
         time.sleep(30)
         try:
             with _db() as conn:
+                # Poll any row that is still incomplete. We keep polling
+                # whenever any of the following holds (so we can pick up data
+                # progressively as STDWeb advances through photometry → sub):
+                #   - status is not terminal (queued/running/uploading/.../subtraction)
+                #   - status='done' but subtraction data is missing (no mag_sub
+                #     and no mag_sub_ul)  → in case the local row was marked
+                #     done from a photometry_done state but subtraction has
+                #     since completed, or the parse silently failed earlier.
+                #   - status='error' and we have no photometry at all  → likely
+                #     a misclassified local timeout where STDWeb actually finished.
+                # The fetch trigger below is gated on the STDWeb state, so a
+                # truly never-finishing task won't waste cycles writing data.
                 rows = conn.execute(
-                    """SELECT id, stdweb_task_id, status, mjd
+                    """SELECT id, stdweb_task_id, status, error, mjd,
+                              mag_ap, mag_sub, mag_sub_ul
                        FROM pipeline_results
                        WHERE stdweb_task_id IS NOT NULL
-                         AND status NOT IN ('done', 'error')"""
+                         AND ( status NOT IN ('done', 'error')
+                               OR ( status = 'done'
+                                    AND mag_sub    IS NULL
+                                    AND mag_sub_ul IS NULL )
+                               OR ( status = 'error'
+                                    AND mag_ap     IS NULL
+                                    AND mag_sub    IS NULL
+                                    AND mag_sub_ul IS NULL ) )"""
                 ).fetchall()
-            for (result_id, task_id, cur_status, stored_mjd) in rows:
+            for (result_id, task_id, cur_status, stored_error, stored_mjd,
+                 stored_mag_ap, stored_mag_sub, stored_mag_sub_ul) in rows:
                 try:
                     r = requests.get(
                         f"{STDWEB_URL}/api/tasks/{task_id}/",
@@ -1870,34 +2077,75 @@ def _stdweb_poller_loop():
                         new_status in ("done", "error") and new_status != cur_status
                     )
 
-                    if new_status and new_status != cur_status:
-                        update_result(result_id, new_status, stdweb_state=raw_state,
-                                      error=(raw_state if new_status == "error" else None))
+                    # Map STDWeb state to a local pipeline status, but never
+                    # demote a row that's already 'done' or 'error' back to a
+                    # non-terminal state (e.g. STDWeb's photometry_done →
+                    # local 'subtraction'). Once the local pipeline considers
+                    # the result terminal, the poller should only fill in
+                    # missing photometry, not rewind progress.
+                    cur_terminal = cur_status in ("done", "error")
+                    new_terminal = new_status in ("done", "error")
+                    safe_to_promote = bool(new_status) and (
+                        new_status != cur_status
+                        and (not cur_terminal or new_terminal)
+                    )
+                    if safe_to_promote:
+                        # Clear any stale local error message when the row
+                        # recovers to a healthy state (e.g. wait_state timeout
+                        # but STDWeb actually finished).
+                        clear_error = (new_status == "done" and stored_error)
+                        update_result(
+                            result_id, new_status,
+                            stdweb_state=raw_state,
+                            error=(raw_state if new_status == "error"
+                                   else ("" if clear_error else None)),
+                        )
                         log.info("[poller] result %s task %s: %s → %s (stdweb=%s)",
                                  result_id, task_id, cur_status, new_status, raw_state)
                     elif raw_state not in ("unknown",):
                         update_result(result_id, cur_status, stdweb_state=raw_state)
 
-                    # Fetch and persist photometry when newly done (and not yet stored)
-                    if raw_state == "subtraction_done" and stored_mjd is None:
+                    # Decide whether to (re)parse the STDWeb log.
+                    #   - photometry_done: log already has "Primary target
+                    #     magnitude is ..." → fetch if we don't have mag_ap yet.
+                    #   - subtraction_done: log has both primary and target/
+                    #     subtraction lines → fetch if we don't yet have mjd,
+                    #     mag_ap, or any subtraction data (mag_sub/mag_sub_ul).
+                    need_primary = stored_mag_ap is None
+                    need_sub = (stored_mag_sub is None
+                                and stored_mag_sub_ul is None)
+                    if raw_state == "photometry_done" and need_primary:
+                        do_fetch = True
+                    elif raw_state == "subtraction_done" and (
+                            stored_mjd is None or need_primary or need_sub):
+                        do_fetch = True
+                    else:
+                        do_fetch = False
+                    if do_fetch:
                         try:
                             phot = _fetch_stdweb_photometry(task_id)
                             kwargs: dict = {}
-                            if phot.get("mjd"):
+                            if phot.get("mjd") and stored_mjd is None:
                                 kwargs["mjd"] = phot["mjd"]
-                                # Derive obs_date from MJD (approx)
                                 from astropy.time import Time as _ATime
                                 kwargs["obs_date"] = _ATime(phot["mjd"], format="mjd").to_datetime().strftime("%Y-%m-%d")
-                            if phot.get("direct"):
+                            if phot.get("direct") and stored_mag_ap is None:
                                 kwargs["mag_ap"]    = phot["direct"]["mag"]
                                 kwargs["magerr_ap"] = phot["direct"]["magerr"]
-                            if phot.get("sub"):
+                            if phot.get("sub") and stored_mag_sub is None:
                                 kwargs["mag_sub"]    = phot["sub"]["mag"]
                                 kwargs["magerr_sub"] = phot["sub"]["magerr"]
-                            elif phot.get("sub_ul") is not None:
+                            elif (phot.get("sub_ul") is not None
+                                  and stored_mag_sub_ul is None
+                                  and stored_mag_sub is None):
                                 kwargs["mag_sub_ul"] = phot["sub_ul"]
+                            # Only persist when there's something genuinely new
+                            # to write — silences the every-30s log spam for
+                            # tasks STDWeb has no parseable photometry for.
                             if kwargs:
-                                update_result(result_id, new_status or cur_status,
+                                target_status = (new_status if safe_to_promote
+                                                 else cur_status)
+                                update_result(result_id, target_status,
                                               stdweb_state=raw_state, **kwargs)
                                 log.info("[poller] stored photometry for result %s task %s: %s",
                                          result_id, task_id, kwargs)

@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Databases
+*.db
+*.db.bak
+
+# Logs
+log.txt
+logs/
+server/logs/
+
+# Sensitive / credentials
+vpn.ovpn
+
+# External data (symlink to /mnt/usb/astrobatch_data)
+data
+
+# Large binaries
+tools/siril.appimage
+
+# Calibration FITS frames (large binary files)
+calib/
+
+# macOS metadata
+.DS_Store
+
+# Backup files
+*.bak
+
+# Artifacts from mistyped commands
+--root
+python
+
+# IDE
+.vscode/

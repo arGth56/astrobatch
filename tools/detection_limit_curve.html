@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#070b10;color:#e2e8f0;font-family:'Syne',sans-serif;padding:20px 16px;display:flex;flex-direction:column;align-items:center;gap:16px}
+  h1{font-size:17px;font-weight:800;letter-spacing:.04em;color:#f8fafc;text-align:center}
+  .sub{font-size:11px;color:#64748b;font-family:'Space Mono',monospace;text-align:center;margin-top:2px}
+  .row{display:flex;gap:14px;width:100%;max-width:960px;flex-wrap:wrap}
+  .card{background:#0d1626;border:1px solid #1e293b;border-radius:10px;padding:16px;flex:1;min-width:280px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin-bottom:10px}
+  canvas{display:block;width:100%}
+  .legend{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap}
+  .leg{display:flex;align-items:center;gap:5px;font-size:10px;font-family:'Space Mono',monospace;color:#94a3b8}
+  .dot{width:9px;height:9px;border-radius:50%}
+  .formula{background:#0a1420;border:1px solid #1e293b;border-radius:6px;padding:8px 12px;
+           font-family:'Space Mono',monospace;font-size:11px;color:#94a3b8;line-height:1.9;margin-top:10px}
+  .formula span{color:#38bdf8}
+  .table-wrap{overflow-x:auto;margin-top:10px}
+  table{width:100%;border-collapse:collapse;font-family:'Space Mono',monospace;font-size:11px}
+  th{background:#111927;color:#64748b;padding:5px 10px;text-align:left;font-weight:400;text-transform:uppercase;font-size:9px;letter-spacing:.06em}
+  td{padding:4px 10px;border-bottom:1px solid #1a2535;color:#94a3b8}
+  tr:hover td{background:#121e30}
+  .hi{color:#38bdf8;font-weight:700}
+  .controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  button.tog{background:#111927;border:1px solid #1e293b;color:#94a3b8;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;font-family:'Space Mono',monospace}
+  button.tog.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+</style>
+</head>
+<body>
+<h1>Detection Limit — Real Observatory Data (80 STDWeb measurements)</h1>
+<div class="sub">Gaia G/BP/RP · 2026-03-19 → 2026-04-02 · calibrated by STDWeb · S/N=5</div>
+
+<div class="row">
+<!-- LEFT: N frames vs limit -->
+<div class="card" style="flex:2;min-width:340px">
+  <h2>Limit mag vs Frames &amp; Moon phase</h2>
+  <div class="controls">
+    <button class="tog active" id="tog-G">G</button>
+    <button class="tog active" id="tog-BP">BP</button>
+    <button class="tog active" id="tog-RP">RP</button>
+  </div>
+  <canvas id="c1" height="300"></canvas>
+  <div class="legend" id="leg1">
+    <div class="leg"><div class="dot" style="background:#22d3ee"></div> New moon (&lt;0.15)</div>
+    <div class="leg"><div class="dot" style="background:#fbbf24"></div> Quarter (0.15–0.5)</div>
+    <div class="leg"><div class="dot" style="background:#f87171"></div> Full moon (&gt;0.5)</div>
+    <div class="leg"><div style="width:18px;height:2px;background:#38bdf8;border-radius:2px"></div> Fit (new moon)</div>
+    <div class="leg"><div style="width:18px;height:2px;background:#f87171;border-radius:2px"></div> Fit (full moon)</div>
+  </div>
+</div>
+
+<!-- RIGHT: Moon phase effect (normalized) -->
+<div class="card" style="min-width:280px">
+  <h2>Moon phase penalty (G filter, 10×120s equiv.)</h2>
+  <canvas id="c2" height="300"></canvas>
+  <div class="formula">
+    New moon base: <span id="base-val">–</span><br>
+    Penalty near full: <span id="penalty-val">–</span> mag<br>
+    Per 10% illum.: <span id="per-illum">–</span> mag
+  </div>
+</div>
+</div>
+
+<!-- Table -->
+<div class="card" style="width:100%;max-width:960px">
+  <h2>Predicted limits — G filter (S/N=5), corrected for moon</h2>
+  <div class="table-wrap"><table>
+    <thead><tr>
+      <th>Frames</th><th>Total exp.</th>
+      <th>New moon</th><th>Quarter moon</th><th>Half moon</th><th>Full moon</th>
+    </tr></thead>
+    <tbody id="tbl"></tbody>
+  </table></div>
+  <div class="formula" style="margin-top:10px">
+    Model: <span>mag_lim = A(moon) + 1.25 × log₁₀(N × t/120)</span> &nbsp;·&nbsp;
+    A(moon) = <span id="model-eq">–</span>
+  </div>
+</div>
+
+<script>
+// ── Data ────────────────────────────────────────────────────────────────────
+const RAW = [{"result_id": 18, "task_id": "3488", "filter": "G", "n_frames": 30, "exp": 120, "obs_date": "2026-03-19", "lim5": 20.06, "lim10": 19.18, "fwhm": null, "moon": 0.661}, {"result_id": 29, "task_id": "3493", "filter": "G", "n_frames": 45, "exp": 120, "obs_date": "2026-03-19", "lim5": 20.72, "lim10": 19.79, "fwhm": null, "moon": 0.661}, {"result_id": 35, "task_id": "3497", "filter": "G", "n_frames": 30, "exp": 120, "obs_date": "2026-03-19", "lim5": 20.43, "lim10": 19.63, "fwhm": null, "moon": 0.661}, {"result_id": 36, "task_id": "3489", "filter": "RP", "n_frames": 60, "exp": 120, "obs_date": "2026-03-20", "lim5": 19.39, "lim10": 18.55, "fwhm": null, "moon": 0.693}, {"result_id": 47, "task_id": "3498", "filter": "RP", "n_frames": 60, "exp": 120, "obs_date": "2026-03-20", "lim5": 19.83, "lim10": 18.95, "fwhm": null, "moon": 0.693}, {"result_id": 56, "task_id": "3507", "filter": "G", "n_frames": 9, "exp": 120, "obs_date": "2026-03-20", "lim5": 19.5, "lim10": 18.63, "fwhm": null, "moon": 0.693}, {"result_id": 57, "task_id": "3508", "filter": "RP", "n_frames": 60, "exp": 120, "obs_date": "2026-03-20", "lim5": 19.77, "lim10": 18.91, "fwhm": null, "moon": 0.693}, {"result_id": 19, "task_id": "3486", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.21, "lim10": 19.26, "fwhm": null, "moon": 0.727}, {"result_id": 20, "task_id": "3485", "filter": "RP", "n_frames": 20, "exp": 120, "obs_date": "2026-03-21", "lim5": 18.84, "lim10": 17.97, "fwhm": null, "moon": 0.727}, {"result_id": 30, "task_id": "3492", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 17.28, "lim10": 16.63, "fwhm": null, "moon": 0.727}, {"result_id": 31, "task_id": "3490", "filter": "RP", "n_frames": 20, "exp": 120, "obs_date": "2026-03-21", "lim5": 19.05, "lim10": 18.1, "fwhm": null, "moon": 0.727}, {"result_id": 32, "task_id": "3491", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.21, "lim10": 19.26, "fwhm": null, "moon": 0.727}, {"result_id": 37, "task_id": "3496", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 19.54, "lim10": 18.67, "fwhm": null, "moon": 0.727}, {"result_id": 38, "task_id": "3494", "filter": "RP", "n_frames": 20, "exp": 120, "obs_date": "2026-03-21", "lim5": 18.89, "lim10": 18.0, "fwhm": null, "moon": 0.727}, {"result_id": 39, "task_id": "3495", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.09, "lim10": 19.13, "fwhm": null, "moon": 0.727}, {"result_id": 48, "task_id": "3505", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 19.5, "lim10": 18.63, "fwhm": null, "moon": 0.727}, {"result_id": 49, "task_id": "3504", "filter": "RP", "n_frames": 19, "exp": 120, "obs_date": "2026-03-21", "lim5": 18.87, "lim10": 17.98, "fwhm": null, "moon": 0.727}, {"result_id": 50, "task_id": "3506", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.1, "lim10": 19.14, "fwhm": null, "moon": 0.727}, {"result_id": 58, "task_id": "3511", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 17.28, "lim10": 16.63, "fwhm": null, "moon": 0.727}, {"result_id": 59, "task_id": "3509", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 18.87, "lim10": 17.98, "fwhm": null, "moon": 0.727}, {"result_id": 60, "task_id": "3510", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.14, "lim10": 19.25, "fwhm": null, "moon": 0.727}, {"result_id": 64, "task_id": "3515", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 19.14, "lim10": 18.27, "fwhm": null, "moon": 0.727}, {"result_id": 65, "task_id": "3513", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 18.88, "lim10": 18.02, "fwhm": null, "moon": 0.727}, {"result_id": 66, "task_id": "3514", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-21", "lim5": 20.22, "lim10": 19.32, "fwhm": null, "moon": 0.727}, {"result_id": 67, "task_id": "3487", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-22", "lim5": 20.18, "lim10": 19.25, "fwhm": null, "moon": 0.761}, {"result_id": 68, "task_id": "3533", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.33, "lim10": 17.43, "fwhm": null, "moon": 0.862}, {"result_id": 69, "task_id": "3534", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.85, "lim10": 18.0, "fwhm": null, "moon": 0.862}, {"result_id": 70, "task_id": "3535", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 19.17, "lim10": 18.33, "fwhm": null, "moon": 0.862}, {"result_id": 71, "task_id": "3536", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.83, "lim10": 18.02, "fwhm": null, "moon": 0.862}, {"result_id": 72, "task_id": "3537", "filter": "G", "n_frames": 39, "exp": 30, "obs_date": "2026-03-25", "lim5": 19.89, "lim10": 19.04, "fwhm": null, "moon": 0.862}, {"result_id": 73, "task_id": "3538", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.79, "lim10": 17.94, "fwhm": null, "moon": 0.862}, {"result_id": 74, "task_id": "3539", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 19.2, "lim10": 18.35, "fwhm": null, "moon": 0.862}, {"result_id": 75, "task_id": "3540", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.56, "lim10": 17.72, "fwhm": null, "moon": 0.862}, {"result_id": 76, "task_id": "3541", "filter": "G", "n_frames": 39, "exp": 30, "obs_date": "2026-03-25", "lim5": 19.75, "lim10": 18.93, "fwhm": null, "moon": 0.862}, {"result_id": 77, "task_id": "3542", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 18.89, "lim10": 18.02, "fwhm": null, "moon": 0.862}, {"result_id": 78, "task_id": "3543", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-25", "lim5": 19.27, "lim10": 18.43, "fwhm": null, "moon": 0.862}, {"result_id": 79, "task_id": "3545", "filter": "G", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 19.84, "lim10": 18.97, "fwhm": null, "moon": 0.862}, {"result_id": 80, "task_id": "3546", "filter": "RP", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 18.34, "lim10": 17.47, "fwhm": null, "moon": 0.862}, {"result_id": 81, "task_id": "3547", "filter": "BP", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 18.84, "lim10": 17.99, "fwhm": null, "moon": 0.862}, {"result_id": 82, "task_id": "3548", "filter": "G", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 19.82, "lim10": 18.95, "fwhm": null, "moon": 0.862}, {"result_id": 84, "task_id": "3549", "filter": "RP", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 18.34, "lim10": 17.47, "fwhm": null, "moon": 0.862}, {"result_id": 85, "task_id": "3550", "filter": "BP", "n_frames": 40, "exp": 30, "obs_date": "2026-03-25", "lim5": 18.99, "lim10": 18.14, "fwhm": null, "moon": 0.862}, {"result_id": 86, "task_id": "3552", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 19.58, "lim10": 18.68, "fwhm": null, "moon": 0.972}, {"result_id": 87, "task_id": "3553", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 19.38, "lim10": 18.5, "fwhm": null, "moon": 0.972}, {"result_id": 88, "task_id": "3554", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 18.67, "lim10": 17.8, "fwhm": null, "moon": 0.972}, {"result_id": 89, "task_id": "3556", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 19.48, "lim10": 18.61, "fwhm": null, "moon": 0.972}, {"result_id": 90, "task_id": "3557", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 17.43, "lim10": 16.82, "fwhm": null, "moon": 0.972}, {"result_id": 91, "task_id": "3558", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 18.52, "lim10": 17.67, "fwhm": null, "moon": 0.972}, {"result_id": 92, "task_id": "3559", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 17.91, "lim10": 17.04, "fwhm": null, "moon": 0.972}, {"result_id": 93, "task_id": "3560", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 19.11, "lim10": 18.22, "fwhm": null, "moon": 0.972}, {"result_id": 94, "task_id": "3561", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 19.2, "lim10": 18.35, "fwhm": null, "moon": 0.972}, {"result_id": 95, "task_id": "3562", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-28", "lim5": 18.46, "lim10": 17.58, "fwhm": null, "moon": 0.972}, {"result_id": 96, "task_id": "3555", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-29", "lim5": 16.66, "lim10": 15.95, "fwhm": null, "moon": 0.003}, {"result_id": 97, "task_id": "3563", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-29", "lim5": 18.63, "lim10": 17.81, "fwhm": null, "moon": 0.003}, {"result_id": 98, "task_id": "3564", "filter": "G", "n_frames": 39, "exp": 30, "obs_date": "2026-03-30", "lim5": 18.45, "lim10": 17.58, "fwhm": null, "moon": 0.037}, {"result_id": 99, "task_id": "3565", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 18.2, "lim10": 17.35, "fwhm": null, "moon": 0.037}, {"result_id": 100, "task_id": "3566", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 19.09, "lim10": 18.2, "fwhm": null, "moon": 0.037}, {"result_id": 101, "task_id": "3568", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 17.1, "lim10": 16.39, "fwhm": null, "moon": 0.037}, {"result_id": 102, "task_id": "3569", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 19.04, "lim10": 18.18, "fwhm": null, "moon": 0.037}, {"result_id": 103, "task_id": "3570", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 18.67, "lim10": 17.8, "fwhm": null, "moon": 0.037}, {"result_id": 104, "task_id": "3571", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 19.09, "lim10": 18.2, "fwhm": null, "moon": 0.037}, {"result_id": 105, "task_id": "3572", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 18.95, "lim10": 18.1, "fwhm": null, "moon": 0.037}, {"result_id": 106, "task_id": "3573", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 18.71, "lim10": 17.85, "fwhm": null, "moon": 0.037}, {"result_id": 107, "task_id": "3574", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 19.02, "lim10": 18.15, "fwhm": null, "moon": 0.037}, {"result_id": 108, "task_id": "3580", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-30", "lim5": 19.03, "lim10": 18.17, "fwhm": null, "moon": 0.037}, {"result_id": 112, "task_id": "3567", "filter": "BP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-31", "lim5": 19.07, "lim10": 18.21, "fwhm": null, "moon": 0.071}, {"result_id": 124, "task_id": "3578", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.63, "lim10": 17.78, "fwhm": null, "moon": 0.071}, {"result_id": 125, "task_id": "3579", "filter": "RP", "n_frames": 10, "exp": 120, "obs_date": "2026-03-31", "lim5": 17.83, "lim10": 17.01, "fwhm": null, "moon": 0.071}, {"result_id": 127, "task_id": "3581", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.87, "lim10": 18.02, "fwhm": null, "moon": 0.071}, {"result_id": 128, "task_id": "3582", "filter": "BP", "n_frames": 9, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.66, "lim10": 17.8, "fwhm": null, "moon": 0.071}, {"result_id": 129, "task_id": "3583", "filter": "RP", "n_frames": 3, "exp": 120, "obs_date": "2026-03-31", "lim5": 17.8, "lim10": 17.01, "fwhm": null, "moon": 0.071}, {"result_id": 130, "task_id": "3584", "filter": "BP", "n_frames": 8, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.67, "lim10": 17.81, "fwhm": null, "moon": 0.071}, {"result_id": 131, "task_id": "3585", "filter": "G", "n_frames": 12, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.65, "lim10": 17.81, "fwhm": null, "moon": 0.071}, {"result_id": 132, "task_id": "3586", "filter": "RP", "n_frames": 7, "exp": 120, "obs_date": "2026-03-31", "lim5": 17.45, "lim10": 16.59, "fwhm": null, "moon": 0.071}, {"result_id": 134, "task_id": "3588", "filter": "G", "n_frames": 7, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.37, "lim10": 17.52, "fwhm": null, "moon": 0.071}, {"result_id": 136, "task_id": "3590", "filter": "RP", "n_frames": 6, "exp": 120, "obs_date": "2026-03-31", "lim5": 15.48, "lim10": 14.7, "fwhm": null, "moon": 0.071}, {"result_id": 138, "task_id": "3592", "filter": "G", "n_frames": 10, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.83, "lim10": 17.97, "fwhm": null, "moon": 0.071}, {"result_id": 139, "task_id": "3593", "filter": "BP", "n_frames": 9, "exp": 120, "obs_date": "2026-03-31", "lim5": 18.67, "lim10": 17.82, "fwhm": null, "moon": 0.071}, {"result_id": 140, "task_id": "3594", "filter": "RP", "n_frames": 3, "exp": 120, "obs_date": "2026-03-31", "lim5": 17.5, "lim10": 16.67, "fwhm": null, "moon": 0.071}, {"result_id": 133, "task_id": "3587", "filter": "BP", "n_frames": 8, "exp": 120, "obs_date": "2026-04-01", "lim5": 18.3, "lim10": 17.43, "fwhm": null, "moon": 0.105}, {"result_id": 135, "task_id": "3589", "filter": "BP", "n_frames": 6, "exp": 120, "obs_date": "2026-04-01", "lim5": 16.95, "lim10": 16.2, "fwhm": null, "moon": 0.105}, {"result_id": 137, "task_id": "3591", "filter": "G", "n_frames": 8, "exp": 120, "obs_date": "2026-04-01", "lim5": 18.53, "lim10": 17.66, "fwhm": null, "moon": 0.105}, {"result_id": 142, "task_id": "3599", "filter": "G", "n_frames": 13, "exp": 120, "obs_date": "2026-04-02", "lim5": 18.66, "lim10": 17.79, "fwhm": null, "moon": 0.139}, {"result_id": 143, "task_id": "3600", "filter": "BP", "n_frames": 5, "exp": 120, "obs_date": "2026-04-02", "lim5": 18.59, "lim10": 17.7, "fwhm": null, "moon": 0.139}];
+
+// ── Moon phase to illum fraction ─────────────────────────────────────────
+function moonIllum(phase) {
+  return (1 - Math.cos(2*Math.PI*phase)) / 2;
+}
+
+// Normalize: lim5 adjusted to 10×120s equivalent
+function normLim(d) {
+  const equiv = d.n_frames * d.exp / 120;  // effective 120s frames
+  return d.lim5 - 1.25 * Math.log10(equiv / 10);
+}
+
+// ── Fit moon penalty on G-filter, 10×120s ───────────────────────────────
+const gData = RAW.filter(d => d.filter === 'G').map(d => ({
+  illum: moonIllum(d.moon), lim_norm: normLim(d)
+}));
+// Simple linear regression: lim_norm = A - k * illum
+const gN = gData.length;
+const sx  = gData.reduce((s,d)=>s+d.illum,0);
+const sy  = gData.reduce((s,d)=>s+d.lim_norm,0);
+const sxy = gData.reduce((s,d)=>s+d.illum*d.lim_norm,0);
+const sxx = gData.reduce((s,d)=>s+d.illum*d.illum,0);
+const slope  = (gN*sxy - sx*sy) / (gN*sxx - sx*sx);
+const interc = (sy - slope*sx) / gN;
+// interc = base limit (new moon), slope = penalty per illum unit
+document.getElementById('base-val').textContent    = interc.toFixed(2) + ' mag';
+document.getElementById('penalty-val').textContent = (-slope).toFixed(2);
+document.getElementById('per-illum').textContent   = (-slope*0.1).toFixed(2);
+document.getElementById('model-eq').textContent    = `${interc.toFixed(2)} - ${(-slope).toFixed(2)} × illum(moon)`;
+
+// Filter offsets (median normalized limits)
+const filtOffset = {};
+['G','BP','RP'].forEach(f => {
+  const vals = RAW.filter(d=>d.filter===f).map(normLim);
+  const med = vals.sort((a,b)=>a-b)[Math.floor(vals.length/2)];
+  filtOffset[f] = med - interc;  // offset vs G
+});
+
+// ── Table ────────────────────────────────────────────────────────────────
+const tbody = document.getElementById('tbl');
+const moonPts = [0.0, 0.25, 0.5, 1.0];
+const moonLbls = ['New ☽', 'Quarter', 'Half', 'Full ○'];
+[1,5,10,20,30,50,80,130,200].forEach(n => {
+  const tr = document.createElement('tr');
+  const fmt = s => s<60?s+'s':s<3600?(s/60).toFixed(0)+'min':(s/3600).toFixed(1)+'h';
+  let cells = `<td>${n}</td><td style="color:#475569">${fmt(n*120)}</td>`;
+  moonPts.forEach((m,i) => {
+    const illum = (1-Math.cos(2*Math.PI*m))/2;
+    const lim = interc + slope*illum + 1.25*Math.log10(n);
+    const col = i===0?'#22d3ee':i===3?'#f87171':'#cbd5e1';
+    cells += `<td class="${i===0?'hi':''}" style="${i===0?'':'color:'+col}">${lim.toFixed(2)}</td>`;
+  });
+  tr.innerHTML = cells;
+  tbody.appendChild(tr);
+});
+
+// ── Chart 1: N-frames vs limit, colored by moon ─────────────────────────
+const c1 = document.getElementById('c1');
+let showFilter = {G:true,BP:true,RP:true};
+
+['G','BP','RP'].forEach(f => {
+  document.getElementById('tog-'+f).addEventListener('click', function(){
+    showFilter[f] = !showFilter[f];
+    this.classList.toggle('active', showFilter[f]);
+    drawC1();
+  });
+});
+
+function moonColor(m) {
+  const ill = moonIllum(m);
+  if (ill < 0.15) return '#22d3ee';
+  if (ill < 0.5)  return '#fbbf24';
+  return '#f87171';
+}
+function filterShape(f) { return f==='G'?'circle':f==='BP'?'diamond':'square'; }
+
+function drawC1() {
+  const W = c1.parentElement.offsetWidth - 32;
+  c1.width = W; c1.height = 300;
+  const ctx = c1.getContext('2d');
+  const PAD = {t:10,r:16,b:36,l:46};
+  const cw = W-PAD.l-PAD.r, ch = 300-PAD.t-PAD.b;
+
+  const pts = RAW.filter(d=>showFilter[d.filter]);
+  const xMin=1, xMax=70, yMin=14.5, yMax=21.5;
+  function xPx(n){return PAD.l+Math.log10(n/xMin)/Math.log10(xMax/xMin)*cw;}
+  function yPx(m){return PAD.t+(yMax-m)/(yMax-yMin)*ch;}
+
+  // Grid
+  [15,16,17,18,19,20,21].forEach(m=>{
+    ctx.strokeStyle='#1a2535'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(PAD.l,yPx(m)); ctx.lineTo(PAD.l+cw,yPx(m)); ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font='9px Space Mono,monospace'; ctx.textAlign='right';
+    ctx.fillText(m,PAD.l-5,yPx(m)+3);
+  });
+  [1,2,5,10,20,50].forEach(n=>{
+    ctx.strokeStyle='#1a2535'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(xPx(n),PAD.t); ctx.lineTo(xPx(n),PAD.t+ch); ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font='9px Space Mono,monospace'; ctx.textAlign='center';
+    ctx.fillText(n,xPx(n),PAD.t+ch+14);
+  });
+
+  // Fit curves for new moon and full moon
+  [[0,'#22d3ee'],[1.0,'#f87171']].forEach(([m,col])=>{
+    const illum=(1-Math.cos(2*Math.PI*m))/2;
+    ctx.beginPath(); ctx.strokeStyle=col+'88'; ctx.lineWidth=2; ctx.setLineDash([4,3]);
+    for(let i=0;i<=200;i++){
+      const n=Math.pow(10,Math.log10(xMin)+i/200*Math.log10(xMax/xMin));
+      const lim=interc+slope*illum+1.25*Math.log10(n);
+      const x=xPx(n),y=yPx(lim);
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  });
+
+  // Data points
+  pts.forEach(d=>{
+    const equiv = d.n_frames * d.exp / 120;
+    const x=xPx(equiv), y=yPx(d.lim5);
+    const col=moonColor(d.moon);
+    ctx.save();
+    ctx.translate(x,y);
+    if(d.filter==='G'){
+      ctx.beginPath(); ctx.arc(0,0,4.5,0,2*Math.PI);
+      ctx.fillStyle=col+'cc'; ctx.fill();
+      ctx.strokeStyle=col; ctx.lineWidth=1; ctx.stroke();
+    } else if(d.filter==='BP'){
+      ctx.beginPath(); ctx.moveTo(0,-5); ctx.lineTo(5,0); ctx.lineTo(0,5); ctx.lineTo(-5,0); ctx.closePath();
+      ctx.fillStyle=col+'88'; ctx.fill();
+      ctx.strokeStyle=col; ctx.lineWidth=1; ctx.stroke();
+    } else {
+      ctx.strokeStyle=col; ctx.lineWidth=1.5;
+      ctx.strokeRect(-4,-4,8,8);
+    }
+    ctx.restore();
+  });
+
+  ctx.fillStyle='#64748b'; ctx.font='10px Syne,sans-serif'; ctx.textAlign='center';
+  ctx.fillText('Equivalent 120s frames (log)', PAD.l+cw/2, 300-4);
+  ctx.save(); ctx.translate(12,PAD.t+ch/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('S/N=5 limit (mag)',0,0); ctx.restore();
+}
+drawC1();
+
+// ── Chart 2: Moon illum vs normalized limit ──────────────────────────────
+const c2 = document.getElementById('c2');
+(function drawC2(){
+  const W = c2.parentElement.offsetWidth - 32;
+  c2.width = W; c2.height = 300;
+  const ctx = c2.getContext('2d');
+  const PAD = {t:10,r:16,b:36,l:46};
+  const cw = W-PAD.l-PAD.r, ch = 300-PAD.t-PAD.b;
+
+  const yMin=15.5, yMax=21.5;
+  function xPx(v){return PAD.l+v*cw;}
+  function yPx(m){return PAD.t+(yMax-m)/(yMax-yMin)*ch;}
+
+  [16,17,18,19,20,21].forEach(m=>{
+    ctx.strokeStyle='#1a2535'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(PAD.l,yPx(m)); ctx.lineTo(PAD.l+cw,yPx(m)); ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font='9px Space Mono,monospace'; ctx.textAlign='right';
+    ctx.fillText(m,PAD.l-5,yPx(m)+3);
+  });
+  [0,0.25,0.5,0.75,1.0].forEach(v=>{
+    ctx.strokeStyle='#1a2535'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(xPx(v),PAD.t); ctx.lineTo(xPx(v),PAD.t+ch); ctx.stroke();
+    ctx.fillStyle='#475569'; ctx.font='9px Space Mono,monospace'; ctx.textAlign='center';
+    const lbl=['New','25%','50%','75%','Full'][Math.round(v*4)];
+    ctx.fillText(lbl,xPx(v),PAD.t+ch+14);
+  });
+
+  // Fit line
+  ctx.beginPath(); ctx.strokeStyle='#38bdf8'; ctx.lineWidth=2;
+  for(let i=0;i<=100;i++){
+    const ill=i/100;
+    const lim=interc+slope*ill;
+    const x=xPx(ill),y=yPx(lim);
+    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+
+  // G data points
+  gData.forEach(d=>{
+    const col=d.illum<0.15?'#22d3ee':d.illum<0.5?'#fbbf24':'#f87171';
+    ctx.beginPath(); ctx.arc(xPx(d.illum),yPx(d.lim_norm),4.5,0,2*Math.PI);
+    ctx.fillStyle=col+'cc'; ctx.fill();
+    ctx.strokeStyle=col; ctx.lineWidth=1; ctx.stroke();
+  });
+
+  ctx.fillStyle='#64748b'; ctx.font='10px Syne,sans-serif'; ctx.textAlign='center';
+  ctx.fillText('Moon illumination', PAD.l+cw/2, 300-4);
+  ctx.save(); ctx.translate(12,PAD.t+ch/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('Norm. limit (10×120s)',0,0); ctx.restore();
+})();
+</script>
+</body>
+</html>

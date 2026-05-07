@@ -155,6 +155,8 @@ db.exec(`
     stdweb_task_id  TEXT,
     stdweb_url      TEXT,
     error           TEXT,
+    use_color       INTEGER DEFAULT 1,
+    refine_wcs      INTEGER DEFAULT 1,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
   );
@@ -188,6 +190,8 @@ db.exec(`
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN target TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN frame_previews TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN target_filter TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN use_color INTEGER DEFAULT 0").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN refine_wcs INTEGER DEFAULT 1").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN stdweb_state TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN obs_date TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mjd REAL").run(); } catch { /* already exists */ }
@@ -2874,10 +2878,25 @@ async function runSequence(ninaConfig, seqConfig) {
     minAlt = 20, meridianGap = 10, zenithLimit = 70, minStars = 10,
     frameCheckEnabled = false, frameCheckThresholdArcmin = 5, solveExp = 5,
   } = seqConfig;
-  const safetyLimits = {
-    minAlt, meridianGap, zenithLimit, minStars,
-    frameCheckEnabled, frameCheckThresholdArcmin, solveExp,
-  };
+  function liveSafetyLimits() {
+    return {
+      minAlt:           Number(getSetting("minAlt",          minAlt)),
+      meridianGap:      Number(getSetting("meridianGap",     meridianGap)),
+      zenithLimit:      Number(getSetting("zenithLimit",     zenithLimit)),
+      minStars:         Number(getSetting("minStars",        minStars)),
+      frameCheckEnabled:        getSetting("frameCheckEnabled", String(frameCheckEnabled)) === "true",
+      frameCheckThresholdArcmin: Number(getSetting("frameCheckThresholdArcmin", frameCheckThresholdArcmin)),
+      solveExp:         Number(getSetting("solveExp",        solveExp)),
+    };
+  }
+  const safetyLimits = new Proxy({}, {
+    get: (_, prop) => liveSafetyLimits()[prop],
+    ownKeys: () => Object.keys(liveSafetyLimits()),
+    getOwnPropertyDescriptor: (_, prop) => {
+      const v = liveSafetyLimits()[prop];
+      return v !== undefined ? { configurable: true, enumerable: true, value: v } : undefined;
+    },
+  });
 
   // Maximum time to wait for any target to enter a valid sky zone before giving up
   const MAX_WAIT_NO_TARGET_MS = 45 * 60 * 1000; // 45 min
@@ -4958,12 +4977,15 @@ app.get("/api/pipeline/result/:id/download", (req, res) => {
 });
 
 app.post("/api/pipeline/trigger", async (req, res) => {
-  const { fits_dir, target, filter, exposure, selected_files, target_filter, manual_selection, force_fresh } = req.body;
+  const { fits_dir, target, filter, exposure, selected_files, target_filter, manual_selection, force_fresh, use_color, refine_wcs } = req.body;
   if (!fits_dir) return res.status(400).json({ success: false, error: "fits_dir is required" });
 
+  const useColorVal    = use_color    === false ? 0 : 1;
+  const refineWcsVal   = refine_wcs   === false ? 0 : 1;
+
   const result = db.prepare(
-    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run(target || null, filter || null, exposure || null, fits_dir, "queued", target_filter || null);
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(target || null, filter || null, exposure || null, fits_dir, "queued", target_filter || null, useColorVal, refineWcsVal);
 
   const job_id = result.lastInsertRowid;
 
@@ -4988,8 +5010,8 @@ app.post("/api/pipeline/rerun/:id", async (req, res) => {
   if (!oldJob) return res.status(404).json({ success: false, error: "Job not found" });
 
   const result = db.prepare(
-    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run(oldJob.target, oldJob.filter, oldJob.exposure, oldJob.fits_dir, "queued", oldJob.target_filter || null);
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(oldJob.target, oldJob.filter, oldJob.exposure, oldJob.fits_dir, "queued", oldJob.target_filter || null, oldJob.use_color ? 1 : 0, oldJob.refine_wcs != null ? oldJob.refine_wcs : 1);
 
   const job_id = result.lastInsertRowid;
 
@@ -5212,8 +5234,27 @@ app.get("/api/pipeline/job/:id/log", async (req, res) => {
   }
 });
 
-app.delete("/api/pipeline/jobs/:id", (req, res) => {
-  db.prepare("DELETE FROM pipeline_jobs WHERE id = ?").run(req.params.id);
+app.delete("/api/pipeline/jobs/:id", async (req, res) => {
+  const jobId = req.params.id;
+  const PROC_URL = process.env.PROCESSING_URL || "http://localhost:5200";
+
+  // Tell the processing service to cancel the running/queued job so it
+  // kills any active Siril subprocess and moves to the next job.
+  try {
+    await fetch(`${PROC_URL}/cancel/${jobId}`, { method: "POST", signal: AbortSignal.timeout(5000) });
+  } catch { /* non-fatal — maybe already finished or service unreachable */ }
+
+  // Mark incomplete results as cancelled
+  db.prepare(
+    `UPDATE pipeline_results SET status='error', error='Cancelled by user', updated_at=datetime('now')
+     WHERE job_id = ? AND status NOT IN ('done', 'error')`
+  ).run(jobId);
+
+  // Mark the job itself
+  db.prepare(
+    "UPDATE pipeline_jobs SET status='error', error='Cancelled by user', updated_at=datetime('now') WHERE id = ?"
+  ).run(jobId);
+
   res.json({ success: true });
 });
 
@@ -5374,41 +5415,45 @@ app.get("/api/stdweb/health", async (req, res) => {
 });
 
 // ── STDWeb photometry proxy ───────────────────────────────────────────────────
-// GET /api/stdweb/task/:task_id/photometry
+// GET /api/stdweb/task/:task_id/photometry[?refresh=1]
 // Returns photometry measurements for a task. Serves from DB when already
-// stored; fetches from STDWeb live otherwise and persists the result.
+// fully populated; fetches from STDWeb live otherwise and persists the result.
+// Pass ?refresh=1 to force a live re-fetch (e.g. user just changed photometry
+// params on STDWeb and wants the new numbers).
 app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
   const { task_id } = req.params;
+  const refresh = req.query.refresh === "1" || req.query.refresh === "true";
   const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
   const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "1e296ddd6738af45467b7bc6558c00a9524447ab";
   const headers = { "Authorization": `Token ${STDWEB_TOKEN}` };
 
   try {
-    // Serve from DB only when photometry AND subtraction data are both present.
-    // If mag_sub and mag_sub_ul are both NULL the subtraction hasn't been
-    // stored yet — fetch live so we get the full result and persist it.
-    const stored = db.prepare(
-      `SELECT r.id, r.target, r.filter, r.obs_date, r.mjd,
-              r.mag_ap, r.magerr_ap, r.mag_sub, r.magerr_sub, r.mag_sub_ul, r.status
-       FROM pipeline_results r
-       WHERE r.stdweb_task_id = ?
-         AND r.mjd IS NOT NULL
-         AND (r.mag_sub IS NOT NULL OR r.mag_sub_ul IS NOT NULL)
-       LIMIT 1`
-    ).get(task_id);
+    // Serve from DB only when photometry AND subtraction data are both present
+    // AND the caller didn't ask for a forced refresh.
+    if (!refresh) {
+      const stored = db.prepare(
+        `SELECT r.id, r.target, r.filter, r.obs_date, r.mjd,
+                r.mag_ap, r.magerr_ap, r.mag_sub, r.magerr_sub, r.mag_sub_ul, r.status
+         FROM pipeline_results r
+         WHERE r.stdweb_task_id = ?
+           AND r.mjd IS NOT NULL
+           AND (r.mag_sub IS NOT NULL OR r.mag_sub_ul IS NOT NULL)
+         LIMIT 1`
+      ).get(task_id);
 
-    if (stored) {
-      return res.json({
-        task_id: parseInt(task_id),
-        target: stored.target,
-        filter: stored.filter,
-        obs_date: stored.obs_date,
-        mjd:    stored.mjd,
-        direct: stored.mag_ap    != null ? { mag: stored.mag_ap,    magerr: stored.magerr_ap }    : null,
-        sub:    stored.mag_sub   != null ? { mag: stored.mag_sub,   magerr: stored.magerr_sub }   : null,
-        sub_ul: stored.mag_sub_ul != null ? { ul: stored.mag_sub_ul } : null,
-        from_db: true,
-      });
+      if (stored) {
+        return res.json({
+          task_id: parseInt(task_id),
+          target: stored.target,
+          filter: stored.filter,
+          obs_date: stored.obs_date,
+          mjd:    stored.mjd,
+          direct: stored.mag_ap    != null ? { mag: stored.mag_ap,    magerr: stored.magerr_ap }    : null,
+          sub:    stored.mag_sub   != null ? { mag: stored.mag_sub,   magerr: stored.magerr_sub }   : null,
+          sub_ul: stored.mag_sub_ul != null ? { ul: stored.mag_sub_ul } : null,
+          from_db: true,
+        });
+      }
     }
 
     // Fetch live from STDWeb
@@ -5419,10 +5464,16 @@ app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
     const html = await fetch(`${STDWEB_URL}/tasks/${task_id}`, { headers })
       .then(r => r.text()).catch(() => "");
 
+    // Match both plain photometry and color-term photometry, e.g.
+    //   "Primary target magnitude is BPmag = 14.26 +/- 0.01"
+    //   "Primary target magnitude is BPmag - 0.03 (BPmag - RPmag) = 14.26 +/- 0.01"
+    // The "Target magnitude is ..." line is anchored to a line start so we don't
+    // accidentally match the "Primary target magnitude is ..." line above it.
+    // The upper-limit regex tolerates both literal '>' and the HTML entity '&gt;'.
     const mjdMatch    = html.match(/MJD is ([\d.]+)/);
-    const directMatch = html.match(/Primary target magnitude is \w+ = ([\d.]+) \+\/- ([\d.]+)/);
-    const subMatch    = html.match(/Target magnitude is \w+ = ([\d.]+) \+\/- ([\d.]+)/);
-    const subUlMatch  = !subMatch && html.match(/Target magnitude upper limit is \w+ > ([\d.]+)/);
+    const directMatch = html.match(/Primary target magnitude is .+? = ([\d.]+) \+\/- ([\d.]+)/);
+    const subMatch    = html.match(/(?:^|\n)\s*Target magnitude is .+? = ([\d.]+) \+\/- ([\d.]+)/m);
+    const subUlMatch  = !subMatch && html.match(/(?:^|\n)\s*Target magnitude upper limit is .+? (?:>|&gt;) ([\d.]+)/m);
 
     const mjd     = mjdMatch    ? parseFloat(mjdMatch[1])    : null;
     const direct  = directMatch ? { mag: parseFloat(directMatch[1]), magerr: parseFloat(directMatch[2]) } : null;
@@ -5438,11 +5489,19 @@ app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
       })() : null;
 
       try {
+        // Use COALESCE(new, existing) for each mag field so a partial parse
+        // (e.g. subtraction not re-run yet) doesn't wipe previously stored
+        // values. obs_date keeps its existing value if already set.
         db.prepare(
           `UPDATE pipeline_results
-           SET mjd=?, obs_date=COALESCE(obs_date,?),
-               mag_ap=?, magerr_ap=?, mag_sub=?, magerr_sub=?, mag_sub_ul=?,
-               updated_at=datetime('now')
+           SET mjd        = ?,
+               obs_date   = COALESCE(obs_date,   ?),
+               mag_ap     = COALESCE(?, mag_ap),
+               magerr_ap  = COALESCE(?, magerr_ap),
+               mag_sub    = COALESCE(?, mag_sub),
+               magerr_sub = COALESCE(?, magerr_sub),
+               mag_sub_ul = COALESCE(?, mag_sub_ul),
+               updated_at = datetime('now')
            WHERE stdweb_task_id=?`
         ).run(mjd, obsDate,
               direct?.mag ?? null, direct?.magerr ?? null,

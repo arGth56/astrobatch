@@ -384,26 +384,46 @@ function startGcnListener(opts) {
     );
   }
 
-  (async () => {
+  const INITIAL_BACKOFF_MS = 5_000;
+  const MAX_BACKOFF_MS     = 5 * 60_000;
+
+  async function connectAndRun() {
     try {
       await consumer.subscribe({ topics: TOPICS });
     } catch (err) {
       if (err?.type === "TOPIC_AUTHORIZATION_FAILED") {
         logger.warn("[alerts] some GCN topics are not accessible — continuing with the others.");
       } else {
-        logger.error("[alerts] subscribe failed:", err);
-        return;
+        throw err;
       }
     }
-    try {
-      await consumer.run({
-        eachMessage: async ({ topic, message }) => {
-          await handleMessage(topic, message.value);
-        },
-      });
-      logger.log(`[alerts] GCN-Kafka listener started — ${TOPICS.length} topics subscribed.`);
-    } catch (err) {
-      logger.error("[alerts] consumer run failed:", err);
+    await consumer.run({
+      eachMessage: async ({ topic, message }) => {
+        await handleMessage(topic, message.value);
+      },
+    });
+    logger.log(`[alerts] GCN-Kafka listener started — ${TOPICS.length} topics subscribed.`);
+  }
+
+  (async () => {
+    let backoff = INITIAL_BACKOFF_MS;
+    let attempt = 0;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        await connectAndRun();
+        backoff = INITIAL_BACKOFF_MS;
+        attempt = 0;
+        await new Promise(() => {});
+      } catch (err) {
+        attempt++;
+        logger.error(`[alerts] consumer crashed (attempt ${attempt}), restarting in ${(backoff / 1000).toFixed(0)}s: ${err?.message || err}`);
+        await new Promise((r) => setTimeout(r, backoff));
+        backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+
+        try { await consumer.disconnect(); } catch (_) {}
+      }
     }
   })();
 

@@ -553,6 +553,14 @@
               <input type="checkbox" id="pipeline-force-fresh" />
               Force fresh
             </label>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;" title="Enable STDWeb photometry color term (use_color=true)">
+              <input type="checkbox" id="pipeline-use-color" checked />
+              Color term
+            </label>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;white-space:nowrap;" title="Refine astrometry / WCS before photometry (refine_wcs=true)">
+              <input type="checkbox" id="pipeline-refine-wcs" checked />
+              Refine astrometry
+            </label>
             <button type="submit" id="pipeline-trigger-btn">&#9654; Trigger</button>
           </form>
           <p style="font-size:12px;color:#6b7280;margin:-8px 0 12px;">
