@@ -683,7 +683,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
             "register pp_i -interp=cu",
-            f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
+            f"stack r_pp_i rej 3 3 -norm=addscale -framing=min{stack_filters}",
             "load r_pp_i_stacked",
             "save res",
         ]
@@ -712,7 +712,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                     retry_lines = [
                         "requires 1.2.0", f'cd "{folder}"',
                         f"register pp_i -interp=cu -ref={ref_n}",
-                        f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
+                        f"stack r_pp_i rej 3 3 -norm=addscale -framing=min{stack_filters}",
                         "load r_pp_i_stacked",
                         "save res",
                     ]
