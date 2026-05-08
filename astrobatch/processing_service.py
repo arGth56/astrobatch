@@ -948,7 +948,7 @@ def stdweb_action(task_id: str, action: str, jlog: JobLogger,
         payload.update({"gain": STDWEB_GAIN, "bias": 0})
     elif action == "photometry":
         payload.update({"sn": 10, "catalog": "gaiadr2"})
-    elif action == "subtract":
+    elif action == "subtraction":
         payload.update({"template": os.environ.get("STDWEB_TEMPLATE", "ztf")})
     if extra:
         payload.update(extra)
