@@ -4,13 +4,15 @@ const path = require("path");
 const https = require("https");
 const http  = require("http");
 const fs    = require("fs");
-const { execSync } = require("child_process");
+const { execSync, spawn } = require("child_process");
 const Database = require("better-sqlite3");
 const alerts = require("./alerts");
 
 const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
+const PYTHON_BIN_CANDIDATE = process.env.PYTHON_BIN || path.join(__dirname, "..", ".venv", "bin", "python");
+const PYTHON_BIN = fs.existsSync(PYTHON_BIN_CANDIDATE) ? PYTHON_BIN_CANDIDATE : "python3";
 
 function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false, force_fresh = false) {
   return new Promise((resolve, reject) => {
@@ -506,6 +508,7 @@ const SETTING_DEFAULTS = {
   zenithLimit:          "70",
   meridianGap:          "10",
   minStars:             "10",
+  maxCloudRecoveryWaitMin: "12",
   frameCheckEnabled:    "false",
   frameCheckThreshold:  "5",
 };
@@ -522,6 +525,156 @@ app.post("/api/settings", (req, res) => {
   if (!key) return res.status(400).json({ success: false, error: "key required" });
   setSetting(key, value ?? "");
   res.json({ success: true });
+});
+
+function runQualityReplay(date, minStars, trailElong, trailSizeFactor, maxEvents) {
+  const script = `
+import json, sys, math
+from pathlib import Path
+import numpy as np
+from astropy.io import fits
+import sep
+
+date = sys.argv[1]
+snap = Path(sys.argv[2])
+min_stars = int(sys.argv[3])
+trail_elong = float(sys.argv[4])
+trail_size_factor = float(sys.argv[5])
+max_events = int(sys.argv[6])
+
+if not snap.exists():
+    print(json.dumps({"success": False, "error": f"Snapshot folder not found: {snap}"}))
+    sys.exit(0)
+
+rows = []
+for fp in sorted(snap.glob("*.fit*")):
+    try:
+        data = fits.getdata(fp, 0)
+        h = fits.getheader(fp, 0)
+    except Exception:
+        continue
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim > 2:
+        arr = arr[0]
+    arr = np.ascontiguousarray(np.nan_to_num(arr, nan=np.nanmedian(arr)))
+    try:
+        b = sep.Background(arr)
+        objs = sep.extract(arr - b, 4.5 * b.globalrms, minarea=5)
+        if len(objs):
+            a = np.array(objs["a"])
+            bb = np.array(objs["b"])
+            flux = np.array(objs["flux"])
+            good = (a > 0.8) & (bb > 0.6) & (flux > 0)
+            a = a[good]
+            bb = bb[good]
+            stars = int(len(a))
+            elong = float(np.median(a / np.maximum(bb, 1e-3))) if stars else None
+            size = float(np.median(np.sqrt(a * bb))) if stars else None
+        else:
+            stars, elong, size = 0, None, None
+    except Exception:
+        stars, elong, size = 0, None, None
+    dt = h.get("DATE-OBS") or h.get("DATEOBS") or h.get("DATE") or ""
+    obj = str(h.get("OBJECT", ""))
+    rows.append((dt, fp.name, obj, stars, elong, size))
+
+rows.sort(key=lambda r: r[0])
+recent_sizes = []
+in_cloud = False
+events = []
+
+for dt, name, obj, stars, elong, size in rows:
+    if stars < min_stars and not in_cloud:
+        events.append({
+            "ts": dt,
+            "type": "CLOUD_RECOVERY_START",
+            "image": name,
+            "target": obj,
+            "reason": f"stars={stars}<min{min_stars}"
+        })
+        in_cloud = True
+    elif stars >= min_stars and in_cloud:
+        in_cloud = False
+
+    if stars >= min_stars:
+        med_size = float(np.median(recent_sizes)) if recent_sizes else None
+        size_trail = (
+            med_size is not None and size is not None and
+            size > med_size * trail_size_factor
+        )
+        elong_trail = (elong is not None and elong >= trail_elong)
+        if elong_trail or size_trail:
+            bits = []
+            if elong_trail:
+                bits.append(f"elong={elong:.2f}")
+            if size_trail:
+                bits.append(f"size_jump={size:.2f}>{med_size * trail_size_factor:.2f}")
+            events.append({
+                "ts": dt,
+                "type": "GUIDING_RECOVERY_START",
+                "image": name,
+                "target": obj,
+                "reason": ", ".join(bits) if bits else "shape anomaly"
+            })
+        elif size is not None and not math.isnan(size) and size > 0:
+            recent_sizes.append(size)
+            if len(recent_sizes) > 8:
+                recent_sizes.pop(0)
+
+if max_events > 0:
+    events = events[:max_events]
+
+print(json.dumps({
+    "success": True,
+    "date": date,
+    "snapshotPath": str(snap),
+    "frameCount": len(rows),
+    "activationCount": len(events),
+    "activations": events
+}))
+`.trim();
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-c", script, date,
+      path.join(NAS_WATCH_PATH, date, "SNAPSHOT"),
+      String(minStars), String(trailElong), String(trailSizeFactor), String(maxEvents),
+    ];
+    const proc = spawn(PYTHON_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    proc.stdout.on("data", (d) => { out += d.toString(); });
+    proc.stderr.on("data", (d) => { err += d.toString(); });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(err.trim() || `Replay exited with code ${code}`));
+      }
+      try {
+        resolve(JSON.parse(out));
+      } catch (e) {
+        reject(new Error(`Invalid replay output: ${e.message}`));
+      }
+    });
+  });
+}
+
+app.get("/api/quality/replay", async (req, res) => {
+  try {
+    const date = String(req.query.date || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ success: false, error: "date must be YYYY-MM-DD", received: date });
+    }
+    const minStarsRaw = Number(req.query.minStars ?? getSetting("minStars", SETTING_DEFAULTS.minStars));
+    const minStars = Number.isFinite(minStarsRaw) ? Math.max(0, Math.round(minStarsRaw)) : 10;
+    const maxEventsRaw = Number(req.query.maxEvents ?? 200);
+    const maxEvents = Number.isFinite(maxEventsRaw) ? Math.max(1, Math.min(1000, Math.round(maxEventsRaw))) : 200;
+    const result = await runQualityReplay(date, minStars, 1.85, 2.0, maxEvents);
+    if (!result?.success) return res.status(404).json(result);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ── Alerts API routes (registered early for Express 5 compatibility) ─────────
@@ -2154,10 +2307,11 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
   checkAbort();
 }
 
-async function stepStartGuiding(target) {
+async function stepStartGuiding(target, opts = {}) {
   const MAX_ATTEMPTS   = 3;
   const SETTLE_TIMEOUT = 3 * 60 * 1000;  // 3 min per attempt to reach "Guiding"
   const RETRY_PAUSE    = 15_000;          // 15 s between stop → restart
+  const allowLostLock  = opts.allowLostLock === true;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     seqState.currentStep = attempt === 1
@@ -2186,13 +2340,13 @@ async function stepStartGuiding(target) {
         target,
         (info) => {
           const s = info?.Guider?.State;
-          return s === "Guiding" || s === "LostLock";
+          return s === "Guiding" || (allowLostLock && s === "LostLock");
         },
         SETTLE_TIMEOUT,
         3000,
       );
       seqLog("Guiding active ✓");
-      return; // success
+      return true; // success
     } catch {
       if (attempt < MAX_ATTEMPTS) {
         seqLog(`  PHD2 did not settle within ${SETTLE_TIMEOUT / 60000} min — retrying...`, "warn");
@@ -2201,6 +2355,7 @@ async function stepStartGuiding(target) {
       }
     }
   }
+  return false;
 }
 
 // ── Dust Cover (Alnitak Flip-Flat / NINA FlatDevice) ─────────────────────────
@@ -2583,21 +2738,59 @@ async function patchFitsFilterHeaders(beforeFiles, filterName) {
 
 /**
  * Fetch NINA's post-capture star statistics for the last image.
- * Returns { stars, hfr } or null if the endpoint is unavailable.
+ * Returns stats object (stars, hfr, eccentricity, roundness, elongation)
+ * or null if the endpoint is unavailable.
  */
 async function fetchLastImageStats(target) {
+  const toNum = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
   try {
     const res = await callNinaLong(
       target, "/v2/api/equipment/camera/capture/statistics", {}, 30000,
     );
     const r = res.body?.Response;
     if (!r) return null;
-    const stars = r.Stars ?? r.DetectedStars ?? null;
-    const hfr   = r.HFR ?? null;
-    return (stars !== null) ? { stars: Number(stars), hfr: Number(hfr) } : null;
+    const stars = toNum(r.Stars ?? r.DetectedStars);
+    if (stars === null) return null;
+    const hfr = toNum(r.HFR);
+    const eccentricity = toNum(
+      r.Eccentricity
+      ?? r.MedianEccentricity
+      ?? r.StarEccentricity
+      ?? r.AverageEccentricity
+    );
+    const roundness = toNum(
+      r.Roundness
+      ?? r.MedianRoundness
+      ?? r.StarRoundness
+      ?? r.AverageRoundness
+    );
+    const directElong = toNum(
+      r.Elongation
+      ?? r.MedianElongation
+      ?? r.StarElongation
+      ?? r.AverageElongation
+    );
+    const derivedElong = (
+      eccentricity !== null && eccentricity >= 0 && eccentricity < 0.995
+    ) ? (1 / Math.sqrt(1 - (eccentricity * eccentricity))) : null;
+    const elongation = directElong ?? derivedElong;
+
+    return { stars, hfr, eccentricity, roundness, elongation };
   } catch {
     return null;
   }
+}
+
+function medianNumber(values) {
+  const nums = values.filter(v => Number.isFinite(v)).sort((a, b) => a - b);
+  if (!nums.length) return null;
+  const mid = Math.floor(nums.length / 2);
+  return nums.length % 2 === 0
+    ? (nums[mid - 1] + nums[mid]) / 2
+    : nums[mid];
 }
 
 /**
@@ -2683,6 +2876,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
   checkAbort();
 
   let saved = 0;
+  const recentGoodHfr = [];
   for (let i = 1; i <= count; i++) {
     checkAbort();
 
@@ -2752,9 +2946,20 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
     // NINA already ran star detection; we just fetch the result.
     // If too few stars → clouds → discard frame, wait, retake.
     // Only proceed to plate-solve drift check when stars look OK.
-    const MIN_STARS      = safetyLimits.minStars ?? 10;
-    const CLOUD_WAIT_MS  = 90_000;   // 90 s pause between retries
-    const MAX_RETAKES    = 3;        // max cloud retakes before giving up on this frame
+    const MIN_STARS          = safetyLimits.minStars ?? 10;
+    const CLOUD_WAIT_MS      = 90_000;          // used by re-centering retries below
+    const CLOUD_PROBE_EXP_S  = 5;               // probe frame for cloud recovery
+    const CLOUD_PROBE_GAP_MS = 20_000;          // pause between probes
+    const cloudRecoveryWaitMinRaw = Number(safetyLimits.maxCloudRecoveryWaitMin ?? 12);
+    const cloudRecoveryWaitMin = Number.isFinite(cloudRecoveryWaitMinRaw)
+      ? Math.min(120, Math.max(1, cloudRecoveryWaitMinRaw))
+      : 12;
+    const CLOUD_PROBE_MAX_MS = cloudRecoveryWaitMin * 60_000; // max wait for stars to come back
+    const MAX_RETAKES        = 3;               // max cloud retakes before giving up on this frame
+    const TRAIL_ELONG_LIMIT  = 1.85;
+    const TRAIL_ECC_LIMIT    = 0.72;
+    const TRAIL_HFR_FACTOR   = 2.0;
+    const MAX_TRAIL_RECOVERY = 2;
 
     /**
      * Retake the current frame.
@@ -2779,6 +2984,66 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
       return await fetchLastImageStats(target);
     };
 
+    const waitForCloudRecovery = async () => {
+      const deadline = Date.now() + CLOUD_PROBE_MAX_MS;
+      let probeNo = 0;
+      while (Date.now() < deadline) {
+        checkAbort();
+        probeNo++;
+        seqState.currentStep = `⛅ Cloud wait: 5s probe ${probeNo}`;
+        await checkMountSafetyForFrame(target, safetyLimits);
+
+        try {
+          const probeResult = await callNinaLong(
+            target,
+            "/v2/api/equipment/camera/capture",
+            { duration: CLOUD_PROBE_EXP_S, gain, save: false, filter: filterName },
+            30000,
+          );
+          if (!isNinaApiSuccess(probeResult)) {
+            seqLog(`Cloud probe rejected: ${probeResult.body?.Error || probeResult.status}`, "warn");
+          }
+        } catch (e) {
+          seqLog(`Cloud probe network error: ${e.message} — retrying`, "warn");
+        }
+
+        await waitExposure(CLOUD_PROBE_EXP_S);
+        checkAbort();
+        try { await waitForCameraIdle(target, 120_000); } catch { await new Promise(r => setTimeout(r, 20_000)); }
+
+        const probeStats = await fetchLastImageStats(target);
+        if (probeStats?.stars != null) {
+          if (probeStats.stars >= MIN_STARS) {
+            seqLog(`☀ Cloud recovery: ${probeStats.stars} stars on 5s probe — resuming science frame`);
+            return true;
+          }
+          seqLog(`⛅ Cloud probe ${probeNo}: only ${probeStats.stars} stars (need ${MIN_STARS})`, "warn");
+        } else {
+          seqLog(`⛅ Cloud probe ${probeNo}: no star stats returned`, "warn");
+        }
+
+        const gapDeadline = Date.now() + CLOUD_PROBE_GAP_MS;
+        while (Date.now() < gapDeadline) {
+          checkAbort();
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      }
+      return false;
+    };
+
+    const isLikelyTrailing = (stats) => {
+      if (!stats || stats.stars == null || stats.stars < MIN_STARS) return false;
+      const baselineHfr = medianNumber(recentGoodHfr);
+      const hfrTrail = (
+        baselineHfr !== null
+        && Number.isFinite(stats.hfr)
+        && stats.hfr > baselineHfr * TRAIL_HFR_FACTOR
+      );
+      const eccTrail = Number.isFinite(stats.eccentricity) && stats.eccentricity >= TRAIL_ECC_LIMIT;
+      const elongTrail = Number.isFinite(stats.elongation) && stats.elongation >= TRAIL_ELONG_LIMIT;
+      return hfrTrail || eccTrail || elongTrail;
+    };
+
     let imgStats  = await fetchLastImageStats(target);
     let retakes   = 0;
     let frameGood = true;   // set false only if we exhaust retakes
@@ -2788,20 +3053,15 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
         retakes++;
         seqLog(
           `⛅ ${filterName} ${i}/${count}: ${imgStats.stars} stars < min ${MIN_STARS} ` +
-          `— cloud passage detected. Waiting ${CLOUD_WAIT_MS / 1000}s then retaking ` +
+          `— cloud passage detected. Probing with 5s frames before retake ` +
           `(${retakes}/${MAX_RETAKES})...`,
           "warn",
         );
-        seqState.currentStep = `⛅ Cloud — retake ${retakes}/${MAX_RETAKES} waiting...`;
-        // Poll every 30 s — bail out early if watchdog says sky clear
-        const frameDeadline = Date.now() + CLOUD_WAIT_MS;
-        while (Date.now() < frameDeadline) {
-          checkAbort();
-          await new Promise(r => setTimeout(r, 30_000));
-          if (watchdog.enabled && watchdog.state === "clear") {
-            seqLog("☀ Sky cleared (watchdog) — retrying frame early");
-            break;
-          }
+        seqState.currentStep = `⛅ Cloud — probing sky (${retakes}/${MAX_RETAKES})`;
+        const recovered = await waitForCloudRecovery();
+        if (!recovered) {
+          seqLog(`⛅ Cloud did not clear within ${cloudRecoveryWaitMin} min`, "warn");
+          break;
         }
         checkAbort();
         imgStats = await doRetake();
@@ -2815,6 +3075,34 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
         const hfrStr = imgStats.hfr > 0 ? `  HFR=${imgStats.hfr.toFixed(2)}` : "";
         seqLog(`  Stars: ${imgStats.stars}${hfrStr} ✓`);
       }
+    }
+
+    // ── Step A2: Trailing gate — restart guiding + retake ─────────────────
+    let trailRecovery = 0;
+    while (isLikelyTrailing(imgStats) && trailRecovery < MAX_TRAIL_RECOVERY) {
+      trailRecovery++;
+      const statsBits = [];
+      if (Number.isFinite(imgStats?.hfr)) statsBits.push(`HFR=${imgStats.hfr.toFixed(2)}`);
+      if (Number.isFinite(imgStats?.eccentricity)) statsBits.push(`Ecc=${imgStats.eccentricity.toFixed(2)}`);
+      if (Number.isFinite(imgStats?.elongation)) statsBits.push(`Elong=${imgStats.elongation.toFixed(2)}`);
+      seqLog(
+        `⚠ ${filterName} ${i}/${count}: likely trailing (${statsBits.join(", ") || "shape anomaly"}) — restarting guiding + retake (${trailRecovery}/${MAX_TRAIL_RECOVERY})`,
+        "warn",
+      );
+      const guidingOk = await stepStartGuiding(target);
+      if (!guidingOk) {
+        seqLog("  Guiding did not settle after restart attempt — retaking anyway", "warn");
+      }
+      imgStats = await doRetake();
+      if (imgStats === null) break;
+    }
+    if (isLikelyTrailing(imgStats)) {
+      seqLog(`⚠ ${filterName} ${i}/${count}: frame still looks trailed after guiding recovery`, "warn");
+      frameGood = false;
+    }
+    if (imgStats !== null && imgStats.stars >= MIN_STARS && Number.isFinite(imgStats.hfr) && imgStats.hfr > 0) {
+      recentGoodHfr.push(imgStats.hfr);
+      if (recentGoodHfr.length > 8) recentGoodHfr.shift();
     }
 
     // ── Step B: Drift check — plate-solve only when stars are present ─────
@@ -2875,7 +3163,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
 async function runSequence(ninaConfig, seqConfig) {
   const {
     duration, gain, count, filters: filterNames, solveEnabled,
-    minAlt = 20, meridianGap = 10, zenithLimit = 70, minStars = 10,
+    minAlt = 20, meridianGap = 10, zenithLimit = 70, minStars = 10, maxCloudRecoveryWaitMin = 12,
     frameCheckEnabled = false, frameCheckThresholdArcmin = 5, solveExp = 5,
   } = seqConfig;
   function liveSafetyLimits() {
@@ -2884,6 +3172,7 @@ async function runSequence(ninaConfig, seqConfig) {
       meridianGap:      Number(getSetting("meridianGap",     meridianGap)),
       zenithLimit:      Number(getSetting("zenithLimit",     zenithLimit)),
       minStars:         Number(getSetting("minStars",        minStars)),
+      maxCloudRecoveryWaitMin: Number(getSetting("maxCloudRecoveryWaitMin", maxCloudRecoveryWaitMin)),
       frameCheckEnabled:        getSetting("frameCheckEnabled", String(frameCheckEnabled)) === "true",
       frameCheckThresholdArcmin: Number(getSetting("frameCheckThresholdArcmin", frameCheckThresholdArcmin)),
       solveExp:         Number(getSetting("solveExp",        solveExp)),
@@ -3219,8 +3508,9 @@ async function runSequence(ninaConfig, seqConfig) {
         checkAbort();
 
         // ── Step 5: Guiding ──────────────────────────────────────────────────
-        await stepStartGuiding(ninaConfig);
-        await waitForConfirmation(`Guiding active — proceed to captures?`);
+        const guidingOk = await stepStartGuiding(ninaConfig);
+        if (!guidingOk) seqLog("⚠ Guiding failed to settle — continuing with caution", "warn");
+        await waitForConfirmation(guidingOk ? `Guiding active — proceed to captures?` : `Guiding did not settle — continue anyway?`);
         checkAbort();
 
         // ── Step 6: Capture each filter ──────────────────────────────────────
@@ -3300,7 +3590,8 @@ async function runSequence(ninaConfig, seqConfig) {
             await stepSlewWithCloudRetry(ninaConfig, t.raDeg, t.decDeg, t.name, {
               center: useCenter, cloudWaitMs: 2 * 60 * 1000, maxRetries: 4,
             });
-            await stepStartGuiding(ninaConfig);
+            const guidingOkResume = await stepStartGuiding(ninaConfig);
+            if (!guidingOkResume) seqLog("⚠ Guiding failed to settle on resume — continuing with caution", "warn");
 
             const { equipmentInfo: reInfo } = await getEquipmentInfo(ninaConfig);
             const reFilters = reInfo?.FilterWheel?.AvailableFilters || [];
@@ -3368,7 +3659,8 @@ async function runSequence(ninaConfig, seqConfig) {
               await stepSlewWithCloudRetry(ninaConfig, t.raDeg, t.decDeg, t.name, {
                 center: useCenter, cloudWaitMs: 2 * 60 * 1000, maxRetries: 4,
               });
-              await stepStartGuiding(ninaConfig);
+              const guidingOkRetry = await stepStartGuiding(ninaConfig);
+              if (!guidingOkRetry) seqLog("⚠ Guiding failed to settle after retry slew — continuing with caution", "warn");
               const remainingFilters = targetFilters.filter(f => !completedFilters.has(f));
               if (completedFilters.size > 0) seqLog(`  ↳ retry: skipping already-done filters [${[...completedFilters].join(", ")}], running: [${remainingFilters.join(", ")}]`);
               for (const filterName of remainingFilters) {
@@ -5402,7 +5694,10 @@ app.post("/api/test/filter-patch", async (req, res) => {
 // GET /api/stdweb/health  — returns { reachable, url, status? }
 app.get("/api/stdweb/health", async (req, res) => {
   const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "1e296ddd6738af45467b7bc6558c00a9524447ab";
+  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "";
+  if (!STDWEB_TOKEN) {
+    return res.status(400).json({ reachable: false, error: "STDWEB_TOKEN is not configured", url: STDWEB_URL });
+  }
   try {
     const r = await fetch(`${STDWEB_URL}/api/tasks/`, {
       headers: { "Authorization": `Token ${STDWEB_TOKEN}` },
@@ -5424,7 +5719,10 @@ app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
   const { task_id } = req.params;
   const refresh = req.query.refresh === "1" || req.query.refresh === "true";
   const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "1e296ddd6738af45467b7bc6558c00a9524447ab";
+  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "";
+  if (!STDWEB_TOKEN) {
+    return res.status(400).json({ success: false, error: "STDWEB_TOKEN is not configured" });
+  }
   const headers = { "Authorization": `Token ${STDWEB_TOKEN}` };
 
   try {

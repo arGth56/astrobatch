@@ -780,6 +780,7 @@ tabSettingsBtn.addEventListener("click", () => {
   setActiveTab("settings");
   loadWatchdogConfig();
   loadArbiterConfig();
+  initQualityReplayDefaults();
   startWatchdogPolling();
   loadCoverDisabled();
 });
@@ -1400,21 +1401,27 @@ function seqConfig() {
     meridianGap:               Number(document.getElementById("set-meridian-gap")?.value)   || 10,
     zenithLimit:               Number(document.getElementById("set-zenith-limit")?.value)   || 70,
     minStars:                  Number(document.getElementById("set-min-stars")?.value)      ?? 10,
+    maxCloudRecoveryWaitMin:   Number(document.getElementById("set-max-cloud-recovery-min")?.value) ?? 12,
   };
 }
 
 // ── Arbiter / Safety limits — load from DB, save to DB ───────────────────────
 async function loadArbiterConfig() {
   try {
-    const keys = ["minAlt","zenithLimit","meridianGap","minStars","frameCheckEnabled","frameCheckThreshold"];
+    const keys = [
+      "minAlt", "zenithLimit", "meridianGap",
+      "minStars", "maxCloudRecoveryWaitMin",
+      "frameCheckEnabled", "frameCheckThreshold",
+    ];
     const results = await Promise.all(keys.map(k =>
       fetch(`/api/settings/${k}`).then(r => r.ok ? r.json() : null).catch(() => null)
     ));
-    const [minAlt, zenithLimit, meridianGap, minStars, frameCheckEnabled, frameCheckThreshold] = results;
+    const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin, frameCheckEnabled, frameCheckThreshold] = results;
     if (minAlt          != null) document.getElementById("set-minalt").value                   = minAlt.value          ?? 20;
     if (zenithLimit     != null) document.getElementById("set-zenith-limit").value             = zenithLimit.value     ?? 70;
     if (meridianGap     != null) document.getElementById("set-meridian-gap").value             = meridianGap.value     ?? 10;
     if (minStars        != null) document.getElementById("set-min-stars").value                = minStars.value        ?? 10;
+    if (maxCloudRecoveryWaitMin != null) document.getElementById("set-max-cloud-recovery-min").value = maxCloudRecoveryWaitMin.value ?? 12;
     if (frameCheckEnabled != null) document.getElementById("set-frame-check-enable").checked  = frameCheckEnabled.value === "true";
     if (frameCheckThreshold != null) document.getElementById("set-frame-check-threshold").value = frameCheckThreshold.value ?? 5;
   } catch { /* non-fatal */ }
@@ -1425,7 +1432,6 @@ document.getElementById("arbiter-save")?.addEventListener("click", async () => {
     minAlt:               document.getElementById("set-minalt").value,
     zenithLimit:          document.getElementById("set-zenith-limit").value,
     meridianGap:          document.getElementById("set-meridian-gap").value,
-    minStars:             document.getElementById("set-min-stars").value,
     frameCheckEnabled:    String(document.getElementById("set-frame-check-enable").checked),
     frameCheckThreshold:  document.getElementById("set-frame-check-threshold").value,
   };
@@ -1440,6 +1446,112 @@ document.getElementById("arbiter-save")?.addEventListener("click", async () => {
     setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
   } catch (e) {
     alert("Failed to save arbiter settings: " + e.message);
+  }
+});
+
+document.getElementById("quality-save")?.addEventListener("click", async () => {
+  const settings = {
+    minStars:               document.getElementById("set-min-stars").value,
+    maxCloudRecoveryWaitMin: document.getElementById("set-max-cloud-recovery-min").value,
+  };
+  try {
+    await Promise.all(Object.entries(settings).map(([key, value]) =>
+      fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value }),
+      })
+    ));
+    const btn = document.getElementById("quality-save");
+    const orig = btn.textContent;
+    btn.textContent = "Saved ✓";
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+  } catch (e) {
+    alert("Failed to save quality gates: " + e.message);
+  }
+});
+
+async function initQualityReplayDefaults() {
+  const dateInput = document.getElementById("quality-replay-date");
+  if (!dateInput) return;
+  if (!dateInput.value) {
+    dateInput.value = new Date().toISOString().slice(0, 10);
+  }
+  try {
+    const res = await fetch("/api/pipeline/nas-dates");
+    const data = await res.json();
+    if (data?.success && Array.isArray(data.dates) && data.dates.length) {
+      dateInput.value = data.dates[0];
+    }
+  } catch { /* non-fatal */ }
+}
+
+function renderQualityReplay(result) {
+  const body = document.getElementById("quality-replay-body");
+  if (!body) return;
+  body.innerHTML = "";
+  const activations = Array.isArray(result?.activations) ? result.activations : [];
+  if (!activations.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.style.padding = "8px";
+    td.style.color = "#64748b";
+    td.textContent = "No activation events for this night.";
+    tr.appendChild(td);
+    body.appendChild(tr);
+    return;
+  }
+  activations.forEach((ev) => {
+    const tr = document.createElement("tr");
+    const cells = [
+      ev.ts || "",
+      ev.type || "",
+      ev.target || "",
+      ev.image || "",
+      ev.reason || "",
+    ];
+    cells.forEach((txt, idx) => {
+      const td = document.createElement("td");
+      td.style.padding = "6px";
+      td.style.borderBottom = "1px solid #1e293b";
+      td.style.verticalAlign = "top";
+      if (idx === 1) {
+        td.style.color = String(txt).includes("CLOUD") ? "#fbbf24" : "#fca5a5";
+      }
+      td.textContent = txt;
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+}
+
+document.getElementById("quality-replay-run")?.addEventListener("click", async () => {
+  const date = document.getElementById("quality-replay-date")?.value;
+  const maxEvents = Number(document.getElementById("quality-replay-max-events")?.value || 200);
+  const status = document.getElementById("quality-replay-status");
+  const btn = document.getElementById("quality-replay-run");
+  if (!date) {
+    if (status) status.textContent = "Pick a date first.";
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = "Running..."; }
+  if (status) status.textContent = "Replaying night FITS (can take 10-60s)...";
+  try {
+    const q = new URLSearchParams({
+      date,
+      maxEvents: String(Math.max(10, Math.min(1000, Math.round(maxEvents) || 200))),
+    });
+    const res = await fetch(`/api/quality/replay?${q.toString()}`);
+    const data = await res.json();
+    if (!res.ok || !data?.success) throw new Error(data?.error || `HTTP ${res.status}`);
+    renderQualityReplay(data);
+    if (status) status.textContent = `${data.activationCount ?? 0} activations from ${data.frameCount ?? 0} frames (${data.date})`;
+  } catch (e) {
+    if (status) status.textContent = `Replay failed: ${e.message}`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Run Replay"; }
   }
 });
 

@@ -50,7 +50,7 @@ DATA_DIR.mkdir(exist_ok=True)
 # ── STDWeb ────────────────────────────────────────────────────────────────────
 
 STDWEB_URL   = os.environ.get("STDWEB_URL",   "http://86.253.141.183:7000")
-STDWEB_TOKEN = os.environ.get("STDWEB_TOKEN", "1e296ddd6738af45467b7bc6558c00a9524447ab")
+STDWEB_TOKEN = os.environ.get("STDWEB_TOKEN", "")
 SIRIL_BIN    = os.environ.get("SIRIL_BIN",    "siril")
 
 # IMX533 @ NINA gain=10 → ~2.8 e/ADU (14-bit ADC, scaled ×4 to 16-bit by NINA,

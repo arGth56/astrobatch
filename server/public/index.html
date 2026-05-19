@@ -900,9 +900,6 @@
             <label title="Pause target when |HA| is smaller than this (meridian cable protection)">Meridian gap (°)
               <input id="set-meridian-gap" type="number" min="0" max="30" step="1" value="10" style="width:68px;" autocomplete="off" />
             </label>
-            <label title="Minimum stars detected per frame; fewer = cloudy → retake (0 = disabled)">Min stars / frame
-              <input id="set-min-stars" type="number" min="0" step="1" value="10" style="width:68px;" autocomplete="off" />
-            </label>
           </div>
           <div class="inline-form" style="margin-bottom:12px;align-items:center;gap:10px;">
             <label class="seq-toggle-label" style="align-self:center;">
@@ -960,6 +957,55 @@
               <span id="mount-monitor-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#6b7280;flex-shrink:0;"></span>
               <span id="mount-monitor-text" style="color:#94a3b8;">Park monitor: —</span>
               <span id="mount-monitor-last" style="color:#475569;font-size:12px;margin-left:auto;"></span>
+            </div>
+          </div>
+
+          <!-- Image quality recovery -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Image Quality Recovery</h3>
+          <p class="hint" style="margin-bottom:12px;">
+            Separate from watchdog: these gates react to stars/trailing in captured images.
+          </p>
+          <div class="inline-form" style="margin-bottom:12px;align-items:center;gap:10px;">
+            <label title="Minimum stars detected per frame; fewer = cloudy → cloud-recovery probes (0 = disabled)">Min stars / frame
+              <input id="set-min-stars" type="number" min="0" step="1" value="10" style="width:72px;" autocomplete="off" />
+            </label>
+            <label title="Maximum wait for cloud recovery probes before giving up for this frame">Max cloud recovery wait (min)
+              <input id="set-max-cloud-recovery-min" type="number" min="1" max="120" step="1" value="12" style="width:72px;" autocomplete="off" />
+            </label>
+            <div class="buttons">
+              <button id="quality-save" type="button">Save Quality Gates</button>
+            </div>
+          </div>
+          <div style="margin-bottom:6px;padding:10px 12px;border:1px solid #1e293b;border-radius:8px;background:#0f172a;">
+            <div style="font-size:13px;color:#93c5fd;margin-bottom:8px;">Replay Activations (Cloud/Trailing)</div>
+            <div class="inline-form" style="margin-bottom:8px;align-items:center;gap:10px;">
+              <label>Date
+                <input id="quality-replay-date" type="date" style="width:148px;" autocomplete="off" />
+              </label>
+              <label title="Maximum number of activation events returned">Max events
+                <input id="quality-replay-max-events" type="number" min="10" max="1000" step="10" value="200" style="width:80px;" autocomplete="off" />
+              </label>
+              <div class="buttons">
+                <button id="quality-replay-run" type="button">Run Replay</button>
+              </div>
+              <span id="quality-replay-status" style="font-size:12px;color:#94a3b8;"></span>
+            </div>
+            <div style="max-height:260px;overflow:auto;border:1px solid #1e293b;border-radius:6px;">
+              <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead style="position:sticky;top:0;background:#0b1220;">
+                  <tr>
+                    <th style="text-align:left;padding:6px;border-bottom:1px solid #1e293b;">Time (UTC)</th>
+                    <th style="text-align:left;padding:6px;border-bottom:1px solid #1e293b;">Type</th>
+                    <th style="text-align:left;padding:6px;border-bottom:1px solid #1e293b;">Target</th>
+                    <th style="text-align:left;padding:6px;border-bottom:1px solid #1e293b;">Image</th>
+                    <th style="text-align:left;padding:6px;border-bottom:1px solid #1e293b;">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="quality-replay-body">
+                  <tr><td colspan="5" style="padding:8px;color:#64748b;">Run replay to see activation points.</td></tr>
+                </tbody>
+              </table>
             </div>
           </div>
 
