@@ -821,6 +821,7 @@ tabSettingsBtn.addEventListener("click", () => {
   initQualityReplayDefaults();
   startWatchdogPolling();
   loadCoverDisabled();
+  loadStdwebTokenStatus();
 });
 
 async function loadCoverDisabled() {
@@ -2180,7 +2181,7 @@ window.addEventListener("resize", () => {
   if (lastTargetCoords.raDeg != null) drawVisibility();
 });
 
-tabPipelineBtn.addEventListener("click",  () => { setActiveTab("pipeline"); loadStdwebTokenStatus(); });
+tabPipelineBtn.addEventListener("click",  () => setActiveTab("pipeline"));
 tabHistoryBtn.addEventListener("click",   () => { setActiveTab("history"); loadHistory(); });
 
 // ── Target History ────────────────────────────────────────────────────────────

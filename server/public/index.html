@@ -524,20 +524,6 @@
         <div id="panel-pipeline" class="tab-panel">
           <h2>Processing Pipeline</h2>
 
-          <details class="tns-creds" style="margin-bottom:16px;">
-            <summary>API Credentials</summary>
-            <div class="inline-form" style="margin-top:10px;align-items:flex-end;gap:10px;">
-              <label class="wide">STDWeb Token
-                <input id="stdweb-token-input" type="password" placeholder="••••••••••••••••" autocomplete="off" />
-              </label>
-              <div class="buttons">
-                <button id="stdweb-token-save" type="button">Save Token</button>
-              </div>
-              <span id="stdweb-token-status" style="font-size:12px;color:#94a3b8;white-space:nowrap;"></span>
-            </div>
-            <p class="hint">Token stored on the server — takes effect immediately, no restart needed. Value is never displayed after saving.</p>
-          </details>
-
           <form id="pipeline-trigger-form" class="inline-form" style="margin-bottom:16px;">
             <label>
               Date
@@ -896,6 +882,20 @@
               <button id="settings-ocs-test" type="button">Test OCS</button>
             </div>
           </form>
+
+          <!-- Arbiter & Safety Limits -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">API Credentials</h3>
+          <p class="hint" style="margin-bottom:10px;">Stored on the server — survive restarts, take effect immediately.</p>
+          <div class="inline-form" style="margin-bottom:6px;align-items:flex-end;gap:10px;">
+            <label class="wide">STDWeb Token
+              <input id="stdweb-token-input" type="password" placeholder="••••••••••••••••" autocomplete="off" />
+            </label>
+            <div class="buttons">
+              <button id="stdweb-token-save" type="button">Save Token</button>
+            </div>
+            <span id="stdweb-token-status" style="font-size:12px;color:#94a3b8;white-space:nowrap;"></span>
+          </div>
 
           <!-- Arbiter & Safety Limits -->
           <hr style="border-color:#1e293b;margin:18px 0;" />
