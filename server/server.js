@@ -1015,6 +1015,17 @@ async function runWatchdogCheck() {
           console.error("[watchdog] Park failed:", e.message);
         }
 
+        // If rain detected: also command OCS to close roof (backup to OCS auto-close firmware)
+        if (rainBad) {
+          console.log("[watchdog] Rain detected — commanding OCS roof close as safety backup...");
+          try {
+            await ocsGet(DEFAULT_OCS_HOST, { roof: "close" });
+            console.log("[watchdog] OCS roof close command sent ✓");
+          } catch (e) {
+            console.error("[watchdog] OCS roof close command failed:", e.message);
+          }
+        }
+
         // Close dust cover immediately after parking — protect optics from rain
         try {
           const cfg = seqState.ninaConfig;
