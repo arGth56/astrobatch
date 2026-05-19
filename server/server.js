@@ -399,7 +399,7 @@ async function pollAndStoreOcs() {
   }
 }
 
-setInterval(pollAndStoreOcs, 10 * 60 * 1000);  // every 10 min
+setInterval(pollAndStoreOcs, 10 * 60 * 1000);  // store to DB every 10 min
 setTimeout(pollAndStoreOcs, 8000);              // initial reading after server startup
 
 // ── Queue persistence helpers ─────────────────────────────────────────────────
@@ -1124,7 +1124,7 @@ async function runWatchdogCheck() {
 function applyWatchdogInterval() {
   if (watchdog._interval) { clearInterval(watchdog._interval); watchdog._interval = null; }
   if (watchdog.enabled) {
-    watchdog._interval = setInterval(runWatchdogCheck, 60 * 1000);
+    watchdog._interval = setInterval(runWatchdogCheck, 10 * 1000);  // safety check every 10s
     runWatchdogCheck(); // immediate first check
   }
 }
