@@ -993,6 +993,15 @@ async function runWatchdogCheck() {
   if (sqBad)   reasons.push(`SQ=${sq} < ${watchdog.sqLimit}`);
   watchdog.lastMsg = conditionsBad ? `Bad: ${reasons.join(", ")}` : `Clear (IR=${irSky ?? "?"}°C, SQ=${sq ?? "?"})`;
 
+  // Rain radar forecast check — non-blocking, runs in background
+  fetchRainForecast().then(fc => {
+    watchdog.rainForecast = fc;
+    if (fc.warnLevel === "imminent" && !conditionsBad) {
+      console.warn(`[watchdog] Rain radar: IMMINENT (${fc.maxProb30}% in next 30 min) — prepare to close`);
+      if (seqState.running) seqLog(`⚠ Rain radar: ${fc.maxProb30}% chance in next 30 min`, "warn");
+    }
+  }).catch(() => {});  // forecast failure never blocks the watchdog
+
   if (conditionsBad) {
     watchdog.clearSince = null;
     if (watchdog.state !== "bad") {
@@ -1215,6 +1224,7 @@ app.get("/api/watchdog", (req, res) => {
     coverClosed:    watchdog.coverClosed,
     badSince:       watchdog.badSince,
     safetyOverride: watchdog.safetyOverride,
+    rainForecast:   watchdog.rainForecast || null,
     mountMonitor: {
       lastAtPark:   mountMonitor.lastAtPark,
       lastCheck:    mountMonitor.lastCheck ?? null,
@@ -5101,6 +5111,55 @@ app.post("/api/ocs/roof", async (req, res) => {
       host,
       error: error.name === "AbortError" ? "Connection timed out" : error.message,
     });
+  }
+});
+
+// ── Rain radar forecast (Open-Meteo, free, no key) ───────────────────────────
+// GET /api/weather/forecast  → next 2h in 15-min slots + rain warning level
+const OBS_LAT = parseFloat(process.env.OBS_LAT || "47.75");
+const OBS_LON = parseFloat(process.env.OBS_LON || "-2.83");
+
+let _rainForecastCache = null;
+let _rainForecastTs    = 0;
+const RAIN_FORECAST_TTL_MS = 10 * 60 * 1000; // refresh every 10 min
+
+async function fetchRainForecast() {
+  if (_rainForecastCache && Date.now() - _rainForecastTs < RAIN_FORECAST_TTL_MS) {
+    return _rainForecastCache;
+  }
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${OBS_LAT}&longitude=${OBS_LON}` +
+    `&minutely_15=precipitation,precipitation_probability&forecast_days=1&timezone=UTC`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`Open-Meteo HTTP ${r.status}`);
+  const d = await r.json();
+  const times = d.minutely_15?.time || [];
+  const prob  = d.minutely_15?.precipitation_probability || [];
+  const prec  = d.minutely_15?.precipitation || [];
+  const now = new Date().toISOString().slice(0, 16);
+  const startIdx = Math.max(0, times.findIndex(t => t >= now));
+  // Next 8 slots = 2 hours
+  const slots = [];
+  for (let i = startIdx; i < Math.min(startIdx + 8, times.length); i++) {
+    slots.push({ time: times[i], prob: prob[i] ?? null, prec: prec[i] ?? null });
+  }
+  // Warning level: max prob in next 30 min (2 slots)
+  const next30Prob = slots.slice(0, 2).map(s => s.prob ?? 0);
+  const next60Prob = slots.slice(0, 4).map(s => s.prob ?? 0);
+  const maxProb30 = Math.max(...next30Prob);
+  const maxProb60 = Math.max(...next60Prob);
+  const warnLevel = maxProb30 >= 70 ? "imminent" : maxProb60 >= 50 ? "likely" : maxProb60 >= 25 ? "possible" : "clear";
+  const result = { slots, maxProb30, maxProb60, warnLevel, fetchedAt: new Date().toISOString() };
+  _rainForecastCache = result;
+  _rainForecastTs    = Date.now();
+  return result;
+}
+
+app.get("/api/weather/forecast", async (req, res) => {
+  try {
+    const forecast = await fetchRainForecast();
+    res.json({ success: true, ...forecast });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 

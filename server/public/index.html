@@ -188,6 +188,20 @@
 
           <hr style="margin:20px 0; border-color: #333;" />
 
+          <!-- Rain radar forecast -->
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 8px;">Rain Radar Forecast</h3>
+          <div id="rain-forecast-bar" style="display:flex;gap:4px;align-items:flex-end;margin-bottom:8px;min-height:48px;">
+            <span style="font-size:12px;color:#64748b;">Loading…</span>
+          </div>
+          <div id="rain-forecast-warn" style="display:none;font-size:13px;padding:6px 10px;border-radius:5px;margin-bottom:8px;"></div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+            <a id="rain-radar-link" href="https://www.windy.com/?rain,47.75,-2.83,9" target="_blank"
+               style="font-size:12px;color:#60a5fa;text-decoration:none;">Open rain radar map ↗</a>
+            <span id="rain-forecast-updated" style="font-size:11px;color:#475569;"></span>
+          </div>
+
+          <hr style="margin:20px 0; border-color: #333;" />
+
           <div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">
             <h3 style="margin:0;">48h Weather Timeline</h3>
             <select id="ocs-history-hours" style="background:#1a1a1a;color:#ccc;border:1px solid #444;padding:3px 8px;border-radius:4px;">

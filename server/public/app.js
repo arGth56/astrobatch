@@ -815,7 +815,7 @@ document.getElementById("stdweb-token-save")?.addEventListener("click", async ()
 
 tabDevicesBtn.addEventListener("click",  () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click",  () => setActiveTab("actions"));
-tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
+tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); loadRainForecast(); });
 tabTargetBtn.addEventListener("click",   () => setActiveTab("target"));
 
 // ── Email notification settings ───────────────────────────────────────────────
@@ -4080,6 +4080,45 @@ async function loadOcsHistory() {
 
 document.getElementById("ocs-history-refresh")?.addEventListener("click", loadOcsHistory);
 document.getElementById("ocs-history-hours")?.addEventListener("change", loadOcsHistory);
+
+// ── Rain radar forecast ───────────────────────────────────────────────────────
+async function loadRainForecast() {
+  const bar  = document.getElementById("rain-forecast-bar");
+  const warn = document.getElementById("rain-forecast-warn");
+  const upd  = document.getElementById("rain-forecast-updated");
+  if (!bar) return;
+  try {
+    const r = await fetch("/api/weather/forecast");
+    const d = await r.json();
+    if (!d.success) { bar.innerHTML = `<span style="font-size:12px;color:#f87171;">${d.error}</span>`; return; }
+
+    // Render mini bar chart
+    const maxH = 40;
+    bar.innerHTML = d.slots.map(s => {
+      const p = s.prob ?? 0;
+      const h = Math.max(4, Math.round(p / 100 * maxH));
+      const col = p >= 70 ? "#ef4444" : p >= 40 ? "#f59e0b" : "#22c55e";
+      const time = s.time.slice(11, 16);
+      return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px;min-width:28px;">
+        <span style="font-size:10px;color:#94a3b8;">${p}%</span>
+        <div style="width:22px;height:${h}px;background:${col};border-radius:2px;"></div>
+        <span style="font-size:10px;color:#64748b;">${time}</span>
+      </div>`;
+    }).join("");
+
+    // Warning banner
+    const warnTexts = { imminent: "Rain imminent within 30 min", likely: "Rain likely within 1 h", possible: "Rain possible within 1 h", clear: null };
+    const warnStyles = { imminent: "background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;", likely: "background:#78350f;color:#fcd34d;border:1px solid #92400e;", possible: "background:#1e3a5f;color:#93c5fd;border:1px solid #1e40af;", clear: "" };
+    if (warn) {
+      const txt = warnTexts[d.warnLevel];
+      if (txt) { warn.style.display = ""; warn.style.cssText += warnStyles[d.warnLevel]; warn.textContent = txt + ` (${d.maxProb30}% in 30 min, ${d.maxProb60}% in 1 h)`; }
+      else { warn.style.display = "none"; }
+    }
+    if (upd) upd.textContent = `Updated ${new Date(d.fetchedAt).toLocaleTimeString()}`;
+  } catch (e) {
+    if (bar) bar.innerHTML = `<span style="font-size:12px;color:#f87171;">Forecast unavailable</span>`;
+  }
+}
 
 document.getElementById("ocs-backfill")?.addEventListener("click", async () => {
   const btn = document.getElementById("ocs-backfill");
