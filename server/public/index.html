@@ -747,6 +747,12 @@
             <span id="alert-ready-status" class="alert-ready-status">OFF</span>
             <span class="alert-ready-hint">When enabled: incoming alerts that pass filters will <strong>interrupt</strong> the current imaging, slew to the target, image it, then resume.</span>
           </div>
+          <div style="margin:8px 0 12px;display:flex;align-items:center;gap:8px;">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;color:#94a3b8;">
+              <input id="alert-notify-email-cb" type="checkbox" />
+              Send email when an alert is queued
+            </label>
+          </div>
 
           <!-- Ready Obs for Alert -->
           <div class="alert-prep-bar">
@@ -776,7 +782,6 @@
                     <th style="text-align:right;padding:6px;">Min Alt</th>
                     <th style="text-align:right;padding:6px;">Max Err</th>
                     <th style="text-align:left;padding:6px;">Notes</th>
-                    <th style="text-align:center;padding:6px;" title="Send email when this broker's alert is queued or fires a ToO">📧</th>
                     <th style="padding:6px;"></th>
                   </tr>
                 </thead>

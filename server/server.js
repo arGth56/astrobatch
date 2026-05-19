@@ -5977,8 +5977,7 @@ alerts.startGcnListener({
   getStrategy,
   pushToQueue: ({ name, raDeg, decDeg, alert, mode }) => {
     const isToo = (mode === "too");
-    const strat = alert?.broker ? getStrategy(alert.broker) : null;
-    const shouldNotify = strat ? Boolean(strat.notify_email) : true;
+    const shouldNotify = getSetting("alert_notify_email", "true") !== "false";
     if (isToo && seqState.alertReady && seqState.running && !seqState.tooRunning && alert) {
       seqState.tooInterrupt = alert;
       seqLog(`🚨 ToO ALERT received: ${alert.broker} ${alert.trigger_id} — interrupt will fire at next checkAbort`, "warn");

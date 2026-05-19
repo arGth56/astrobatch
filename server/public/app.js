@@ -4259,6 +4259,13 @@ async function loadAlertConfig() {
       st.textContent = d.alertReady ? "ARMED" : "OFF";
       st.className = "alert-ready-status " + (d.alertReady ? "armed" : "");
     }
+    // Global email notify checkbox
+    const notifyCb = document.getElementById("alert-notify-email-cb");
+    if (notifyCb) {
+      const res = await fetch("/api/settings/alert_notify_email");
+      if (res.ok) { const sd = await res.json(); notifyCb.checked = sd.value !== "false"; }
+      else notifyCb.checked = true;
+    }
 
     // Prep state
     const prepBtn    = document.getElementById("alert-prep-btn");
@@ -4302,6 +4309,14 @@ document.getElementById("alert-ready-cb")?.addEventListener("change", async (e) 
     });
     loadAlertConfig();
   } catch {}
+});
+
+document.getElementById("alert-notify-email-cb")?.addEventListener("change", async (e) => {
+  await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: "alert_notify_email", value: e.target.checked ? "true" : "false" }),
+  });
 });
 
 document.getElementById("alert-prep-btn")?.addEventListener("click", async () => {
@@ -4376,7 +4391,6 @@ function renderStrategies() {
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="min_alt" value="${s.min_alt}" min="0" max="90" step="1" style="width:42px;" /></td>
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="max_err_deg" value="${s.max_err_deg}" min="0.01" max="180" step="0.1" style="width:50px;" /></td>
       <td style="padding:5px 6px;"><input type="text" class="strat-inp" data-field="notes" value="${(s.notes||"").replace(/"/g,"&quot;")}" style="width:160px;font-size:11px;" /></td>
-      <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="notify_email" ${s.notify_email ? "checked" : ""} title="Email on queue/ToO" /></td>
       <td style="padding:5px 6px;"><button class="btn-small strat-reset-btn" data-broker="${s.broker}" title="Reset to defaults">↺</button></td>
     </tr>`;
   }).join("");
