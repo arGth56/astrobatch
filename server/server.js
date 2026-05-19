@@ -274,6 +274,19 @@ db.exec(`
 // Migration: add ir_sky column if DB was created before this version
 try { db.exec(`ALTER TABLE ocs_history ADD COLUMN ir_sky REAL`); } catch (_) {}
 
+// ── Rain forecast log table ──────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rain_forecast_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL DEFAULT (datetime('now')),
+    warn_level   TEXT,
+    max_prob_30  REAL,
+    max_prob_60  REAL,
+    slots_json   TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_rfl_ts ON rain_forecast_log(ts DESC);
+`);
+
 // ── Autofocus log table ──────────────────────────────────────────────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS autofocus_log (
@@ -401,6 +414,23 @@ async function pollAndStoreOcs() {
 
 setInterval(pollAndStoreOcs, 10 * 60 * 1000);  // store to DB every 10 min
 setTimeout(pollAndStoreOcs, 8000);              // initial reading after server startup
+
+// ── Rain forecast periodic logger ────────────────────────────────────────────
+const storeRainForecast = db.prepare(
+  `INSERT INTO rain_forecast_log (warn_level, max_prob_30, max_prob_60, slots_json)
+   VALUES (?, ?, ?, ?)`
+);
+async function pollAndStoreRainForecast() {
+  try {
+    const fc = await fetchRainForecast();
+    storeRainForecast.run(fc.warnLevel, fc.maxProb30, fc.maxProb60, JSON.stringify(fc.slots));
+    if (process.env.DEBUG) console.log(`[rain-forecast] stored: ${fc.warnLevel} (${fc.maxProb30}%/30m)`);
+  } catch (e) {
+    if (process.env.DEBUG) console.error("[rain-forecast]", e.message);
+  }
+}
+setInterval(pollAndStoreRainForecast, 15 * 60 * 1000); // every 15 min (matches forecast resolution)
+setTimeout(pollAndStoreRainForecast, 12000);            // initial store after startup
 
 // ── Queue persistence helpers ─────────────────────────────────────────────────
 
@@ -5161,6 +5191,17 @@ app.get("/api/weather/forecast", async (req, res) => {
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
+});
+
+app.get("/api/weather/forecast/history", (req, res) => {
+  const hours = Math.min(Number(req.query.hours) || 48, 168);
+  const rows = db.prepare(
+    `SELECT id, ts, warn_level, max_prob_30, max_prob_60, slots_json
+     FROM rain_forecast_log
+     WHERE ts >= datetime('now', ? || ' hours')
+     ORDER BY ts ASC`
+  ).all(`-${hours}`);
+  res.json({ success: true, history: rows.map(r => ({ ...r, slots: JSON.parse(r.slots_json || "[]") })), hours });
 });
 
 app.get("/api/ocs/history", (req, res) => {
