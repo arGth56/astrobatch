@@ -251,6 +251,10 @@ try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN use_color INTEGER DEFAULT
 try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN refine_wcs INTEGER DEFAULT 1").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN stdweb_state TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN obs_date TEXT").run(); } catch { /* already exists */ }
+// seq_queue source column: "manual" (user-added) or "alert" (pushed from alert broker)
+try { db.prepare("ALTER TABLE seq_queue ADD COLUMN source TEXT DEFAULT 'manual'").run(); } catch { /* already exists */ }
+// seq_queue cycles column
+try { db.prepare("ALTER TABLE seq_queue ADD COLUMN cycles INTEGER DEFAULT 1").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mjd REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_ap REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_ap REAL").run(); } catch { /* already exists */ }
@@ -437,10 +441,10 @@ setTimeout(pollAndStoreRainForecast, 12000);            // initial store after s
 const _saveQueue = db.transaction(() => {
   db.prepare("DELETE FROM seq_queue").run();
   const ins = db.prepare(
-    "INSERT INTO seq_queue (position, name, ra, dec, ra_deg, dec_deg, done, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO seq_queue (position, name, ra, dec, ra_deg, dec_deg, done, added_at, source, cycles) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   seqState.queue.forEach((t, i) => {
-    ins.run(i, t.name, t.ra || "", t.dec || "", t.raDeg, t.decDeg, t.done ? 1 : 0, t.addedAt || Date.now());
+    ins.run(i, t.name, t.ra || "", t.dec || "", t.raDeg, t.decDeg, t.done ? 1 : 0, t.addedAt || Date.now(), t.source || "manual", t.cycles ?? 1);
   });
 });
 
@@ -466,6 +470,8 @@ function loadQueue() {
         decDeg:   r.dec_deg,
         done:     r.done === 1,
         addedAt:  r.added_at,
+        source:   r.source || "manual",
+        cycles:   r.cycles ?? 1,
         filters:  r.filters ? JSON.parse(r.filters) : null,
         count:    r.count    ?? null,
         duration: r.duration ?? null,
@@ -1756,6 +1762,37 @@ const seqState = {
 };
 
 loadQueue();
+
+// ── Daily noon reset ──────────────────────────────────────────────────────────
+function dailyReset({ manual = false } = {}) {
+  const before = seqState.queue.length;
+  // Remove alert-sourced targets (they belonged to last night)
+  const alertRemoved = seqState.queue.filter(t => t.source === "alert");
+  seqState.queue = seqState.queue.filter(t => t.source !== "alert");
+  // Reset done=false on all remaining manual targets so they run again tonight
+  seqState.queue.forEach(t => { t.done = false; });
+  saveQueue();
+  const msg = `Daily reset: removed ${alertRemoved.length} alert target(s), reset ${seqState.queue.length} manual target(s). (${manual ? "manual trigger" : "scheduled noon"})`;
+  console.log("[daily-reset]", msg);
+  if (alertRemoved.length || seqState.queue.length) seqLog(msg, "info");
+  return { removed: alertRemoved.map(t => t.name), kept: seqState.queue.map(t => t.name) };
+}
+
+function scheduleNoonReset() {
+  const resetHourLocal = parseInt(getSetting("daily_reset_hour", "12"), 10);
+  const now = new Date();
+  // Compute next occurrence of resetHourLocal:00 local time (server TZ)
+  const next = new Date(now);
+  next.setHours(resetHourLocal, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1); // already passed today → tomorrow
+  const msUntil = next - now;
+  console.log(`[daily-reset] Scheduled for ${next.toLocaleString()} (in ${Math.round(msUntil / 60000)} min)`);
+  setTimeout(() => {
+    dailyReset();
+    setInterval(dailyReset, 24 * 60 * 60 * 1000); // every 24 h after first fire
+  }, msUntil);
+}
+scheduleNoonReset();
 
 // ── Per-filter autofocus cache (DB-backed) ────────────────────────────────────
 const FILTER_AF_CACHE_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -4389,6 +4426,22 @@ app.delete("/api/sequence/queue/:index", (req, res) => {
   return res.json({ success: true, queue: seqState.queue });
 });
 
+// ── Daily reset endpoint ──────────────────────────────────────────────────────
+app.post("/api/sequence/daily-reset", (req, res) => {
+  if (seqState.running) {
+    return res.status(409).json({ success: false, error: "Cannot reset while sequence is running" });
+  }
+  const result = dailyReset({ manual: true });
+  res.json({ success: true, ...result });
+});
+
+app.get("/api/sequence/daily-reset/info", (req, res) => {
+  const hour = parseInt(getSetting("daily_reset_hour", "12"), 10);
+  const alertTargets  = seqState.queue.filter(t => t.source === "alert").map(t => t.name);
+  const manualTargets = seqState.queue.filter(t => t.source !== "alert").map(t => t.name);
+  res.json({ success: true, resetHour: hour, alertTargets, manualTargets });
+});
+
 app.post("/api/sequence/run", (req, res) => {
   if (seqState.running) {
     return res.status(409).json({ success: false, error: "Sequence already running" });
@@ -6106,7 +6159,7 @@ alerts.startGcnListener({
     }
     seqState.queue.push({
       name, raDeg, decDeg, ra: "", dec: "",
-      done: false, addedAt: Date.now(),
+      done: false, addedAt: Date.now(), source: "alert",
     });
     if (shouldNotify) sendAlertEmail(
       `📡 Alert queued: ${name}`,

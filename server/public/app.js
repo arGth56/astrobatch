@@ -1522,11 +1522,12 @@ async function loadArbiterConfig() {
       "minAlt", "zenithLimit", "meridianGap",
       "minStars", "maxCloudRecoveryWaitMin",
       "frameCheckEnabled", "frameCheckThreshold",
+      "daily_reset_hour",
     ];
     const results = await Promise.all(keys.map(k =>
       fetch(`/api/settings/${k}`).then(r => r.ok ? r.json() : null).catch(() => null)
     ));
-    const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin, frameCheckEnabled, frameCheckThreshold] = results;
+    const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin, frameCheckEnabled, frameCheckThreshold, dailyResetHour] = results;
     if (minAlt          != null) document.getElementById("set-minalt").value                   = minAlt.value          ?? 20;
     if (zenithLimit     != null) document.getElementById("set-zenith-limit").value             = zenithLimit.value     ?? 70;
     if (meridianGap     != null) document.getElementById("set-meridian-gap").value             = meridianGap.value     ?? 10;
@@ -1534,6 +1535,7 @@ async function loadArbiterConfig() {
     if (maxCloudRecoveryWaitMin != null) document.getElementById("set-max-cloud-recovery-min").value = maxCloudRecoveryWaitMin.value ?? 12;
     if (frameCheckEnabled != null) document.getElementById("set-frame-check-enable").checked  = frameCheckEnabled.value === "true";
     if (frameCheckThreshold != null) document.getElementById("set-frame-check-threshold").value = frameCheckThreshold.value ?? 5;
+    if (dailyResetHour  != null) { const el = document.getElementById("set-daily-reset-hour"); if (el) el.value = dailyResetHour.value ?? 12; }
   } catch { /* non-fatal */ }
 }
 
@@ -1579,6 +1581,44 @@ document.getElementById("quality-save")?.addEventListener("click", async () => {
     setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
   } catch (e) {
     alert("Failed to save quality gates: " + e.message);
+  }
+});
+
+// ── Daily reset hour save ─────────────────────────────────────────────────────
+document.getElementById("daily-reset-hour-save")?.addEventListener("click", async () => {
+  const val = document.getElementById("set-daily-reset-hour")?.value;
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "daily_reset_hour", value: val }),
+    });
+    const btn = document.getElementById("daily-reset-hour-save");
+    btn.textContent = "Saved ✓"; btn.disabled = true;
+    setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 2000);
+  } catch (e) { alert("Save failed: " + e.message); }
+});
+
+// ── Daily reset button (Night Plan tab) ──────────────────────────────────────
+document.getElementById("seq-daily-reset-btn")?.addEventListener("click", async () => {
+  const info = await (await fetch("/api/sequence/daily-reset/info")).json();
+  const alertNames  = info.alertTargets?.join(", ")  || "(none)";
+  const manualNames = info.manualTargets?.join(", ") || "(none)";
+  const ok = confirm(
+    `Daily Night Plan Reset\n\n` +
+    `Will REMOVE (alert targets): ${alertNames}\n` +
+    `Will KEEP & RESET (monitored): ${manualNames}\n\n` +
+    `Continue?`
+  );
+  if (!ok) return;
+  const r = await fetch("/api/sequence/daily-reset", { method: "POST" });
+  const d = await r.json();
+  if (d.success) {
+    const infoEl = document.getElementById("seq-daily-reset-info");
+    if (infoEl) infoEl.textContent = `Reset done — removed: ${d.removed?.join(", ") || "none"}, kept: ${d.kept?.join(", ") || "none"}`;
+    refreshSeqState();
+  } else {
+    alert("Reset failed: " + d.error);
   }
 });
 
@@ -1735,6 +1775,7 @@ function renderSeqQueue(queue) {
         <div class="seq-queue-row">
           <span class="seq-queue-num">${i + 1}</span>
           <span class="seq-queue-name">${t.name}</span>
+          ${t.source === "alert" ? `<span class="seq-source-badge alert-source" title="Added from alert broker — will be removed at daily reset">alert</span>` : `<span class="seq-source-badge manual-source" title="Manually added — kept across daily reset">monitored</span>`}
           <span class="seq-queue-coords">α&nbsp;${raHH}h${raM}m &nbsp;δ&nbsp;${decSign}${(t.decDeg || 0).toFixed(1)}°</span>
           ${badge}
           ${t.done

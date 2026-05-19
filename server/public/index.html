@@ -400,6 +400,12 @@
         <!-- ToDo / Observation Queue tab -->
         <div id="panel-todo" class="tab-panel">
           <h2>Night Plan</h2>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+            <button id="seq-daily-reset-btn" type="button" class="btn-danger" style="font-size:12px;padding:4px 10px;" title="Remove alert targets from last night, reset manual targets to run again tonight">
+              Reset Plan (noon)
+            </button>
+            <span id="seq-daily-reset-info" style="font-size:12px;color:#64748b;"></span>
+          </div>
 
           <details class="seq-config">
             <summary>Sequence Parameters</summary>
@@ -1045,6 +1051,19 @@
             </label>
             <div class="buttons">
               <button id="quality-save" type="button">Save Quality Gates</button>
+            </div>
+          </div>
+
+          <h3 style="font-size:14px;color:#93c5fd;margin:16px 0 4px;">Daily Night Plan Reset</h3>
+          <p class="hint" style="margin-bottom:8px;">
+            Every day at the configured hour: alert targets are removed, monitored targets are reset to run again tonight.
+          </p>
+          <div class="inline-form" style="align-items:center;gap:10px;">
+            <label title="Hour of day (local time) for automatic night plan reset">Reset hour (local)
+              <input id="set-daily-reset-hour" type="number" min="0" max="23" step="1" value="12" style="width:60px;" autocomplete="off" />
+            </label>
+            <div class="buttons">
+              <button id="daily-reset-hour-save" type="button">Save</button>
             </div>
           </div>
           <div style="margin-bottom:6px;padding:10px 12px;border:1px solid #1e293b;border-radius:8px;background:#0f172a;">
