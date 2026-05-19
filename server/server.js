@@ -66,6 +66,7 @@ const DEFAULT_OCS_HOST = process.env.OCS_HOST || "192.168.1.220";
 const TNS_BOT_ID = process.env.TNS_BOT_ID || "";
 const TNS_BOT_NAME = process.env.TNS_BOT_NAME || "";
 const TNS_API_KEY = process.env.TNS_API_KEY || "";
+const STDWEB_TOKEN = process.env.STDWEB_TOKEN || "";
 const DEVICE_TYPES = ["mount", "camera", "filterwheel", "focuser", "flatdevice"];
 const STATUS_DEVICE_MAP = {
   mount: ["Mount", "Connected"],
@@ -80,6 +81,21 @@ const STATUS_DEVICE_MAP = {
   weather: ["WeatherData", "Connected"],
   flatdevice: ["FlatDevice", "Connected"],
 };
+
+function warnMissingSecrets() {
+  const warnings = [];
+  if (!STDWEB_TOKEN) {
+    warnings.push("STDWEB_TOKEN is missing (STDWeb health/photometry proxy will be disabled).");
+  }
+  if (!TNS_API_KEY || !TNS_BOT_ID || !TNS_BOT_NAME) {
+    warnings.push("TNS credentials are incomplete (TNS lookup requires TNS_BOT_ID, TNS_BOT_NAME, TNS_API_KEY).");
+  }
+  if (warnings.length) {
+    console.warn("[startup] Missing optional secrets:");
+    for (const w of warnings) console.warn(`[startup] - ${w}`);
+  }
+}
+warnMissingSecrets();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
@@ -5694,7 +5710,6 @@ app.post("/api/test/filter-patch", async (req, res) => {
 // GET /api/stdweb/health  — returns { reachable, url, status? }
 app.get("/api/stdweb/health", async (req, res) => {
   const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "";
   if (!STDWEB_TOKEN) {
     return res.status(400).json({ reachable: false, error: "STDWEB_TOKEN is not configured", url: STDWEB_URL });
   }
@@ -5719,7 +5734,6 @@ app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
   const { task_id } = req.params;
   const refresh = req.query.refresh === "1" || req.query.refresh === "true";
   const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  const STDWEB_TOKEN = process.env.STDWEB_TOKEN  || "";
   if (!STDWEB_TOKEN) {
     return res.status(400).json({ success: false, error: "STDWEB_TOKEN is not configured" });
   }
