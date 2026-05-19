@@ -897,6 +897,42 @@
             <span id="stdweb-token-status" style="font-size:12px;color:#94a3b8;white-space:nowrap;"></span>
           </div>
 
+          <!-- Email Notifications -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Email Notifications</h3>
+          <p class="hint" style="margin-bottom:10px;">Sends an email when a ToO alert fires or a target is queued.</p>
+          <div class="inline-form" style="margin-bottom:8px;flex-wrap:wrap;gap:10px;">
+            <label>SMTP Host
+              <input id="email-host" type="text" placeholder="smtp.gmail.com" autocomplete="off" style="width:160px;" />
+            </label>
+            <label>Port
+              <input id="email-port" type="number" value="587" min="1" max="65535" style="width:70px;" />
+            </label>
+            <label style="flex-direction:row;align-items:center;gap:6px;cursor:pointer;">
+              <input id="email-secure" type="checkbox" />
+              TLS (port 465)
+            </label>
+            <label>Username
+              <input id="email-user" type="text" placeholder="you@gmail.com" autocomplete="off" style="width:180px;" />
+            </label>
+            <label>Password / App key
+              <input id="email-pass" type="password" placeholder="••••••••••••••••" autocomplete="off" style="width:160px;" />
+            </label>
+            <label>From
+              <input id="email-from" type="text" placeholder="AstroBatch &lt;you@gmail.com&gt;" autocomplete="off" style="width:200px;" />
+            </label>
+            <label>To (recipient)
+              <input id="email-to" type="text" placeholder="you@example.com" autocomplete="off" style="width:180px;" />
+            </label>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+            <div class="buttons">
+              <button id="email-save" type="button">Save</button>
+              <button id="email-test" type="button" class="btn-small">Send Test Email</button>
+            </div>
+            <span id="email-status" style="font-size:12px;color:#94a3b8;"></span>
+          </div>
+
           <!-- Arbiter & Safety Limits -->
           <hr style="border-color:#1e293b;margin:18px 0;" />
           <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Arbiter &amp; Safety Limits</h3>

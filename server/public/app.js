@@ -817,6 +817,72 @@ tabDevicesBtn.addEventListener("click",  () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click",  () => setActiveTab("actions"));
 tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
 tabTargetBtn.addEventListener("click",   () => setActiveTab("target"));
+
+// ── Email notification settings ───────────────────────────────────────────────
+async function loadEmailConfig() {
+  const keys = ["email_host","email_port","email_secure","email_user","email_from","email_to"];
+  try {
+    const vals = await Promise.all(keys.map(k => fetch(`/api/settings/${k}`).then(r => r.ok ? r.json() : null)));
+    const map = {};
+    keys.forEach((k, i) => { if (vals[i]?.success) map[k] = vals[i].value; });
+    if (map.email_host)   document.getElementById("email-host").value   = map.email_host;
+    if (map.email_port)   document.getElementById("email-port").value   = map.email_port;
+    if (map.email_secure) document.getElementById("email-secure").checked = map.email_secure === "true";
+    if (map.email_user)   document.getElementById("email-user").value   = map.email_user;
+    if (map.email_from)   document.getElementById("email-from").value   = map.email_from;
+    if (map.email_to)     document.getElementById("email-to").value     = map.email_to;
+    // show masked pass status
+    const passRes = await fetch("/api/secrets/secret_email_pass");
+    const passData = passRes.ok ? await passRes.json() : null;
+    const st = document.getElementById("email-status");
+    if (st && passData?.set) { st.textContent = "Password saved ✓"; st.style.color = "#86efac"; }
+  } catch {}
+}
+
+document.getElementById("email-save")?.addEventListener("click", async () => {
+  const btn = document.getElementById("email-save");
+  const st  = document.getElementById("email-status");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    const settings = {
+      email_host:   document.getElementById("email-host").value.trim(),
+      email_port:   document.getElementById("email-port").value,
+      email_secure: document.getElementById("email-secure").checked ? "true" : "false",
+      email_user:   document.getElementById("email-user").value.trim(),
+      email_from:   document.getElementById("email-from").value.trim(),
+      email_to:     document.getElementById("email-to").value.trim(),
+    };
+    await Promise.all(Object.entries(settings).map(([key, value]) =>
+      fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, value }) })
+    ));
+    const pass = document.getElementById("email-pass").value;
+    if (pass) {
+      await fetch("/api/secrets", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: "secret_email_pass", value: pass }) });
+      document.getElementById("email-pass").value = "";
+    }
+    if (st) { st.textContent = "Saved ✓"; st.style.color = "#86efac"; }
+  } catch (e) {
+    if (st) { st.textContent = "Error: " + e.message; st.style.color = "#fca5a5"; }
+  } finally {
+    btn.disabled = false; btn.textContent = "Save";
+  }
+});
+
+document.getElementById("email-test")?.addEventListener("click", async () => {
+  const btn = document.getElementById("email-test");
+  const st  = document.getElementById("email-status");
+  btn.disabled = true; btn.textContent = "Sending…";
+  try {
+    const r = await fetch("/api/email/test", { method: "POST" });
+    const d = await r.json();
+    if (d.success) { st.textContent = `Test sent to ${d.to} ✓`; st.style.color = "#86efac"; }
+    else           { st.textContent = `Failed: ${d.error}`;      st.style.color = "#fca5a5"; }
+  } catch (e) {
+    st.textContent = "Error: " + e.message; st.style.color = "#fca5a5";
+  } finally {
+    btn.disabled = false; btn.textContent = "Send Test Email";
+  }
+});
 tabAlertsBtn.addEventListener("click",   () => { setActiveTab("alerts"); loadAlerts(); loadAlertConfig(); loadStrategies(); });
 tabSettingsBtn.addEventListener("click", () => {
   setActiveTab("settings");
@@ -826,6 +892,7 @@ tabSettingsBtn.addEventListener("click", () => {
   startWatchdogPolling();
   loadCoverDisabled();
   loadStdwebTokenStatus();
+  loadEmailConfig();
 });
 
 async function loadCoverDisabled() {

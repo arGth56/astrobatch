@@ -6,6 +6,7 @@ const http  = require("http");
 const fs    = require("fs");
 const { execSync, spawn } = require("child_process");
 const Database = require("better-sqlite3");
+const nodemailer = require("nodemailer");
 const alerts = require("./alerts");
 
 const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
@@ -98,6 +99,42 @@ function warnMissingSecrets() {
   }
 }
 warnMissingSecrets();
+
+// ── Email notifications ───────────────────────────────────────────────────────
+function getEmailConfig() {
+  return {
+    host:     getSetting("email_host")     || process.env.EMAIL_HOST     || "",
+    port:     parseInt(getSetting("email_port") || process.env.EMAIL_PORT || "587", 10),
+    secure:   (getSetting("email_secure")  || process.env.EMAIL_SECURE   || "false") === "true",
+    user:     getSetting("email_user")     || process.env.EMAIL_USER     || "",
+    pass:     getSetting("secret_email_pass") || process.env.EMAIL_PASS  || "",
+    from:     getSetting("email_from")     || process.env.EMAIL_FROM     || "",
+    to:       getSetting("email_to")       || process.env.EMAIL_TO       || "",
+  };
+}
+
+async function sendAlertEmail(subject, body) {
+  const cfg = getEmailConfig();
+  if (!cfg.host || !cfg.to || !cfg.user || !cfg.pass) {
+    seqLog("[email] Not configured — skipping notification", "warn");
+    return;
+  }
+  try {
+    const transporter = nodemailer.createTransport({
+      host: cfg.host, port: cfg.port, secure: cfg.secure,
+      auth: { user: cfg.user, pass: cfg.pass },
+    });
+    await transporter.sendMail({
+      from: cfg.from || cfg.user,
+      to:   cfg.to,
+      subject,
+      text: body,
+    });
+    seqLog(`[email] Notification sent to ${cfg.to}`);
+  } catch (e) {
+    seqLog(`[email] Failed to send: ${e.message}`, "error");
+  }
+}
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
@@ -548,7 +585,7 @@ app.post("/api/settings", (req, res) => {
 // ── Secrets ──────────────────────────────────────────────────────────────────
 // GET  /api/secrets/:key  — returns { set: bool } only, never the value
 // POST /api/secrets       — { key, value } stores in DB (survives restarts, no file edit needed)
-const ALLOWED_SECRET_KEYS = new Set(["secret_stdweb_token"]);
+const ALLOWED_SECRET_KEYS = new Set(["secret_stdweb_token", "secret_email_pass"]);
 
 app.get("/api/secrets/:key", (req, res) => {
   const key = req.params.key;
@@ -565,6 +602,28 @@ app.post("/api/secrets", (req, res) => {
     return res.status(400).json({ success: false, error: "unknown secret key" });
   setSetting(key, value ?? "");
   res.json({ success: true });
+});
+
+// POST /api/email/test — send a test email with current config
+app.post("/api/email/test", async (req, res) => {
+  const cfg = getEmailConfig();
+  if (!cfg.host || !cfg.to || !cfg.user || !cfg.pass)
+    return res.status(400).json({ success: false, error: "Email not fully configured (host, user, password, to required)" });
+  try {
+    const transporter = nodemailer.createTransport({
+      host: cfg.host, port: cfg.port, secure: cfg.secure,
+      auth: { user: cfg.user, pass: cfg.pass },
+    });
+    await transporter.sendMail({
+      from: cfg.from || cfg.user,
+      to:   cfg.to,
+      subject: "🔭 AstroBatch — test notification",
+      text:  `This is a test email from AstroBatch.\n\nSent at: ${new Date().toISOString()}\n`,
+    });
+    res.json({ success: true, to: cfg.to });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 function runQualityReplay(date, minStars, trailElong, trailSizeFactor, maxEvents) {
@@ -5915,12 +5974,30 @@ alerts.startGcnListener({
     if (isToo && seqState.alertReady && seqState.running && !seqState.tooRunning && alert) {
       seqState.tooInterrupt = alert;
       seqLog(`🚨 ToO ALERT received: ${alert.broker} ${alert.trigger_id} — interrupt will fire at next checkAbort`, "warn");
+      sendAlertEmail(
+        `🚨 ToO Alert: ${alert.broker} ${alert.trigger_id}`,
+        `A Target-of-Opportunity alert has been received and will interrupt the current sequence.\n\n` +
+        `Broker:     ${alert.broker}\n` +
+        `Trigger ID: ${alert.trigger_id}\n` +
+        `RA:         ${alert.ra?.toFixed?.(4) ?? "?"}°\n` +
+        `Dec:        ${alert.dec?.toFixed?.(4) ?? "?"}°\n` +
+        `Error:      ${alert.err_deg?.toFixed?.(3) ?? "?"}°\n` +
+        `Time:       ${new Date().toISOString()}\n`
+      );
       return;
     }
     seqState.queue.push({
       name, raDeg, decDeg, ra: "", dec: "",
       done: false, addedAt: Date.now(),
     });
+    sendAlertEmail(
+      `📡 Alert queued: ${name}`,
+      `A new alert has been added to the Night Plan queue.\n\n` +
+      `Target:     ${name}\n` +
+      `RA:         ${raDeg?.toFixed?.(4) ?? "?"}°\n` +
+      `Dec:        ${decDeg?.toFixed?.(4) ?? "?"}°\n` +
+      `Time:       ${new Date().toISOString()}\n`
+    );
   },
   saveQueue,
   computeAltAz:  serverComputeAltAz,
