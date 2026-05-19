@@ -4387,6 +4387,8 @@ function renderAlerts() {
   let rows = _alertsCache;
   if (brokerFilter) rows = rows.filter(a => a.broker === brokerFilter);
   if (actionFilter) rows = rows.filter(a => (a.action || "").startsWith(actionFilter));
+  // Hide "ignored" alerts (disabled-strategy drops) unless explicitly requested
+  else rows = rows.filter(a => a.action !== "ignored");
 
   const queuedCount = _alertsCache.filter(a => a.action === "queued" || a.action === "too-observed").length;
   if (badge) {
