@@ -315,7 +315,8 @@ db.exec(`
     do_center    INTEGER NOT NULL DEFAULT 0,
     min_alt      REAL    NOT NULL DEFAULT 25,
     max_err_deg  REAL    NOT NULL DEFAULT 1.0,
-    notes        TEXT    DEFAULT ''
+    notes        TEXT    DEFAULT '',
+    notify_email INTEGER NOT NULL DEFAULT 1
   );
 `);
 
@@ -341,6 +342,11 @@ const _stratSeedStmt = db.prepare(`
   VALUES (@broker, @mode, @exposure, @filter_cycle, @rapid_count, @max_err_deg, @notes)
 `);
 for (const s of ALERT_STRATEGY_SEEDS) _stratSeedStmt.run(s);
+
+// Migration: add notify_email column if it doesn't exist yet
+try {
+  db.prepare("ALTER TABLE alert_strategies ADD COLUMN notify_email INTEGER NOT NULL DEFAULT 1").run();
+} catch { /* column already exists */ }
 
 const STRATEGY_DEFAULTS = {
   enabled: 1, mode: "too", exposure: 30, gain: 10, filter_cycle: "G,RP,BP",
@@ -5971,10 +5977,12 @@ alerts.startGcnListener({
   getStrategy,
   pushToQueue: ({ name, raDeg, decDeg, alert, mode }) => {
     const isToo = (mode === "too");
+    const strat = alert?.broker ? getStrategy(alert.broker) : null;
+    const shouldNotify = strat ? Boolean(strat.notify_email) : true;
     if (isToo && seqState.alertReady && seqState.running && !seqState.tooRunning && alert) {
       seqState.tooInterrupt = alert;
       seqLog(`🚨 ToO ALERT received: ${alert.broker} ${alert.trigger_id} — interrupt will fire at next checkAbort`, "warn");
-      sendAlertEmail(
+      if (shouldNotify) sendAlertEmail(
         `🚨 ToO Alert: ${alert.broker} ${alert.trigger_id}`,
         `A Target-of-Opportunity alert has been received and will interrupt the current sequence.\n\n` +
         `Broker:     ${alert.broker}\n` +
@@ -5990,7 +5998,7 @@ alerts.startGcnListener({
       name, raDeg, decDeg, ra: "", dec: "",
       done: false, addedAt: Date.now(),
     });
-    sendAlertEmail(
+    if (shouldNotify) sendAlertEmail(
       `📡 Alert queued: ${name}`,
       `A new alert has been added to the Night Plan queue.\n\n` +
       `Target:     ${name}\n` +

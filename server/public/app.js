@@ -4376,6 +4376,7 @@ function renderStrategies() {
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="min_alt" value="${s.min_alt}" min="0" max="90" step="1" style="width:42px;" /></td>
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="max_err_deg" value="${s.max_err_deg}" min="0.01" max="180" step="0.1" style="width:50px;" /></td>
       <td style="padding:5px 6px;"><input type="text" class="strat-inp" data-field="notes" value="${(s.notes||"").replace(/"/g,"&quot;")}" style="width:160px;font-size:11px;" /></td>
+      <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="notify_email" ${s.notify_email ? "checked" : ""} title="Email on queue/ToO" /></td>
       <td style="padding:5px 6px;"><button class="btn-small strat-reset-btn" data-broker="${s.broker}" title="Reset to defaults">↺</button></td>
     </tr>`;
   }).join("");
