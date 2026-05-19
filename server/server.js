@@ -67,6 +67,8 @@ const TNS_BOT_ID = process.env.TNS_BOT_ID || "";
 const TNS_BOT_NAME = process.env.TNS_BOT_NAME || "";
 const TNS_API_KEY = process.env.TNS_API_KEY || "";
 const STDWEB_TOKEN = process.env.STDWEB_TOKEN || "";
+// Runtime helper — checks DB first so the UI save takes effect without restart
+const getStdwebToken = () => getSetting("secret_stdweb_token") || process.env.STDWEB_TOKEN || "";
 const DEVICE_TYPES = ["mount", "camera", "filterwheel", "focuser", "flatdevice"];
 const STATUS_DEVICE_MAP = {
   mount: ["Mount", "Connected"],
@@ -539,6 +541,28 @@ app.get("/api/settings/:key", (req, res) => {
 app.post("/api/settings", (req, res) => {
   const { key, value } = req.body || {};
   if (!key) return res.status(400).json({ success: false, error: "key required" });
+  setSetting(key, value ?? "");
+  res.json({ success: true });
+});
+
+// ── Secrets ──────────────────────────────────────────────────────────────────
+// GET  /api/secrets/:key  — returns { set: bool } only, never the value
+// POST /api/secrets       — { key, value } stores in DB (survives restarts, no file edit needed)
+const ALLOWED_SECRET_KEYS = new Set(["secret_stdweb_token"]);
+
+app.get("/api/secrets/:key", (req, res) => {
+  const key = req.params.key;
+  if (!ALLOWED_SECRET_KEYS.has(key))
+    return res.status(400).json({ success: false, error: "unknown secret key" });
+  const val = getSetting(key) || "";
+  res.json({ success: true, key, set: val.length > 0 });
+});
+
+app.post("/api/secrets", (req, res) => {
+  const { key, value } = req.body || {};
+  if (!key) return res.status(400).json({ success: false, error: "key required" });
+  if (!ALLOWED_SECRET_KEYS.has(key))
+    return res.status(400).json({ success: false, error: "unknown secret key" });
   setSetting(key, value ?? "");
   res.json({ success: true });
 });
@@ -5709,13 +5733,14 @@ app.post("/api/test/filter-patch", async (req, res) => {
 // ── STDWeb health check ───────────────────────────────────────────────────────
 // GET /api/stdweb/health  — returns { reachable, url, status? }
 app.get("/api/stdweb/health", async (req, res) => {
-  const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  if (!STDWEB_TOKEN) {
+  const STDWEB_URL = process.env.STDWEB_URL || "http://86.253.141.183:7000";
+  const tok = getStdwebToken();
+  if (!tok) {
     return res.status(400).json({ reachable: false, error: "STDWEB_TOKEN is not configured", url: STDWEB_URL });
   }
   try {
     const r = await fetch(`${STDWEB_URL}/api/tasks/`, {
-      headers: { "Authorization": `Token ${STDWEB_TOKEN}` },
+      headers: { "Authorization": `Token ${tok}` },
       signal: AbortSignal.timeout(5000),
     });
     res.json({ reachable: r.ok || r.status < 500, httpStatus: r.status, url: STDWEB_URL });
@@ -5733,11 +5758,12 @@ app.get("/api/stdweb/health", async (req, res) => {
 app.get("/api/stdweb/task/:task_id/photometry", async (req, res) => {
   const { task_id } = req.params;
   const refresh = req.query.refresh === "1" || req.query.refresh === "true";
-  const STDWEB_URL   = process.env.STDWEB_URL   || "http://86.253.141.183:7000";
-  if (!STDWEB_TOKEN) {
+  const STDWEB_URL = process.env.STDWEB_URL || "http://86.253.141.183:7000";
+  const tok = getStdwebToken();
+  if (!tok) {
     return res.status(400).json({ success: false, error: "STDWEB_TOKEN is not configured" });
   }
-  const headers = { "Authorization": `Token ${STDWEB_TOKEN}` };
+  const headers = { "Authorization": `Token ${tok}` };
 
   try {
     // Serve from DB only when photometry AND subtraction data are both present

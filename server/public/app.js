@@ -771,6 +771,44 @@ document.getElementById("btn-stdweb-test")?.addEventListener("click", async () =
   }
 });
 
+// ── STDWeb token save ─────────────────────────────────────────────────────────
+async function loadStdwebTokenStatus() {
+  try {
+    const r = await fetch("/api/secrets/secret_stdweb_token");
+    if (!r.ok) return;
+    const data = await r.json();
+    const el = document.getElementById("stdweb-token-status");
+    if (el) el.textContent = data.set ? "Token configured ✓" : "No token saved yet";
+    if (el) el.style.color = data.set ? "#86efac" : "#94a3b8";
+  } catch {}
+}
+
+document.getElementById("stdweb-token-save")?.addEventListener("click", async () => {
+  const input = document.getElementById("stdweb-token-input");
+  const status = document.getElementById("stdweb-token-status");
+  const btn = document.getElementById("stdweb-token-save");
+  const value = input?.value.trim();
+  if (!value) { if (status) { status.textContent = "Enter a token first"; status.style.color = "#fca5a5"; } return; }
+  btn.disabled = true;
+  btn.textContent = "Saving…";
+  try {
+    const r = await fetch("/api/secrets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "secret_stdweb_token", value }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    if (input) input.value = "";
+    if (status) { status.textContent = "Token saved ✓"; status.style.color = "#86efac"; }
+    await checkStdwebHealth();
+  } catch (e) {
+    if (status) { status.textContent = "Error: " + e.message; status.style.color = "#fca5a5"; }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save Token";
+  }
+});
+
 tabDevicesBtn.addEventListener("click",  () => setActiveTab("devices"));
 tabActionsBtn.addEventListener("click",  () => setActiveTab("actions"));
 tabDomeBtn.addEventListener("click",     () => { setActiveTab("dome"); refreshOcsStatus(); loadOcsHistory(); loadIrImage(); });
@@ -2142,7 +2180,7 @@ window.addEventListener("resize", () => {
   if (lastTargetCoords.raDeg != null) drawVisibility();
 });
 
-tabPipelineBtn.addEventListener("click",  () => setActiveTab("pipeline"));
+tabPipelineBtn.addEventListener("click",  () => { setActiveTab("pipeline"); loadStdwebTokenStatus(); });
 tabHistoryBtn.addEventListener("click",   () => { setActiveTab("history"); loadHistory(); });
 
 // ── Target History ────────────────────────────────────────────────────────────
