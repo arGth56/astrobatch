@@ -548,6 +548,8 @@ async function refreshStatus() {
     connectionStatus.textContent = payload.success
       ? `Connected to ${payload.target.protocol}://${payload.target.host}:${payload.target.port}`
       : `Connection failed (${payload.status || "unknown status"})`;
+    connectionStatus.classList.toggle("online", !!payload.success);
+    connectionStatus.classList.toggle("offline", !payload.success);
     setDeviceStatuses(payload.devices || {});
     lastEquipment = payload.equipment || null;
     updateFilterOptions(lastEquipment);
@@ -568,6 +570,8 @@ async function refreshStatus() {
     setLog(payload);
   } else {
     connectionStatus.textContent = `Connection failed: ${ninaResult.reason?.message}`;
+    connectionStatus.classList.add("offline");
+    connectionStatus.classList.remove("online");
     setLog({ success: false, error: ninaResult.reason?.message });
   }
 
