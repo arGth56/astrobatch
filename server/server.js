@@ -2791,7 +2791,7 @@ async function stepAutofocusForFilter(target, filterName, availableFilters) {
     seqLog(`AF [${filterName}]: DB pos ${cached.pos} (${ageMin} min ago) — moving focuser ✓`);
     seqState.currentStep = `AF [${filterName}]: moving to cached position ${cached.pos}...`;
     await stepMoveFocuserAbsolute(target, cached.pos);
-    return;
+    return false; // cache hit — guiding was not disturbed
   }
 
   // ── 3. Full AF run ────────────────────────────────────────────────────────
@@ -2858,19 +2858,20 @@ async function stepAutofocusForFilter(target, filterName, availableFilters) {
       if (moveCount >= MIN_MOVES && stableCount >= STABLE_NEEDED && elapsed >= MIN_AF_MS) {
         seqLog(`  Autofocus [${filterName}] complete — position: ${startPos} → ${pos} (${moveCount} moves) ✓`);
         saveAfResult(filterName, pos);
-        return;
+        return true; // full AF ran
       }
 
       if (moveCount === 0 && pollCount >= NO_MOVE_LIMIT) {
         seqLog(`  No focuser movement — assuming AF skipped/complete [${filterName}]`);
         if (Number.isFinite(finalPos)) saveAfResult(filterName, finalPos);
-        return;
+        return true; // full AF ran (or was skipped by NINA)
       }
     } catch { /* ignore transient errors */ }
   }
 
   seqLog(`  AF [${filterName}] timed out (12 min) — proceeding`, "warn");
   if (Number.isFinite(finalPos)) saveAfResult(filterName, finalPos);
+  return true; // full AF ran (timed out)
 }
 
 /** Legacy wrapper — kept for any direct call sites outside the filter loop */
@@ -3844,7 +3845,13 @@ async function runSequence(ninaConfig, seqConfig) {
         for (const filterName of targetFilters) {
           checkAbort();
           // AF per filter: changes filter wheel then runs AF or uses 2h cache
-          await stepAutofocusForFilter(ninaConfig, filterName, filters);
+          const fullAfRan = await stepAutofocusForFilter(ninaConfig, filterName, filters);
+          // If a full AF ran, PHD2 guiding may have been disturbed — restart it
+          if (fullAfRan) {
+            seqLog(`AF [${filterName}] complete — restarting guiding before captures`);
+            const guidingOkAf = await stepStartGuiding(ninaConfig);
+            if (!guidingOkAf) seqLog("⚠ Guiding did not settle after AF — continuing with caution", "warn");
+          }
           await waitForConfirmation(`Autofocus [${filterName}] done — proceed to captures?`);
           checkAbort();
           await assertCameraIdle(ninaConfig, `before ${filterName} captures`);
@@ -3916,7 +3923,12 @@ async function runSequence(ninaConfig, seqConfig) {
               seqLog(`  Resuming filters: [${remainingFilters.join(", ")}] (done: [${[...completedFilters].join(", ")}])`);
               for (const filterName of remainingFilters) {
                 checkAbort();
-                await stepAutofocusForFilter(ninaConfig, filterName, reFilters);
+                const fullAfRanResume = await stepAutofocusForFilter(ninaConfig, filterName, reFilters);
+                if (fullAfRanResume) {
+                  seqLog(`AF [${filterName}] complete — restarting guiding before captures (resume)`);
+                  const gOk = await stepStartGuiding(ninaConfig);
+                  if (!gOk) seqLog("⚠ Guiding did not settle after AF (resume) — continuing with caution", "warn");
+                }
                 checkAbort();
                 await assertCameraIdle(ninaConfig, `before ${filterName} captures (resume)`);
                 await stepCaptureFilter(ninaConfig, t.name, filterName, targetCount, targetDuration, gain, reFilters, safetyLimits, t.raDeg, t.decDeg);
@@ -3981,7 +3993,12 @@ async function runSequence(ninaConfig, seqConfig) {
               if (completedFilters.size > 0) seqLog(`  ↳ retry: skipping already-done filters [${[...completedFilters].join(", ")}], running: [${remainingFilters.join(", ")}]`);
               for (const filterName of remainingFilters) {
                 checkAbort();
-                await stepAutofocusForFilter(ninaConfig, filterName, reFilters);
+                const fullAfRanRetry = await stepAutofocusForFilter(ninaConfig, filterName, reFilters);
+                if (fullAfRanRetry) {
+                  seqLog(`AF [${filterName}] complete — restarting guiding before captures (retry)`);
+                  const gOk = await stepStartGuiding(ninaConfig);
+                  if (!gOk) seqLog("⚠ Guiding did not settle after AF (retry) — continuing with caution", "warn");
+                }
                 checkAbort();
                 await assertCameraIdle(ninaConfig, `before ${filterName} captures`);
                 await stepCaptureFilter(ninaConfig, t.name, filterName, targetCount, targetDuration, gain, reFilters, safetyLimits, t.raDeg, t.decDeg);
