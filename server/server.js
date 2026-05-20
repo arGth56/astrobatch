@@ -2585,11 +2585,8 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
         ra: raDeg, dec: decDeg, waitForResult: true, center: true, name,
       }, 10 * 60 * 1000);
       centeringOk = isNinaApiSuccess(centerResult);
-      if (!centeringOk) {
-        const errMsg = centerResult.body?.Error || centerResult.body?.Response || "no details";
-        seqLog(`  ⚠ Centering: NINA reports failure — ${errMsg} (clouds? no stars?)`, "warn");
-        seqLog(`    Mount will be at blind-slew position — watchdog will catch bad images`, "warn");
-      }
+      // Don't warn yet — we'll check everExposed after polling to distinguish
+      // a real plate-solve failure from NINA's spurious "Slew failed" on plain gotos.
     } catch (fetchErr) {
       seqLog(`  Centering request error: ${fetchErr.message} — falling back to plain slew`, "warn");
       await plainSlew();
@@ -2611,6 +2608,7 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
     const deadline  = Date.now() + SETTLE_TIMEOUT;
     let stableMs    = 0;
     let lastLogRA   = null;
+    let everExposed = false;  // did NINA attempt a plate-solve image?
 
     while (Date.now() < deadline) {
       checkAbort();
@@ -2630,6 +2628,7 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
 
       const mountBusy  = m.Slewing === true;
       const cameraBusy = ei?.Camera?.IsExposing === true;
+      if (cameraBusy) everExposed = true;
       if (mountBusy || cameraBusy) {
         stableMs = 0;  // still in slew or plate-solve image capture
       } else {
@@ -2642,7 +2641,16 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
     const { equipmentInfo: eiFinal } = await getEquipmentInfo(target).catch(() => ({ equipmentInfo: null }));
     const mFinal = eiFinal?.Mount;
     const finalPos = mFinal ? `${mFinal.RightAscensionString} / ${mFinal.DeclinationString}` : "unknown";
-    const statusTxt = centeringOk ? "✓" : "⚠ (plate solve failed)";
+
+    // Interpret result:
+    //  - centeringOk=true               → plate solve succeeded ✓
+    //  - centeringOk=false, everExposed  → plate solve was attempted but failed (clouds / no stars)
+    //  - centeringOk=false, !everExposed → NINA returned its usual spurious "Slew failed" for a plain goto
+    if (!centeringOk && everExposed) {
+      seqLog(`  ⚠ Plate solve failed (clouds / no stars) — proceeding at blind-slew position`, "warn");
+      seqLog(`    Watchdog will suspend imaging if sky is too cloudy for stars`, "warn");
+    }
+    const statusTxt = centeringOk ? "✓" : everExposed ? "⚠ (plate solve failed — clouds?)" : "✓ (goto only)";
     seqLog(`Slew + centering complete ${statusTxt}  mount at ${finalPos} (JNOW)`);
 
   } else {
