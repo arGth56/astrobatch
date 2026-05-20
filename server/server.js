@@ -2594,15 +2594,18 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
     // Poll until NINA's full SlewAndCenter cycle completes.
     // NINA iterates: goto → capture plate-solve image (IsExposing=true) →
     // solve → correction-slew (Slewing=true) → repeat until within tolerance.
-    // Centering is done only when BOTH mount.Slewing=false AND camera.IsExposing=false
-    // have been stable for SETTLE_STABLE ms — this outlasts solve computation time.
+    // Done when BOTH mount.Slewing=false AND camera.IsExposing=false for SETTLE_STABLE ms.
+    // NOTE: we do NOT verify the final offset here because NINA reports coordinates
+    // in JNOW while our targets are stored as J2000. The precession for 2026 is
+    // ~10-22 arcmin depending on Dec — exactly the "offsets" we used to misdiagnose
+    // as plate-solve failures. Trust NINA's own centering loop.
     seqState.currentStep = `Centering ${name} — waiting for convergence...`;
     const SETTLE_TIMEOUT  = 10 * 60 * 1000;
     const POLL_INTERVAL   = 2500;
     const SETTLE_STABLE   = 10000;  // 10s both-idle → centering done
     const deadline  = Date.now() + SETTLE_TIMEOUT;
     let stableMs    = 0;
-    let lastErrArcsec = null;
+    let lastLogRA   = null;
 
     while (Date.now() < deadline) {
       checkAbort();
@@ -2612,17 +2615,12 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       const m = ei?.Mount;
       if (!m) continue;
 
-      if (m.RightAscension != null && m.Declination != null) {
-        const errArcsec = _angularSepArcsec(
-          m.RightAscension * 15, m.Declination,   // NINA returns RA in hours
-          raDeg, decDeg,
-        );
-        const errRounded = Math.round(errArcsec);
-        if (lastErrArcsec === null || Math.abs(errRounded - lastErrArcsec) > 10) {
-          seqLog(`  Centering: offset ${errRounded}"  (Slewing=${m.Slewing}, Exposing=${ei?.Camera?.IsExposing ?? "?"})`);
-          lastErrArcsec = errRounded;
-          seqState.currentStep = `Centering ${name} — offset ${errRounded}"`;
-        }
+      // Log position changes (informational only — JNOW coords, not comparable to J2000 target)
+      const raLog = m.RightAscensionString;
+      if (raLog !== lastLogRA) {
+        seqLog(`  Centering: mount at ${raLog} / ${m.DeclinationString}  (Slewing=${m.Slewing}, Exposing=${ei?.Camera?.IsExposing ?? "?"})`);
+        seqState.currentStep = `Centering ${name} — Slewing=${m.Slewing} Exposing=${ei?.Camera?.IsExposing ?? "?"}`;
+        lastLogRA = raLog;
       }
 
       const mountBusy  = m.Slewing === true;
@@ -2635,49 +2633,12 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       }
     }
 
-    const MAX_ACCEPTABLE_OFFSET = 120;
-    if (lastErrArcsec !== null && lastErrArcsec > MAX_ACCEPTABLE_OFFSET) {
-      seqLog(`  ⚠ Centering offset ${lastErrArcsec}" exceeds ${MAX_ACCEPTABLE_OFFSET}" — plate solve may have failed. Retrying...`, "warn");
-      try {
-        await callNinaLong(target, "/v2/api/equipment/mount/slew", {
-          ra: raDeg, dec: decDeg, waitForResult: true, center: true, name,
-        }, 10 * 60 * 1000);
-      } catch { /* best effort */ }
+    // NINA's centering loop is complete. Log final mount position.
+    const { equipmentInfo: eiFinal } = await getEquipmentInfo(target).catch(() => ({ equipmentInfo: null }));
+    const mFinal = eiFinal?.Mount;
+    const finalPos = mFinal ? `${mFinal.RightAscensionString} / ${mFinal.DeclinationString}` : "unknown";
+    seqLog(`Slew + centering complete ✓  mount at ${finalPos} (JNOW)`);
 
-      const retryDeadline = Date.now() + 4 * 60 * 1000;
-      let retryStable = 0;
-      let retryErr = null;
-      while (Date.now() < retryDeadline) {
-        checkAbort();
-        await new Promise(r => setTimeout(r, POLL_INTERVAL));
-        const { equipmentInfo: ei2 } = await getEquipmentInfo(target);
-        const m2 = ei2?.Mount;
-        if (!m2) continue;
-        if (m2.RightAscension != null && m2.Declination != null) {
-          retryErr = _angularSepArcsec(m2.RightAscension * 15, m2.Declination, raDeg, decDeg);
-          const rr = Math.round(retryErr);
-          seqLog(`  Retry centering: offset ${rr}"  (Slewing=${m2.Slewing}, Exposing=${ei2?.Camera?.IsExposing ?? "?"})`);
-          seqState.currentStep = `Retry centering ${name} — offset ${rr}"`;
-        }
-        const mountBusy2  = m2.Slewing === true;
-        const cameraBusy2 = ei2?.Camera?.IsExposing === true;
-        if (mountBusy2 || cameraBusy2) { retryStable = 0; } else {
-          retryStable += POLL_INTERVAL;
-          if (retryStable >= SETTLE_STABLE) break;
-        }
-      }
-      const finalRetryErr = retryErr !== null ? Math.round(retryErr) : null;
-      if (finalRetryErr !== null && finalRetryErr > MAX_ACCEPTABLE_OFFSET) {
-        seqLog(`  ✗ Centering failed: offset ${finalRetryErr}" after retry (>${MAX_ACCEPTABLE_OFFSET}"). Falling back to blind slew.`, "error");
-        await plainSlew();
-      } else {
-        lastErrArcsec = finalRetryErr;
-        seqLog(`  Retry centering converged ✓  offset ${finalRetryErr}"`);
-      }
-    }
-
-    const finalErrTxt = lastErrArcsec !== null ? `  final offset ${lastErrArcsec}"` : "";
-    seqLog(`Slew + centering complete ✓${finalErrTxt}`);
   } else {
     await plainSlew();
   }
