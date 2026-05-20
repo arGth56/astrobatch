@@ -2219,6 +2219,30 @@ async function stepUnparkMount(target) {
 const _D2R = Math.PI / 180;
 const _R2D = 180 / Math.PI;
 
+/**
+ * Precess J2000 coordinates to JNOW (approximate, IAU 1976).
+ * Returns { ra, dec } in degrees for the current epoch.
+ */
+function _j2000ToJnow(raDeg, decDeg, date = new Date()) {
+  const T = (date.getFullYear() + (date.getMonth() + 1) / 12 - 2000) / 100;
+  const d2r = _D2R, r2d = _R2D;
+  const zetaA  = ((2306.2181 + (1.39656 - 0.000139 * T) * T) * T
+                + (0.30188 - 0.000345 * T) * T * T + 0.017998 * T * T * T) * d2r / 3600;
+  const zA     = ((2306.2181 + (1.39656 - 0.000139 * T) * T) * T
+                + (1.09468  + 0.000066 * T) * T * T + 0.018203 * T * T * T) * d2r / 3600;
+  const thetaA = ((2004.3109 - (0.85330 + 0.000217 * T) * T) * T
+                - (0.42665  + 0.000217 * T) * T * T - 0.041775 * T * T * T) * d2r / 3600;
+  const ra0  = raDeg  * d2r;
+  const dec0 = decDeg * d2r;
+  const A = Math.cos(dec0) * Math.sin(ra0 + zetaA);
+  const B = Math.cos(thetaA) * Math.cos(dec0) * Math.cos(ra0 + zetaA) - Math.sin(thetaA) * Math.sin(dec0);
+  const C = Math.sin(thetaA) * Math.cos(dec0) * Math.cos(ra0 + zetaA) + Math.cos(thetaA) * Math.sin(dec0);
+  return {
+    ra:  ((Math.atan2(A, B) * r2d) + zA * r2d + 360) % 360,
+    dec: Math.asin(C) * r2d,
+  };
+}
+
 /** Angular separation in arcseconds between two points (ra/dec in degrees) */
 function _angularSepArcsec(ra1Deg, dec1Deg, ra2Deg, dec2Deg) {
   const dRa  = (ra2Deg  - ra1Deg)  * _D2R;
@@ -2608,7 +2632,6 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
     const deadline  = Date.now() + SETTLE_TIMEOUT;
     let stableMs    = 0;
     let lastLogRA   = null;
-    let everExposed = false;  // did NINA attempt a plate-solve image?
 
     while (Date.now() < deadline) {
       checkAbort();
@@ -2628,7 +2651,6 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
 
       const mountBusy  = m.Slewing === true;
       const cameraBusy = ei?.Camera?.IsExposing === true;
-      if (cameraBusy) everExposed = true;
       if (mountBusy || cameraBusy) {
         stableMs = 0;  // still in slew or plate-solve image capture
       } else {
@@ -2637,21 +2659,27 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       }
     }
 
-    // NINA's centering loop is complete. Log final mount position.
+    // NINA's centering loop is complete. Compare mount JNOW position to
+    // target converted to JNOW — this is the definitive centering quality check.
     const { equipmentInfo: eiFinal } = await getEquipmentInfo(target).catch(() => ({ equipmentInfo: null }));
     const mFinal = eiFinal?.Mount;
     const finalPos = mFinal ? `${mFinal.RightAscensionString} / ${mFinal.DeclinationString}` : "unknown";
 
-    // Interpret result:
-    //  - centeringOk=true               → plate solve succeeded ✓
-    //  - centeringOk=false, everExposed  → plate solve was attempted but failed (clouds / no stars)
-    //  - centeringOk=false, !everExposed → NINA returned its usual spurious "Slew failed" for a plain goto
-    if (!centeringOk && everExposed) {
-      seqLog(`  ⚠ Plate solve failed (clouds / no stars) — proceeding at blind-slew position`, "warn");
-      seqLog(`    Watchdog will suspend imaging if sky is too cloudy for stars`, "warn");
+    if (mFinal?.RightAscension != null && mFinal?.Declination != null) {
+      const targetJnow = _j2000ToJnow(raDeg, decDeg);
+      const mountRaDeg = mFinal.RightAscension * 15;  // NINA RA is in hours
+      const offsetArcsec = _angularSepArcsec(mountRaDeg, mFinal.Declination, targetJnow.ra, targetJnow.dec);
+      const MAX_CENTER_OFFSET = 120; // arcsec — good centering
+      if (offsetArcsec <= MAX_CENTER_OFFSET) {
+        seqLog(`Slew + centering complete ✓  offset ${Math.round(offsetArcsec)}"  mount at ${finalPos} (JNOW)`);
+      } else {
+        seqLog(`  ⚠ Centering offset ${Math.round(offsetArcsec)}" (limit ${MAX_CENTER_OFFSET}") — plate solve may have failed (clouds?)`, "warn");
+        seqLog(`    Watchdog will suspend imaging if sky is too cloudy`, "warn");
+        seqLog(`Slew + centering complete ⚠  offset ${Math.round(offsetArcsec)}"  mount at ${finalPos} (JNOW)`);
+      }
+    } else {
+      seqLog(`Slew + centering complete ✓  mount at ${finalPos} (JNOW)`);
     }
-    const statusTxt = centeringOk ? "✓" : everExposed ? "⚠ (plate solve failed — clouds?)" : "✓ (goto only)";
-    seqLog(`Slew + centering complete ${statusTxt}  mount at ${finalPos} (JNOW)`);
 
   } else {
     await plainSlew();
