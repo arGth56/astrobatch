@@ -2880,13 +2880,13 @@ async function stepAutofocusForFilter(target, filterName, availableFilters) {
   }
   seqLog(`  ${result.body?.Response ?? "AF started"} — monitoring position...`);
 
-  await new Promise(r => setTimeout(r, 12000));
+  await new Promise(r => setTimeout(r, 5000)); // brief pause to let AF motion begin
   checkAbort();
 
   const AF_DEADLINE   = Date.now() + 12 * 60 * 1000;
-  const STABLE_NEEDED = 12;    // 12 × 5 s = 60 s stable
+  const STABLE_NEEDED = 6;     // 6 × 5 s = 30 s stable → AF done
   const MIN_MOVES     = 3;
-  const MIN_AF_MS     = 90 * 1000;
+  const MIN_AF_MS     = 60 * 1000; // min 60s before declaring done
   const afStartMs     = Date.now();
   const NO_MOVE_LIMIT = 30;
 
@@ -4408,27 +4408,35 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
         seqLog(`  Phase 1 AF: running autofocus for ${firstFilterName}`);
         await stepAutofocusForFilter(ninaConfig, firstFilterName, availFilters);
       } else {
-        // Temperature-predicted fast focus — read focuser thermistor, move directly
-        const foctemp  = await getFocuserTemp(ninaConfig);
-        const predicted = predictFocuserPos(firstFilterName, foctemp);
-        const lastAf   = getLatestAfResult(firstFilterName);
-
-        if (predicted != null) {
-          const drift = lastAf ? predicted - lastAf.pos : null;
-          const driftStr = drift != null
-            ? ` (last AF pos ${lastAf.pos}, Δ${drift >= 0 ? "+" : ""}${drift} steps)`
-            : " (no prior AF in DB)";
-          seqLog(`  🌡 Fast focus: FOCTEMP=${foctemp.toFixed(1)}°C → predicted pos ${predicted} [${firstFilterName}]${driftStr}`);
-          if (drift != null && Math.abs(drift) > 50) {
-            seqLog(`  ⚠ Drift ${Math.abs(drift)} steps > 50 from last AF — temp model may be off, proceeding`, "warn");
-          }
-          await stepMoveFocuserAbsolute(ninaConfig, predicted);
-        } else if (lastAf) {
+        // Fix 1: prefer recent AF result (<2h); only fall back to temp model if AF is stale/absent
+        const lastAf = getAfResultIfFresh(firstFilterName); // returns null if >2h old
+        if (lastAf) {
           const ageMin = Math.round((Date.now() - lastAf.ts) / 60000);
-          seqLog(`  Fast focus: FOCTEMP unavailable — restoring ${firstFilterName} pos ${lastAf.pos} from DB (${ageMin} min ago)`);
+          seqLog(`  Fast focus: using recent AF pos ${lastAf.pos} for ${firstFilterName} (${ageMin} min ago)`);
           await stepMoveFocuserAbsolute(ninaConfig, lastAf.pos);
         } else {
-          seqLog(`  No FOCTEMP and no prior AF for ${firstFilterName} — proceeding with current focuser position`, "warn");
+          // No recent AF — fall back to temperature model
+          const foctemp   = await getFocuserTemp(ninaConfig);
+          const predicted = predictFocuserPos(firstFilterName, foctemp);
+          const staleAf   = getLatestAfResult(firstFilterName);
+
+          if (predicted != null) {
+            const drift = staleAf ? predicted - staleAf.pos : null;
+            const driftStr = drift != null
+              ? ` (last AF pos ${staleAf.pos} ${Math.round((Date.now()-staleAf.ts)/60000)}min ago, Δ${drift >= 0 ? "+" : ""}${drift} steps)`
+              : " (no prior AF in DB)";
+            seqLog(`  🌡 Fast focus (no recent AF): FOCTEMP=${foctemp?.toFixed(1)}°C → predicted pos ${predicted} [${firstFilterName}]${driftStr}`);
+            if (drift != null && Math.abs(drift) > 100) {
+              seqLog(`  ⚠ Drift ${Math.abs(drift)} steps > 100 from last AF — check camera position`, "warn");
+            }
+            await stepMoveFocuserAbsolute(ninaConfig, predicted);
+          } else if (staleAf) {
+            const ageMin = Math.round((Date.now() - staleAf.ts) / 60000);
+            seqLog(`  Fast focus: FOCTEMP unavailable — using stale AF pos ${staleAf.pos} for ${firstFilterName} (${ageMin} min ago)`, "warn");
+            await stepMoveFocuserAbsolute(ninaConfig, staleAf.pos);
+          } else {
+            seqLog(`  No AF data and no FOCTEMP for ${firstFilterName} — proceeding with current focuser position`, "warn");
+          }
         }
       }
     } else {
@@ -4442,6 +4450,9 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
 
     await stepUnparkMount(ninaConfig);
 
+    // Fix 5: update status text to show ToO target while interrupt is running
+    seqState.currentTarget = `🚨 ToO: ${tooName}`;
+
     // ── Phase 1: rapid filter-cycle imaging (time-critical) ─────────────────
     const validCycleFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
     const cycleLen = validCycleFilters.length || 1;
@@ -4453,6 +4464,13 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
       seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
       await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
       if (!doCenter) await new Promise(r => setTimeout(r, 2000));
+
+      // Fix 2: start guiding after slew if strategy requires it
+      if (doGuiding) {
+        seqLog(`  Starting PHD2 guiding for ToO...`);
+        const gOk = await stepStartGuiding(ninaConfig);
+        if (!gOk) seqLog("  ⚠ Guiding did not settle for ToO — proceeding without guiding", "warn");
+      }
 
       let currentEpoch = 0;
       for (let i = 1; i <= rapidCount; i++) {
@@ -4481,19 +4499,27 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
       }
     }
 
-    // ── Phase 2: multi-filter deep follow-up (remaining frames, with AF) ────
-    const tooFilters = filterNames.filter(f => findFilterByName(availFilters, f));
-    const remainingCount = Math.max(0, count - rapidCount);
+    // ── Phase 2: multi-filter deep follow-up (remaining cycles, with optional AF) ─
+    const tooFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
+    // Fix 6: remaining cycles = total strategy cycles minus the 1 rapid cycle already done
+    const totalStratCycles = Math.max(1, strat.rapid_count || 1);
+    const remainingCount = Math.max(0, totalStratCycles - 1);
     if (remainingCount > 0 && tooFilters.length > 0 && !seqState.aborted) {
       // Phase 2 epoch offset: continue numbering after Phase 1
       const p2EpochOffset = totalEpochs;
-      seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} epochs × [${tooFilters.join(", ")}] (epochs E${String(p2EpochOffset + 1).padStart(2,"0")}+)`);
+      seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} more epoch(s) × [${tooFilters.join(", ")}] (epochs E${String(p2EpochOffset + 1).padStart(2,"0")}+)`);
 
       for (const pt of grid) {
         if (seqState.aborted) break;
         seqLog(`  → Slewing to ${tooName} [${pt.label}] (Phase 2)`);
         await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
         await new Promise(r => setTimeout(r, 2000));
+
+        // Start guiding for Phase 2 if required
+        if (doGuiding) {
+          const gOk2 = await stepStartGuiding(ninaConfig);
+          if (!gOk2) seqLog("  ⚠ Guiding did not settle (Phase 2) — proceeding", "warn");
+        }
 
         // Outer loop: epochs (one complete filter pass per epoch)
         for (let ep = 1; ep <= remainingCount; ep++) {
@@ -4507,7 +4533,14 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
             if (seqState.aborted) break;
             const filter = findFilterByName(availFilters, filterName);
             if (!filter) continue;
-            if (ep === 1) await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+            // Fix 3: only run AF in Phase 2 if doAf is true
+            if (ep === 1 && doAf) {
+              const fullAfRan = await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+              if (fullAfRan && doGuiding) {
+                seqLog(`  AF [${filterName}] complete — restarting guiding (Phase 2)`);
+                await stepStartGuiding(ninaConfig);
+              }
+            }
             await changeFilterVerified(ninaConfig, filter);
             seqState.currentStep = `ToO ${pt.label} ${epochTag} ${filterName}: ${ep}/${remainingCount}`;
             seqState.progress = { filter: filterName, frame: ep, frames: remainingCount, epoch: epochNum };
