@@ -2591,14 +2591,14 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       seqLog("  Plain slew complete (no centering)");
     }
 
-    // Poll until the mount has been continuously NOT slewing for SETTLE_STABLE ms.
-    // This catches the full solve→sync→re-slew cycle: the mount may stop briefly
-    // after the first goto, then start again after the sync. We only declare done
-    // once it has been truly still for a sustained period.
+    // Poll until the mount has truly converged (slew→stop→plate-solve→correction-slew→stop).
+    // NINA's SlewAndCenter iterates: goto → image (5-30s) → solve → correction-slew → repeat.
+    // The mount is STATIONARY during the image+solve phase, so SETTLE_STABLE must be longer
+    // than a typical solve time (20-30s) to avoid declaring "done" mid-solve.
     seqState.currentStep = `Centering ${name} — waiting for convergence...`;
     const SETTLE_TIMEOUT  = 10 * 60 * 1000;  // hard cap
     const POLL_INTERVAL   = 2500;
-    const SETTLE_STABLE   = 5000;             // must be not-slewing for 5 s to be "done"
+    const SETTLE_STABLE   = 45000;  // 45s: outlasts any single plate-solve+decode cycle
     const deadline  = Date.now() + SETTLE_TIMEOUT;
     let stableMs    = 0;
     let lastErrArcsec = null;
@@ -2641,7 +2641,7 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
         }, 10 * 60 * 1000);
       } catch { /* best effort */ }
 
-      const retryDeadline = Date.now() + 3 * 60 * 1000;
+      const retryDeadline = Date.now() + 4 * 60 * 1000;
       let retryStable = 0;
       let retryErr = null;
       while (Date.now() < retryDeadline) {
