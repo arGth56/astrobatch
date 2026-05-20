@@ -1126,13 +1126,22 @@ async function runWatchdogCheck() {
           console.log("[watchdog] Retention passed — checking roof before unparking...");
           try {
             const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
-            const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
-            if (ok && roofStatus && !roofStatus.includes("open")) {
-              console.warn(`[watchdog] Roof is closed (${ocsClean(fields.roof_sta)}) — skipping unpark, staying parked`);
-              watchdog.state = "bad"; // don't resume yet
+            if (!ok || !fields) {
+              console.warn("[watchdog] OCS unreachable — staying parked until OCS confirms roof open");
+              watchdog.state = "bad";
               return;
             }
-          } catch { /* OCS unreachable — proceed */ }
+            const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+            if (roofStatus && !roofStatus.includes("open")) {
+              console.warn(`[watchdog] Roof is closed (${ocsClean(fields.roof_sta)}) — skipping unpark, staying parked`);
+              watchdog.state = "bad";
+              return;
+            }
+          } catch {
+            console.warn("[watchdog] OCS error during roof check — staying parked");
+            watchdog.state = "bad";
+            return;
+          }
           console.log("[watchdog] Roof open — unparking mount...");
           try {
             const cfg = seqState.ninaConfig;
@@ -2048,26 +2057,31 @@ async function stepCoolCamera(target, targetTempC = -5) {
 
 /**
  * Verify the OCS roof is open before any mount movement.
- * Throws if roof is confirmed closed. Logs a warning if OCS is unreachable.
+ * Throws if roof is confirmed closed OR if OCS is unreachable (fail-safe).
  * @param {string} context  – short label shown in the error/log (e.g. "unpark", "slew")
  */
 async function assertRoofOpen(context = "mount move") {
+  let ok, fields;
   try {
-    const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
-    if (!ok) {
-      seqLog(`⚠ Roof check (${context}): OCS unreachable — proceeding with caution`, "warn");
-      return; // can't confirm, don't block
-    }
-    const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
-    if (roofStatus && !roofStatus.includes("open")) {
-      const err = new Error(`Roof is closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting ${context} for safety`);
-      err.code = "__ROOF_CLOSED__";
-      seqLog(`✗ ${err.message}`, "error");
-      throw err;
-    }
+    ({ ok, fields } = await ocsStatus(DEFAULT_OCS_HOST));
   } catch (e) {
-    if (e.code === "__ROOF_CLOSED__") throw e;
-    seqLog(`⚠ Roof check (${context}): OCS error (${e.message}) — proceeding with caution`, "warn");
+    const err = new Error(`OCS unreachable — cannot verify roof before ${context}, aborting for safety`);
+    err.code = "__ROOF_CLOSED__";
+    seqLog(`✗ ${err.message}`, "error");
+    throw err;
+  }
+  if (!ok) {
+    const err = new Error(`OCS unreachable — cannot verify roof before ${context}, aborting for safety`);
+    err.code = "__ROOF_CLOSED__";
+    seqLog(`✗ ${err.message}`, "error");
+    throw err;
+  }
+  const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+  if (roofStatus && !roofStatus.includes("open")) {
+    const err = new Error(`Roof is closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting ${context} for safety`);
+    err.code = "__ROOF_CLOSED__";
+    seqLog(`✗ ${err.message}`, "error");
+    throw err;
   }
 }
 
