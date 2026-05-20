@@ -874,6 +874,77 @@ app.post("/api/alerts/prep/abort", (req, res) => {
   res.json({ success: true, message: "abort requested" });
 });
 
+// ── Inject a simulated alert (dev/test) ──────────────────────────────────────
+// POST /api/alerts/inject  { broker, trigger_id, ra, dec, err_deg, classification }
+// Runs through the exact same strategy/altitude/moon checks as a real GCN alert.
+app.post("/api/alerts/inject", async (req, res) => {
+  const { broker = "SVOM", trigger_id = "TEST-" + Date.now(),
+          ra, dec, err_deg = 0.1, classification = "GRB (simulated)" } = req.body || {};
+
+  if (!Number.isFinite(Number(ra)) || !Number.isFinite(Number(dec))) {
+    return res.status(400).json({ success: false, error: "ra and dec are required" });
+  }
+  const raDeg  = Number(ra);
+  const decDeg = Number(dec);
+  const errDeg = Number(err_deg);
+
+  const strategy = getStrategy(broker);
+  if (!strategy) return res.status(400).json({ success: false, error: `No strategy for broker: ${broker}` });
+
+  const site = resolveObserverSite();
+  const { alt } = serverComputeAltAz(raDeg, decDeg, site.lat, site.lon, new Date());
+  const moon  = alerts.moonRaDec(new Date());
+  const moonSep = alerts.angularSep(raDeg, decDeg, moon.ra, moon.dec);
+
+  const minAltDeg    = strategy.min_alt      ?? 25;
+  const maxErrDeg    = strategy.max_err_deg  ?? 1;
+  const minMoonSep   = 20;
+
+  let action = "rejected", action_reason = null;
+  const rejectReasons = [];
+  if (!Number.isFinite(alt)) rejectReasons.push("no-coords");
+  else {
+    if (alt < minAltDeg)     rejectReasons.push(`alt-too-low:${alt.toFixed(1)}deg`);
+    if (moonSep < minMoonSep) rejectReasons.push(`moon-too-close:${moonSep.toFixed(1)}deg`);
+    if (errDeg > maxErrDeg)  rejectReasons.push(`err-too-large:${errDeg.toFixed(2)}deg(limit=${maxErrDeg})`);
+  }
+
+  const ok = rejectReasons.length === 0;
+  if (ok) {
+    try {
+      const alertObj = { broker, trigger_id, ra: raDeg, dec: decDeg,
+                         err_deg: errDeg, alt, moonSep, strategy };
+      const mode = strategy.mode || "too";
+      _gcnPushToQueue({ name: `${broker}-${trigger_id}`, raDeg, decDeg,
+                        alert: alertObj, mode });
+      saveQueue();
+      action = mode === "too" ? "queued" : "queued-only";
+      action_reason = `strategy:${mode} (injected)`;
+    } catch (e) {
+      action = "rejected"; action_reason = `enqueue-error:${e.message}`;
+    }
+  } else {
+    action_reason = rejectReasons.join(", ");
+  }
+
+  db.prepare(`
+    INSERT INTO alerts (received_at, event_time, broker, topic, trigger_id, classification,
+      ra, dec, err_deg, alt_now, moon_sep, action, action_reason, colibri_id, raw)
+    VALUES (datetime('now'), datetime('now'), ?, 'injected', ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, null, '(injected via API)')
+  `).run(broker, String(trigger_id), classification,
+         raDeg, decDeg, errDeg,
+         Number.isFinite(alt) ? alt : null,
+         Number.isFinite(moonSep) ? moonSep : null,
+         action, action_reason);
+
+  seqLog(`🧪 Injected alert: ${broker} ${trigger_id} RA=${raDeg.toFixed(3)}° Dec=${decDeg.toFixed(3)}° alt=${alt?.toFixed(1)}° → ${action}${action_reason ? " ("+action_reason+")" : ""}`, ok ? "warn" : "info");
+
+  res.json({ success: true, action, action_reason,
+             alt: alt?.toFixed(1), moonSep: moonSep?.toFixed(1),
+             strategy: { mode: strategy.mode, enabled: strategy.enabled } });
+});
+
 // ── Alert strategy routes ────────────────────────────────────────────────────
 
 app.get("/api/alert-strategies", (req, res) => {
@@ -6301,10 +6372,8 @@ function resolveObserverSite() {
   return { lat: 47.7, lon: -3.0 };
 }
 
-alerts.startGcnListener({
-  db,
-  getStrategy,
-  pushToQueue: ({ name, raDeg, decDeg, alert, mode }) => {
+// Stored reference so /api/alerts/inject can reuse the same callback
+function _gcnPushToQueue({ name, raDeg, decDeg, alert, mode }) {
     const isToo = (mode === "too");
     const shouldNotify = getSetting("alert_notify_email", "true") !== "false";
     if (isToo && seqState.alertReady && seqState.running && !seqState.tooRunning && alert) {
@@ -6334,6 +6403,13 @@ alerts.startGcnListener({
       `Dec:        ${decDeg?.toFixed?.(4) ?? "?"}°\n` +
       `Time:       ${new Date().toISOString()}\n`
     );
+}
+
+alerts.startGcnListener({
+  db,
+  getStrategy,
+  pushToQueue: (opts) => {
+    _gcnPushToQueue(opts);
   },
   saveQueue,
   computeAltAz:  serverComputeAltAz,
@@ -6341,6 +6417,7 @@ alerts.startGcnListener({
   minAltDeg:     parseFloat(process.env.ALERT_MIN_ALT_DEG || "25"),
   minMoonSepDeg: parseFloat(process.env.ALERT_MIN_MOON_SEP_DEG || "20"),
 });
+
 
 app.listen(PORT, () => {
   console.log(`NINA control server listening on http://localhost:${PORT}`);
