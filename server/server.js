@@ -608,6 +608,14 @@ const SETTING_DEFAULTS = {
   maxCloudRecoveryWaitMin: "12",
   frameCheckEnabled:    "false",
   frameCheckThreshold:  "5",
+  morning_park_hour:    "8",
+  // Focuser temperature model: pos ≈ slope × (FOCTEMP − 15) + ref15
+  af_slope_G:           "10.83",
+  af_slope_BP:          "9.73",
+  af_slope_RP:          "12.08",
+  af_ref15_G:           "4195",
+  af_ref15_BP:          "4202",
+  af_ref15_RP:          "4202",
 };
 
 app.get("/api/settings/:key", (req, res) => {
@@ -964,7 +972,6 @@ const watchdog = {
   skyTempLimit: -4,    // °C  — park if IR sky > this
   sqLimit:      16,    // mag/arcsec² — park if SQ < this (0 = disabled)
   retentionMin: 10,    // minutes of clear sky before resuming
-  maxBadMin:    90,    // abort sequence if sky has been bad for this long (dawn protection)
 
   // runtime state
   state:        "off",   // "off" | "clear" | "bad" | "recovering"
@@ -987,7 +994,7 @@ const watchdog = {
       if (cfg.skyTempLimit !== undefined) watchdog.skyTempLimit = Number(cfg.skyTempLimit);
       if (cfg.sqLimit      !== undefined) watchdog.sqLimit      = Number(cfg.sqLimit);
       if (cfg.retentionMin !== undefined) watchdog.retentionMin = Number(cfg.retentionMin);
-      if (cfg.maxBadMin    !== undefined) watchdog.maxBadMin    = Number(cfg.maxBadMin);
+      if (cfg.morningParkHour !== undefined) setSetting("morning_park_hour", String(Number(cfg.morningParkHour)));
     }
   } catch (_) {}
   watchdog.state = watchdog.enabled ? "clear" : "off";
@@ -1044,63 +1051,65 @@ async function runWatchdogCheck() {
       watchdog.state    = "bad";
       watchdog.badSince = watchdog.badSince ?? new Date(); // keep first onset time
       console.log(`[watchdog] Conditions bad — ${watchdog.lastMsg}`);
-      // Park mount + close dust cover if sequence is running and not already parked
-      if (seqState.running && !watchdog.parked) {
+
+      // ── Park mount (always, not just when sequence is running) ─────────────
+      if (!watchdog.parked) {
         console.log("[watchdog] Parking mount due to bad conditions...");
         try {
-          const cfg = seqState.ninaConfig;
-          if (cfg) {
-            await fetch(`http://${cfg.host}:${cfg.port}/v2/api/equipment/mount/park`, {
-              method: "GET", signal: AbortSignal.timeout(15000),
-            }).catch(() => {});
-          }
+          const cfg = seqState.ninaConfig ?? { host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL };
+          await fetch(`http://${cfg.host}:${cfg.port}/v2/api/equipment/mount/park`, {
+            method: "GET", signal: AbortSignal.timeout(15000),
+          }).catch(() => {});
           watchdog.parked = true;
           console.log("[watchdog] Mount parked.");
         } catch (e) {
           console.error("[watchdog] Park failed:", e.message);
         }
+      }
 
-        // If rain detected: also command OCS to close roof (backup to OCS auto-close firmware)
-        if (rainBad) {
-          console.log("[watchdog] Rain detected — commanding OCS roof close as safety backup...");
-          try {
-            await ocsGet(DEFAULT_OCS_HOST, { roof: "close" });
-            console.log("[watchdog] OCS roof close command sent ✓");
-          } catch (e) {
-            console.error("[watchdog] OCS roof close command failed:", e.message);
-          }
-        }
-
-        // Close dust cover immediately after parking — protect optics from rain
-        try {
-          const cfg = seqState.ninaConfig;
-          if (cfg) {
-            const fd = await getCoverState(cfg).catch(() => null);
-            const cs = normCoverState(fd?.CoverState);
-            if (cs === 0) {
-              console.log("[watchdog] Dust cover not present — skipping close.");
-            } else if (cs === 1) {
-              console.log("[watchdog] Dust cover already closed ✓");
-              watchdog.coverClosed = true;
-            } else {
-              console.log(`[watchdog] Closing dust cover (current state: ${fd?.CoverState ?? "unknown"})...`);
-              await callNinaLong(cfg, "/v2/api/equipment/flatdevice/set-cover", { closed: true }, 30000);
-              // Poll up to 30 s for confirmation
-              const deadline = Date.now() + 30000;
-              let closed = false;
-              while (Date.now() < deadline) {
-                await new Promise(r => setTimeout(r, 1000));
-                const st = normCoverState((await getCoverState(cfg).catch(() => null))?.CoverState);
-                if (st === 1) { closed = true; break; }
-                if (st === 101) break;
-              }
-              watchdog.coverClosed = closed;
-              console.log(closed ? "[watchdog] Dust cover closed ✓" : "[watchdog] Dust cover close confirmation timed out");
+      // ── Rain: command OCS roof close with retries (backup to OCS firmware) ─
+      if (rainBad) {
+        console.log("[watchdog] Rain detected — commanding OCS roof close (with retries)...");
+        (async () => {
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              await ocsGet(DEFAULT_OCS_HOST, { roof: "close" });
+              console.log(`[watchdog] OCS roof close command sent ✓ (attempt ${attempt})`);
+              break;
+            } catch (e) {
+              console.error(`[watchdog] OCS roof close attempt ${attempt} failed: ${e.message}`);
+              if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
             }
           }
-        } catch (e) {
-          console.error("[watchdog] Dust cover close failed:", e.message);
+        })();
+      }
+
+      // ── Close dust cover (always — protect optics regardless of sequence state) ──
+      const cfg = seqState.ninaConfig ?? { host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL };
+      try {
+        const fd = await getCoverState(cfg).catch(() => null);
+        const cs = normCoverState(fd?.CoverState);
+        if (cs === 0) {
+          console.log("[watchdog] Dust cover not present — skipping close.");
+        } else if (cs === 1) {
+          console.log("[watchdog] Dust cover already closed ✓");
+          watchdog.coverClosed = true;
+        } else {
+          console.log(`[watchdog] Closing dust cover (current state: ${fd?.CoverState ?? "unknown"})...`);
+          await callNinaLong(cfg, "/v2/api/equipment/flatdevice/set-cover", { closed: true }, 30000);
+          const deadline = Date.now() + 30000;
+          let closed = false;
+          while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 1000));
+            const st = normCoverState((await getCoverState(cfg).catch(() => null))?.CoverState);
+            if (st === 1) { closed = true; break; }
+            if (st === 101) break;
+          }
+          watchdog.coverClosed = closed;
+          console.log(closed ? "[watchdog] Dust cover closed ✓" : "[watchdog] Dust cover close confirmation timed out");
         }
+      } catch (e) {
+        console.error("[watchdog] Dust cover close failed:", e.message);
       }
     }
   } else {
@@ -1248,11 +1257,11 @@ setTimeout(runMountParkCheck, 5000); // initial check shortly after startup
 
 app.get("/api/watchdog", (req, res) => {
   res.json({
-    enabled:      watchdog.enabled,
-    skyTempLimit: watchdog.skyTempLimit,
-    sqLimit:      watchdog.sqLimit,
-    retentionMin: watchdog.retentionMin,
-    maxBadMin:    watchdog.maxBadMin,
+    enabled:        watchdog.enabled,
+    skyTempLimit:   watchdog.skyTempLimit,
+    sqLimit:        watchdog.sqLimit,
+    retentionMin:   watchdog.retentionMin,
+    morningParkHour: parseInt(getSetting("morning_park_hour") ?? "8", 10),
     state:        watchdog.state,
     lastCheck:    watchdog.lastCheck,
     lastMsg:      watchdog.lastMsg,
@@ -1281,7 +1290,7 @@ app.post("/api/watchdog", (req, res) => {
   watchdog.skyTempLimit = Number(b.skyTempLimit) ?? -4;
   watchdog.sqLimit      = Number(b.sqLimit)      ?? 16;
   watchdog.retentionMin = Math.max(1, Number(b.retentionMin) || 10);
-  watchdog.maxBadMin    = Math.max(10, Number(b.maxBadMin)   || 90);
+  if (b.morningParkHour !== undefined) setSetting("morning_park_hour", String(Math.max(0, Math.min(12, Number(b.morningParkHour) || 8))));
   // Set state synchronously so the response reflects the new state immediately
   if (!watchdog.enabled) {
     watchdog.state  = "off";
@@ -1292,23 +1301,22 @@ app.post("/api/watchdog", (req, res) => {
   setSetting("watchdog_config", JSON.stringify({
     enabled: watchdog.enabled, skyTempLimit: watchdog.skyTempLimit,
     sqLimit: watchdog.sqLimit, retentionMin: watchdog.retentionMin,
-    maxBadMin: watchdog.maxBadMin,
   }));
   applyWatchdogInterval();
   res.json({
     success: true,
     watchdog: {
-      enabled:        watchdog.enabled,
-      skyTempLimit:   watchdog.skyTempLimit,
-      sqLimit:        watchdog.sqLimit,
-      retentionMin:   watchdog.retentionMin,
-      maxBadMin:      watchdog.maxBadMin,
-      state:          watchdog.state,
-      lastCheck:      watchdog.lastCheck,
-      lastMsg:        watchdog.lastMsg,
-      parked:         watchdog.parked,
-      badSince:       watchdog.badSince,
-      safetyOverride: watchdog.safetyOverride,
+      enabled:         watchdog.enabled,
+      skyTempLimit:    watchdog.skyTempLimit,
+      sqLimit:         watchdog.sqLimit,
+      retentionMin:    watchdog.retentionMin,
+      morningParkHour: parseInt(getSetting("morning_park_hour") ?? "8", 10),
+      state:           watchdog.state,
+      lastCheck:       watchdog.lastCheck,
+      lastMsg:         watchdog.lastMsg,
+      parked:          watchdog.parked,
+      badSince:        watchdog.badSince,
+      safetyOverride:  watchdog.safetyOverride,
     },
   });
 });
@@ -1797,6 +1805,42 @@ scheduleNoonReset();
 // ── Per-filter autofocus cache (DB-backed) ────────────────────────────────────
 const FILTER_AF_CACHE_MS = 2 * 60 * 60 * 1000; // 2 hours
 
+// ── Temperature-based focuser position prediction ──────────────────────────
+// Linear regression from May 2026 autofocus runs (current camera configuration).
+// Formula: pos ≈ slope × FOCTEMP + intercept  (FOCTEMP in °C from focuser thermistor)
+// R²≈0.60 for combined, ±20 steps typical error vs ~±100 steps depth-of-focus.
+const AF_TEMP_REGRESSION = {
+  G:   { slope: 10.83, intercept: 4033 },
+  BP:  { slope:  9.73, intercept: 4056 },
+  RP:  { slope: 12.08, intercept: 4021 },
+  ALL: { slope: 11.09, intercept: 4034 }, // combined / fallback
+};
+
+/** Return predicted focuser position from thermistor temperature (configurable model).
+ *  Formula: pos = slope × (FOCTEMP − 15) + ref15
+ *  Parameters are read live from DB settings so the UI can update them without restart. */
+function predictFocuserPos(filterName, foctemp) {
+  if (!Number.isFinite(foctemp)) return null;
+  const knownFilters = ["G", "BP", "RP"];
+  const f = knownFilters.includes(filterName) ? filterName : null;
+  const reg = AF_TEMP_REGRESSION[f] ?? AF_TEMP_REGRESSION.ALL;
+  // Live DB read (SETTING_DEFAULTS provide the May 2026 values as fallback)
+  const slope = parseFloat(f ? getSetting(`af_slope_${f}`) : null) || reg.slope;
+  const ref15 = parseFloat(f ? getSetting(`af_ref15_${f}`) : null) || Math.round(reg.slope * 15 + reg.intercept);
+  return Math.round(slope * (foctemp - 15) + ref15);
+}
+
+/** Read current focuser thermistor temperature (°C) from NINA live equipment info. */
+async function getFocuserTemp(target) {
+  try {
+    const { equipmentInfo } = await getEquipmentInfo(target);
+    const temp = equipmentInfo?.Focuser?.Temperature;
+    return Number.isFinite(temp) ? temp : null;
+  } catch {
+    return null;
+  }
+}
+
 const _afInsertStmt = db.prepare(
   `INSERT INTO autofocus_log (filter, position, ts) VALUES (?, ?, datetime('now'))`
 );
@@ -2112,6 +2156,24 @@ function serverComputeAltAz(raDeg, decDeg, latDeg, lonDeg, date = new Date()) {
  * @param {object} limits       – { minAlt, meridianGap, zenithLimit }
  */
 async function checkMountSafetyForFrame(target, { minAlt = 20, meridianGap = 10, zenithLimit = 70 } = {}) {
+  // ── Morning cutoff: end sequence if past configured local hour ─────────────
+  // Checked here (not just in waitForWatchdogClear) so it fires even on clear nights.
+  {
+    const morningParkHour = parseInt(getSetting("morning_park_hour") ?? "8", 10);
+    const localHour = new Date().getHours();
+    if (localHour >= morningParkHour && localHour < 14) {
+      seqLog(`🌅 Morning cutoff (${morningParkHour}:00 local) — ending sequence and parking`, "warn");
+      // Park mount
+      try {
+        await fetch(`http://${target.host}:${target.port}/v2/api/equipment/mount/park`, {
+          method: "GET", signal: AbortSignal.timeout(15000),
+        }).catch(() => {});
+      } catch { /* non-fatal */ }
+      seqState.aborted = true;
+      checkAbort(); // throws __ABORTED__
+    }
+  }
+
   // Watchdog takes priority: if sky is bad, wait here — do NOT throw __LIMIT_REACHED__
   // because that would consume a retry slot; instead block until the watchdog clears.
   if (watchdog.enabled && (watchdog.state === "bad" || watchdog.state === "recovering")) {
@@ -2319,18 +2381,19 @@ async function checkTargetAboveHorizon(target, raDeg, decDeg, name) {
 async function waitForWatchdogClear() {
   if (watchdog.state !== "bad" && watchdog.state !== "recovering") return;
   seqLog("⛅ Watchdog: bad conditions — sequence suspended until sky clears", "warn");
-  const maxBadMs = (watchdog.maxBadMin ?? 90) * 60_000;
   while (watchdog.state === "bad" || watchdog.state === "recovering") {
     checkAbort();
-    // If conditions have been bad longer than maxBadMin → dawn or persistent closure → abort
-    if (watchdog.badSince && (Date.now() - watchdog.badSince.getTime()) > maxBadMs) {
-      const badMin = Math.round((Date.now() - watchdog.badSince.getTime()) / 60_000);
-      seqLog(`🌅 Watchdog: sky has been bad for ${badMin} min (limit ${watchdog.maxBadMin} min) — aborting sequence (likely dawn)`, "warn");
+    // Morning cutoff: abort once local time reaches the configured park hour
+    // (mount is already parked by the watchdog loop, this just ends the sequence)
+    const morningParkHour = parseInt(getSetting("morning_park_hour") ?? "8", 10);
+    const localHour = new Date().getHours();
+    if (localHour >= morningParkHour && localHour < 14) {
+      seqLog(`🌅 Watchdog: past morning cutoff (${morningParkHour}:00 local) — ending sequence, mount already parked`, "warn");
       seqState.aborted = true;
       checkAbort(); // throws __ABORTED__
     }
     const badMin = watchdog.badSince ? Math.round((Date.now() - watchdog.badSince.getTime()) / 60_000) : "?";
-    seqState.currentStep = `Watchdog: waiting for clear sky — bad for ${badMin} min / max ${watchdog.maxBadMin} min (${watchdog.lastMsg || watchdog.state})`;
+    seqState.currentStep = `Watchdog: waiting for clear sky — bad for ${badMin} min (${watchdog.lastMsg || watchdog.state})`;
     await new Promise(r => setTimeout(r, 60_000));
   }
   seqLog("☀ Watchdog: sky clear — resuming", "info");
@@ -3389,6 +3452,8 @@ async function runSequence(ninaConfig, seqConfig) {
   seqState.error      = null;
   seqState.manualMode = seqConfig.manualMode === true;
   seqState.ninaConfig = ninaConfig;
+  // Reset stale daytime badSince so morning-cutoff timer starts fresh for tonight
+  watchdog.badSince   = null;
 
   seqLog(`=== Sequence started ${seqState.manualMode ? "(MANUAL step mode)" : "(auto)"} ===`);
 
@@ -4197,13 +4262,27 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
         seqLog(`  Phase 1 AF: running autofocus for ${firstFilterName}`);
         await stepAutofocusForFilter(ninaConfig, firstFilterName, availFilters);
       } else {
-        const lastAf = getLatestAfResult(firstFilterName);
-        if (lastAf) {
+        // Temperature-predicted fast focus — read focuser thermistor, move directly
+        const foctemp  = await getFocuserTemp(ninaConfig);
+        const predicted = predictFocuserPos(firstFilterName, foctemp);
+        const lastAf   = getLatestAfResult(firstFilterName);
+
+        if (predicted != null) {
+          const drift = lastAf ? predicted - lastAf.pos : null;
+          const driftStr = drift != null
+            ? ` (last AF pos ${lastAf.pos}, Δ${drift >= 0 ? "+" : ""}${drift} steps)`
+            : " (no prior AF in DB)";
+          seqLog(`  🌡 Fast focus: FOCTEMP=${foctemp.toFixed(1)}°C → predicted pos ${predicted} [${firstFilterName}]${driftStr}`);
+          if (drift != null && Math.abs(drift) > 50) {
+            seqLog(`  ⚠ Drift ${Math.abs(drift)} steps > 50 from last AF — temp model may be off, proceeding`, "warn");
+          }
+          await stepMoveFocuserAbsolute(ninaConfig, predicted);
+        } else if (lastAf) {
           const ageMin = Math.round((Date.now() - lastAf.ts) / 60000);
-          seqLog(`  Fast focus: restoring ${firstFilterName} focuser pos ${lastAf.pos} from DB (${ageMin} min ago)`);
+          seqLog(`  Fast focus: FOCTEMP unavailable — restoring ${firstFilterName} pos ${lastAf.pos} from DB (${ageMin} min ago)`);
           await stepMoveFocuserAbsolute(ninaConfig, lastAf.pos);
         } else {
-          seqLog(`  No prior AF for ${firstFilterName} in DB — proceeding with current focuser position`, "warn");
+          seqLog(`  No FOCTEMP and no prior AF for ${firstFilterName} — proceeding with current focuser position`, "warn");
         }
       }
     } else {
@@ -4220,7 +4299,8 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
     // ── Phase 1: rapid filter-cycle imaging (time-critical) ─────────────────
     const validCycleFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
     const cycleLen = validCycleFilters.length || 1;
-    seqLog(`  Phase 1: rapid cycling [${validCycleFilters.join(",")}] — ${rapidCount} × ${rapidExposure}s (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
+    const totalEpochs = Math.ceil(rapidCount / cycleLen);
+    seqLog(`  Phase 1: rapid cycling [${validCycleFilters.join(",")}] — ${rapidCount} × ${rapidExposure}s → ${totalEpochs} epoch(s) (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
 
     for (const pt of grid) {
       if (seqState.aborted) break;
@@ -4228,17 +4308,28 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
       await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
       if (!doCenter) await new Promise(r => setTimeout(r, 2000));
 
+      let currentEpoch = 0;
       for (let i = 1; i <= rapidCount; i++) {
         if (seqState.aborted) break;
         const cycleFilter = validCycleFilters[(i - 1) % cycleLen] || fastFilter;
+        const epochNum    = Math.ceil(i / cycleLen);
+        const epochTag    = `E${String(epochNum).padStart(2, "0")}`;
+        // Each complete filter cycle is a separate NINA target → separate directory → pipeline processes each epoch independently
+        const epochName   = `${tooName}-${pt.label}-${epochTag}`;
+
+        if (epochNum !== currentEpoch) {
+          seqLog(`  ── Epoch ${epochTag} (frames ${(epochNum - 1) * cycleLen + 1}–${Math.min(epochNum * cycleLen, rapidCount)}) ──`);
+          currentEpoch = epochNum;
+        }
+
         const cFilter = findFilterByName(availFilters, cycleFilter);
         if (cFilter) await changeFilterVerified(ninaConfig, cFilter);
 
-        seqState.currentStep = `ToO ${pt.label} ${cycleFilter}: ${i}/${rapidCount} [RAPID]`;
-        seqState.progress = { filter: cycleFilter, frame: i, frames: rapidCount };
-        seqLog(`  ${pt.label} ${cycleFilter} ${i}/${rapidCount}: ${rapidExposure}s`);
+        seqState.currentStep = `ToO ${pt.label} ${epochTag} ${cycleFilter}: ${i}/${rapidCount} [RAPID]`;
+        seqState.progress = { filter: cycleFilter, frame: i, frames: rapidCount, epoch: epochNum, totalEpochs };
+        seqLog(`  ${pt.label} ${epochTag} ${cycleFilter} ${i}/${rapidCount}: ${rapidExposure}s`);
         await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
-          { duration: rapidExposure, gain: rapidGain, save: true, targetName: tooName, filter: cycleFilter }, 30000);
+          { duration: rapidExposure, gain: rapidGain, save: true, targetName: epochName, filter: cycleFilter }, 30000);
         await waitExposure(rapidExposure);
         try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
       }
@@ -4248,59 +4339,37 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
     const tooFilters = filterNames.filter(f => findFilterByName(availFilters, f));
     const remainingCount = Math.max(0, count - rapidCount);
     if (remainingCount > 0 && tooFilters.length > 0 && !seqState.aborted) {
-      seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} frames × [${tooFilters.join(", ")}]`);
+      // Phase 2 epoch offset: continue numbering after Phase 1
+      const p2EpochOffset = totalEpochs;
+      seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} epochs × [${tooFilters.join(", ")}] (epochs E${String(p2EpochOffset + 1).padStart(2,"0")}+)`);
 
-      if (needsLoop) {
-        const perPointing = Math.max(1, Math.floor(remainingCount / grid.length));
-        for (const filterName of tooFilters) {
+      for (const pt of grid) {
+        if (seqState.aborted) break;
+        seqLog(`  → Slewing to ${tooName} [${pt.label}] (Phase 2)`);
+        await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Outer loop: epochs (one complete filter pass per epoch)
+        for (let ep = 1; ep <= remainingCount; ep++) {
           if (seqState.aborted) break;
-          const filter = findFilterByName(availFilters, filterName);
-          if (!filter) continue;
-          await changeFilterVerified(ninaConfig, filter);
-          await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
-
-          for (const pt of grid) {
-            if (seqState.aborted) break;
-            seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
-            await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
-            await new Promise(r => setTimeout(r, 2000));
-
-            for (let i = 1; i <= perPointing; i++) {
-              if (seqState.aborted) break;
-              seqState.currentStep = `ToO ${pt.label} ${filterName}: ${i}/${perPointing}`;
-              seqState.progress = { filter: filterName, frame: i, frames: perPointing };
-              seqLog(`  ${pt.label} ${filterName} ${i}/${perPointing}: ${duration}s`);
-              await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
-                { duration, gain, save: true, targetName: tooName, filter: filterName }, 30000);
-              await waitExposure(duration);
-              try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
-            }
-          }
-        }
-      } else {
-        for (const pt of grid) {
-          if (seqState.aborted) break;
-          seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
-          await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
-          await new Promise(r => setTimeout(r, 2000));
+          const epochNum  = p2EpochOffset + ep;
+          const epochTag  = `E${String(epochNum).padStart(2, "0")}`;
+          const epochName = `${tooName}-${pt.label}-${epochTag}`;
+          seqLog(`  ── Epoch ${epochTag} (Phase 2, pass ${ep}/${remainingCount}) ──`);
 
           for (const filterName of tooFilters) {
             if (seqState.aborted) break;
             const filter = findFilterByName(availFilters, filterName);
             if (!filter) continue;
-            await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+            if (ep === 1) await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
             await changeFilterVerified(ninaConfig, filter);
-
-            for (let i = 1; i <= remainingCount; i++) {
-              if (seqState.aborted) break;
-              seqState.currentStep = `ToO ${pt.label} ${filterName}: ${i}/${remainingCount}`;
-              seqState.progress = { filter: filterName, frame: i, frames: remainingCount };
-              seqLog(`  ${pt.label} ${filterName} ${i}/${remainingCount}: ${duration}s`);
-              await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
-                { duration, gain, save: true, targetName: tooName, filter: filterName }, 30000);
-              await waitExposure(duration);
-              try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
-            }
+            seqState.currentStep = `ToO ${pt.label} ${epochTag} ${filterName}: ${ep}/${remainingCount}`;
+            seqState.progress = { filter: filterName, frame: ep, frames: remainingCount, epoch: epochNum };
+            seqLog(`  ${pt.label} ${epochTag} ${filterName} ${ep}/${remainingCount}: ${duration}s`);
+            await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+              { duration, gain, save: true, targetName: epochName, filter: filterName }, 30000);
+            await waitExposure(duration);
+            try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
           }
         }
       }
@@ -4549,6 +4618,27 @@ app.post("/api/sequence/reset-af", (req, res) => {
   seqState.lastAutofocusTime = null;
   setSetting("lastAutofocusTime", "");
   return res.json({ success: true, message: "Autofocus timer reset — AF will run on next sequence" });
+});
+
+// Returns the temperature-predicted focus position for the current FOCTEMP,
+// alongside the last stored AF result per filter. Useful for debugging the model.
+app.get("/api/autofocus/predict", async (req, res) => {
+  const ninaTarget = seqState.ninaConfig || { host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL };
+  const foctemp = await getFocuserTemp(ninaTarget);
+  const predictions = {};
+  for (const f of ["G", "BP", "RP", "ALL"]) {
+    const reg = AF_TEMP_REGRESSION[f];
+    const lastAf = getLatestAfResult(f === "ALL" ? "__none__" : f);
+    predictions[f] = {
+      slope: reg.slope,
+      intercept: reg.intercept,
+      predicted: foctemp != null ? predictFocuserPos(f, foctemp) : null,
+      lastStoredPos: lastAf?.pos ?? null,
+      lastStoredTs:  lastAf?.ts  ?? null,
+      drift: (foctemp != null && lastAf) ? predictFocuserPos(f, foctemp) - lastAf.pos : null,
+    };
+  }
+  res.json({ success: true, foctemp, predictions });
 });
 
 app.get("/api/autofocus/history", (req, res) => {

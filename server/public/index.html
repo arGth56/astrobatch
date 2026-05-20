@@ -1017,8 +1017,8 @@
               <input id="watchdog-retention" type="number" min="1" step="1" value="10" style="width:72px;" autocomplete="off"
                 title="Minutes of clear sky required before resuming" />
             </label>
-            <label title="Abort sequence if conditions stay bad this long — prevents running into dawn">Max bad (min)
-              <input id="watchdog-max-bad" type="number" min="10" step="5" value="90" style="width:72px;" autocomplete="off" />
+            <label title="Local hour after which a still-bad sequence is ended and mount stays parked until evening">Morning park (h)
+              <input id="watchdog-morning-park" type="number" min="0" max="12" step="1" value="8" style="width:72px;" autocomplete="off" />
             </label>
             <div class="buttons">
               <button id="watchdog-save" type="button">Save Watchdog</button>
@@ -1097,6 +1097,35 @@
               </table>
             </div>
           </div>
+
+          <!-- Focuser temperature model -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Focuser Temperature Model</h3>
+          <p class="hint" style="margin-bottom:10px;">
+            Used for fast autofocus during alerts: <code>pos = slope × (T − 15°C) + ref@15°C</code>.
+            Update <em>ref@15°C</em> after a camera position change (run a manual AF at 15°C and enter the result).
+            Slope rarely needs changing.
+          </p>
+          <div style="display:grid;grid-template-columns:auto repeat(3,1fr) auto;gap:6px 10px;align-items:center;font-size:13px;margin-bottom:8px;">
+            <div></div>
+            <div style="font-weight:600;color:#93c5fd;text-align:center;">G</div>
+            <div style="font-weight:600;color:#93c5fd;text-align:center;">BP</div>
+            <div style="font-weight:600;color:#93c5fd;text-align:center;">RP</div>
+            <div></div>
+            <div style="color:#94a3b8;">Slope (steps/°C)</div>
+            <input id="set-af-slope-G"  type="number" step="0.1" style="width:80px;text-align:center;" title="G filter: focuser steps per °C" />
+            <input id="set-af-slope-BP" type="number" step="0.1" style="width:80px;text-align:center;" title="BP filter: focuser steps per °C" />
+            <input id="set-af-slope-RP" type="number" step="0.1" style="width:80px;text-align:center;" title="RP filter: focuser steps per °C" />
+            <div></div>
+            <div style="color:#94a3b8;">Ref pos @ 15°C</div>
+            <input id="set-af-ref15-G"  type="number" step="1" style="width:80px;text-align:center;" title="G filter: focuser position at 15°C" />
+            <input id="set-af-ref15-BP" type="number" step="1" style="width:80px;text-align:center;" title="BP filter: focuser position at 15°C" />
+            <input id="set-af-ref15-RP" type="number" step="1" style="width:80px;text-align:center;" title="RP filter: focuser position at 15°C" />
+            <div class="buttons">
+              <button id="af-model-save" type="button">Save</button>
+            </div>
+          </div>
+          <div id="af-model-preview" style="font-size:12px;color:#64748b;margin-bottom:4px;"></div>
 
           <!-- Maintenance -->
           <hr style="border-color:#1e293b;margin:18px 0;" />

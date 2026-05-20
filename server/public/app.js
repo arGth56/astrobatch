@@ -1108,7 +1108,8 @@ async function loadWatchdogConfig() {
     document.getElementById("watchdog-sky-temp").value      = cfg.skyTempLimit ?? -4;
     document.getElementById("watchdog-sq").value            = cfg.sqLimit      ?? 16;
     document.getElementById("watchdog-retention").value     = cfg.retentionMin ?? 10;
-    document.getElementById("watchdog-max-bad").value       = cfg.maxBadMin    ?? 90;
+    const mph = document.getElementById("watchdog-morning-park");
+    if (mph) mph.value = cfg.morningParkHour ?? 8;
     updateWatchdogStatusPanel(cfg);
   } catch {}
 }
@@ -1189,7 +1190,7 @@ document.getElementById("watchdog-save")?.addEventListener("click", async () => 
     skyTempLimit: Number(document.getElementById("watchdog-sky-temp").value),
     sqLimit:      Number(document.getElementById("watchdog-sq").value),
     retentionMin: Number(document.getElementById("watchdog-retention").value),
-    maxBadMin:    Number(document.getElementById("watchdog-max-bad").value),
+    morningParkHour: Number(document.getElementById("watchdog-morning-park")?.value ?? 8),
   };
   try {
     const res = await fetch("/api/watchdog", {
@@ -1523,11 +1524,16 @@ async function loadArbiterConfig() {
       "minStars", "maxCloudRecoveryWaitMin",
       "frameCheckEnabled", "frameCheckThreshold",
       "daily_reset_hour",
+      "af_slope_G", "af_slope_BP", "af_slope_RP",
+      "af_ref15_G", "af_ref15_BP", "af_ref15_RP",
     ];
     const results = await Promise.all(keys.map(k =>
       fetch(`/api/settings/${k}`).then(r => r.ok ? r.json() : null).catch(() => null)
     ));
-    const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin, frameCheckEnabled, frameCheckThreshold, dailyResetHour] = results;
+    const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin,
+           frameCheckEnabled, frameCheckThreshold, dailyResetHour,
+           afSlopeG, afSlopeBP, afSlopeRP,
+           afRef15G, afRef15BP, afRef15RP] = results;
     if (minAlt          != null) document.getElementById("set-minalt").value                   = minAlt.value          ?? 20;
     if (zenithLimit     != null) document.getElementById("set-zenith-limit").value             = zenithLimit.value     ?? 70;
     if (meridianGap     != null) document.getElementById("set-meridian-gap").value             = meridianGap.value     ?? 10;
@@ -1536,6 +1542,13 @@ async function loadArbiterConfig() {
     if (frameCheckEnabled != null) document.getElementById("set-frame-check-enable").checked  = frameCheckEnabled.value === "true";
     if (frameCheckThreshold != null) document.getElementById("set-frame-check-threshold").value = frameCheckThreshold.value ?? 5;
     if (dailyResetHour  != null) { const el = document.getElementById("set-daily-reset-hour"); if (el) el.value = dailyResetHour.value ?? 12; }
+    if (afSlopeG  != null) { const el = document.getElementById("set-af-slope-G");  if (el) el.value = afSlopeG.value  ?? 10.83; }
+    if (afSlopeBP != null) { const el = document.getElementById("set-af-slope-BP"); if (el) el.value = afSlopeBP.value ?? 9.73; }
+    if (afSlopeRP != null) { const el = document.getElementById("set-af-slope-RP"); if (el) el.value = afSlopeRP.value ?? 12.08; }
+    if (afRef15G  != null) { const el = document.getElementById("set-af-ref15-G");  if (el) el.value = afRef15G.value  ?? 4195; }
+    if (afRef15BP != null) { const el = document.getElementById("set-af-ref15-BP"); if (el) el.value = afRef15BP.value ?? 4202; }
+    if (afRef15RP != null) { const el = document.getElementById("set-af-ref15-RP"); if (el) el.value = afRef15RP.value ?? 4202; }
+    _updateAfModelPreview();
   } catch { /* non-fatal */ }
 }
 
@@ -1594,6 +1607,44 @@ document.getElementById("daily-reset-hour-save")?.addEventListener("click", asyn
       body: JSON.stringify({ key: "daily_reset_hour", value: val }),
     });
     const btn = document.getElementById("daily-reset-hour-save");
+    btn.textContent = "Saved ✓"; btn.disabled = true;
+    setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 2000);
+  } catch (e) { alert("Save failed: " + e.message); }
+});
+
+// ── Focuser temperature model ─────────────────────────────────────────────────
+function _updateAfModelPreview() {
+  const el = document.getElementById("af-model-preview");
+  if (!el) return;
+  const filters = ["G", "BP", "RP"];
+  const parts = filters.map(f => {
+    const slope = parseFloat(document.getElementById(`set-af-slope-${f}`)?.value);
+    const ref15 = parseFloat(document.getElementById(`set-af-ref15-${f}`)?.value);
+    if (!slope || !ref15) return null;
+    const p10 = Math.round(slope * (10 - 15) + ref15);
+    const p15 = Math.round(ref15);
+    const p20 = Math.round(slope * (20 - 15) + ref15);
+    return `${f}: ${p10}@10° / ${p15}@15° / ${p20}@20°`;
+  }).filter(Boolean);
+  el.textContent = parts.length ? "Preview — " + parts.join("  ·  ") : "";
+}
+["G","BP","RP"].forEach(f => {
+  document.getElementById(`set-af-slope-${f}`)?.addEventListener("input", _updateAfModelPreview);
+  document.getElementById(`set-af-ref15-${f}`)?.addEventListener("input", _updateAfModelPreview);
+});
+
+document.getElementById("af-model-save")?.addEventListener("click", async () => {
+  const settings = {};
+  ["G","BP","RP"].forEach(f => {
+    settings[`af_slope_${f}`] = document.getElementById(`set-af-slope-${f}`)?.value;
+    settings[`af_ref15_${f}`] = document.getElementById(`set-af-ref15-${f}`)?.value;
+  });
+  try {
+    await Promise.all(Object.entries(settings).map(([key, value]) =>
+      fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value }) })
+    ));
+    const btn = document.getElementById("af-model-save");
     btn.textContent = "Saved ✓"; btn.disabled = true;
     setTimeout(() => { btn.textContent = "Save"; btn.disabled = false; }, 2000);
   } catch (e) { alert("Save failed: " + e.message); }
