@@ -1123,7 +1123,17 @@ async function runWatchdogCheck() {
         // Retention passed — unpark if we parked it
         watchdog.state = "clear";
         if (watchdog.parked) {
-          console.log("[watchdog] Retention passed — unparking mount...");
+          console.log("[watchdog] Retention passed — checking roof before unparking...");
+          try {
+            const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
+            const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+            if (ok && roofStatus && !roofStatus.includes("open")) {
+              console.warn(`[watchdog] Roof is closed (${ocsClean(fields.roof_sta)}) — skipping unpark, staying parked`);
+              watchdog.state = "bad"; // don't resume yet
+              return;
+            }
+          } catch { /* OCS unreachable — proceed */ }
+          console.log("[watchdog] Roof open — unparking mount...");
           try {
             const cfg = seqState.ninaConfig;
             if (cfg) {
@@ -2036,8 +2046,34 @@ async function stepCoolCamera(target, targetTempC = -5) {
   seqLog(`Camera cooled to ${targetTempC}°C ✓`);
 }
 
+/**
+ * Verify the OCS roof is open before any mount movement.
+ * Throws if roof is confirmed closed. Logs a warning if OCS is unreachable.
+ * @param {string} context  – short label shown in the error/log (e.g. "unpark", "slew")
+ */
+async function assertRoofOpen(context = "mount move") {
+  try {
+    const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
+    if (!ok) {
+      seqLog(`⚠ Roof check (${context}): OCS unreachable — proceeding with caution`, "warn");
+      return; // can't confirm, don't block
+    }
+    const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+    if (roofStatus && !roofStatus.includes("open")) {
+      const err = new Error(`Roof is closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting ${context} for safety`);
+      err.code = "__ROOF_CLOSED__";
+      seqLog(`✗ ${err.message}`, "error");
+      throw err;
+    }
+  } catch (e) {
+    if (e.code === "__ROOF_CLOSED__") throw e;
+    seqLog(`⚠ Roof check (${context}): OCS error (${e.message}) — proceeding with caution`, "warn");
+  }
+}
+
 async function stepUnparkMount(target) {
   seqState.currentStep = "Preparing mount...";
+  await assertRoofOpen("unpark");
   const { equipmentInfo } = await getEquipmentInfo(target);
   const mount = equipmentInfo?.Mount;
 
@@ -2433,6 +2469,7 @@ async function stepSlewWithCloudRetry(
 }
 
 async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } = {}) {
+  await assertRoofOpen("slew");
   const raHours = raDeg / 15;
   seqState.currentStep = `Slewing${center ? " + centering" : ""} to ${name}...`;
   seqLog(`Slewing${center ? " + centering" : ""} to ${name} (RA ${raHours.toFixed(4)}h  Dec ${decDeg >= 0 ? "+" : ""}${decDeg.toFixed(4)}°)...`);
@@ -3466,6 +3503,7 @@ async function runSequence(ninaConfig, seqConfig) {
    */
   async function safeHome() {
     seqState.currentStep = "Homing mount...";
+    await assertRoofOpen("home");
     try {
       const { equipmentInfo: preInfo } = await getEquipmentInfo(ninaConfig);
       const mountPre = preInfo?.Mount;
@@ -3522,7 +3560,13 @@ async function runSequence(ninaConfig, seqConfig) {
     // ── Pre-flight: ensure NINA is not already capturing ─────────────────────
     await assertCameraIdle(ninaConfig, "sequence start");
 
-    // ── Step 0: Check roof, unpark, go home ──────────────────────────────────
+    // ── Step 0a: Wait for watchdog to clear before moving anything ────────────
+    if (watchdog.enabled && (watchdog.state === "bad" || watchdog.state === "recovering")) {
+      seqLog("⛅ Watchdog: conditions bad at sequence start — waiting before moving mount", "warn");
+      await waitForWatchdogClear();
+    }
+
+    // ── Step 0b: Check roof, unpark, go home ─────────────────────────────────
     try {
       // Verify OCS roof is open before moving anything
       const { ok: ocsOk, fields } = await ocsStatus(DEFAULT_OCS_HOST).catch(() => ({ ok: false, fields: {} }));
