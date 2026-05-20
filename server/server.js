@@ -2591,14 +2591,15 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
       seqLog("  Plain slew complete (no centering)");
     }
 
-    // Poll until the mount has truly converged (slew→stop→plate-solve→correction-slew→stop).
-    // NINA's SlewAndCenter iterates: goto → image (5-30s) → solve → correction-slew → repeat.
-    // The mount is STATIONARY during the image+solve phase, so SETTLE_STABLE must be longer
-    // than a typical solve time (20-30s) to avoid declaring "done" mid-solve.
+    // Poll until NINA's full SlewAndCenter cycle completes.
+    // NINA iterates: goto → capture plate-solve image (IsExposing=true) →
+    // solve → correction-slew (Slewing=true) → repeat until within tolerance.
+    // Centering is done only when BOTH mount.Slewing=false AND camera.IsExposing=false
+    // have been stable for SETTLE_STABLE ms — this outlasts solve computation time.
     seqState.currentStep = `Centering ${name} — waiting for convergence...`;
-    const SETTLE_TIMEOUT  = 10 * 60 * 1000;  // hard cap
+    const SETTLE_TIMEOUT  = 10 * 60 * 1000;
     const POLL_INTERVAL   = 2500;
-    const SETTLE_STABLE   = 45000;  // 45s: outlasts any single plate-solve+decode cycle
+    const SETTLE_STABLE   = 10000;  // 10s both-idle → centering done
     const deadline  = Date.now() + SETTLE_TIMEOUT;
     let stableMs    = 0;
     let lastErrArcsec = null;
@@ -2618,17 +2619,19 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
         );
         const errRounded = Math.round(errArcsec);
         if (lastErrArcsec === null || Math.abs(errRounded - lastErrArcsec) > 10) {
-          seqLog(`  Centering: offset ${errRounded}"  (Slewing=${m.Slewing})`);
+          seqLog(`  Centering: offset ${errRounded}"  (Slewing=${m.Slewing}, Exposing=${ei?.Camera?.IsExposing ?? "?"})`);
           lastErrArcsec = errRounded;
           seqState.currentStep = `Centering ${name} — offset ${errRounded}"`;
         }
       }
 
-      if (m.Slewing === true) {
-        stableMs = 0;  // reset — still moving
+      const mountBusy  = m.Slewing === true;
+      const cameraBusy = ei?.Camera?.IsExposing === true;
+      if (mountBusy || cameraBusy) {
+        stableMs = 0;  // still in slew or plate-solve image capture
       } else {
         stableMs += POLL_INTERVAL;
-        if (stableMs >= SETTLE_STABLE) break;  // sustained stillness → done
+        if (stableMs >= SETTLE_STABLE) break;  // both idle for 10s → done
       }
     }
 
@@ -2653,10 +2656,12 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
         if (m2.RightAscension != null && m2.Declination != null) {
           retryErr = _angularSepArcsec(m2.RightAscension * 15, m2.Declination, raDeg, decDeg);
           const rr = Math.round(retryErr);
-          seqLog(`  Retry centering: offset ${rr}"  (Slewing=${m2.Slewing})`);
+          seqLog(`  Retry centering: offset ${rr}"  (Slewing=${m2.Slewing}, Exposing=${ei2?.Camera?.IsExposing ?? "?"})`);
           seqState.currentStep = `Retry centering ${name} — offset ${rr}"`;
         }
-        if (m2.Slewing === true) { retryStable = 0; } else {
+        const mountBusy2  = m2.Slewing === true;
+        const cameraBusy2 = ei2?.Camera?.IsExposing === true;
+        if (mountBusy2 || cameraBusy2) { retryStable = 0; } else {
           retryStable += POLL_INTERVAL;
           if (retryStable >= SETTLE_STABLE) break;
         }
