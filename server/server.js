@@ -2578,13 +2578,18 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
 
   if (center) {
     // Fire the SlewAndCenter command. NINA will: goto → capture → plate solve →
-    // sync (writes correction into mount model) → re-slew → repeat until within
-    // its own tolerance. We don't trust the HTTP response (NINA often returns
-    // Success=false on intermediate slews); instead we poll mount state.
+    // sync → re-slew → repeat until within its own tolerance.
+    let centeringOk = false;
     try {
-      await callNinaLong(target, "/v2/api/equipment/mount/slew", {
+      const centerResult = await callNinaLong(target, "/v2/api/equipment/mount/slew", {
         ra: raDeg, dec: decDeg, waitForResult: true, center: true, name,
       }, 10 * 60 * 1000);
+      centeringOk = isNinaApiSuccess(centerResult);
+      if (!centeringOk) {
+        const errMsg = centerResult.body?.Error || centerResult.body?.Response || "no details";
+        seqLog(`  ⚠ Centering: NINA reports failure — ${errMsg} (clouds? no stars?)`, "warn");
+        seqLog(`    Mount will be at blind-slew position — watchdog will catch bad images`, "warn");
+      }
     } catch (fetchErr) {
       seqLog(`  Centering request error: ${fetchErr.message} — falling back to plain slew`, "warn");
       await plainSlew();
@@ -2637,7 +2642,8 @@ async function stepSlewToTarget(target, raDeg, decDeg, name, { center = false } 
     const { equipmentInfo: eiFinal } = await getEquipmentInfo(target).catch(() => ({ equipmentInfo: null }));
     const mFinal = eiFinal?.Mount;
     const finalPos = mFinal ? `${mFinal.RightAscensionString} / ${mFinal.DeclinationString}` : "unknown";
-    seqLog(`Slew + centering complete ✓  mount at ${finalPos} (JNOW)`);
+    const statusTxt = centeringOk ? "✓" : "⚠ (plate solve failed)";
+    seqLog(`Slew + centering complete ${statusTxt}  mount at ${finalPos} (JNOW)`);
 
   } else {
     await plainSlew();
