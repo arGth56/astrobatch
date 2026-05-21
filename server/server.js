@@ -4463,9 +4463,12 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
 
     // ── Phase 1: rapid filter-cycle imaging (time-critical) ─────────────────
     const validCycleFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
-    const cycleLen = validCycleFilters.length || 1;
-    const totalEpochs = Math.ceil(rapidCount / cycleLen);
-    seqLog(`  Phase 1: rapid cycling [${validCycleFilters.join(",")}] — ${rapidCount} × ${rapidExposure}s → ${totalEpochs} epoch(s) (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
+    const cycleLen    = validCycleFilters.length || 1;
+    // rapid_count = number of complete filter cycles (e.g. SVOM=1 → G+RP+BP once, Swift=15 → 15×G+RP+BP)
+    const rapidCycles = Math.max(1, strat.rapid_count || 1);
+    const rapidCount  = rapidCycles * cycleLen;   // total frames in Phase 1
+    const totalEpochs = rapidCycles;              // one epoch per complete filter cycle
+    seqLog(`  Phase 1: ${rapidCycles} × [${validCycleFilters.join(",")}] = ${rapidCount} frames → ${totalEpochs} epoch(s) (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
 
     for (const pt of grid) {
       if (seqState.aborted) break;
@@ -4510,8 +4513,7 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
     // ── Phase 2: multi-filter deep follow-up (remaining cycles, with optional AF) ─
     const tooFilters = filterCycle.filter(f => findFilterByName(availFilters, f));
     // Fix 6: remaining cycles = total strategy cycles minus the 1 rapid cycle already done
-    const totalStratCycles = Math.max(1, strat.rapid_count || 1);
-    const remainingCount = Math.max(0, totalStratCycles - 1);
+    const remainingCount = Math.max(0, rapidCycles - 1);
     if (remainingCount > 0 && tooFilters.length > 0 && !seqState.aborted) {
       // Phase 2 epoch offset: continue numbering after Phase 1
       const p2EpochOffset = totalEpochs;

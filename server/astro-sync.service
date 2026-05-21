@@ -1,0 +1,15 @@
+[Unit]
+Description=Astro FITS sync — astropc USB disk → NAS
+After=network-online.target mnt-astropc.mount mnt-nas-input.mount
+Wants=network-online.target mnt-astropc.mount mnt-nas-input.mount
+
+[Service]
+Type=simple
+User=pyl
+Group=pyl
+ExecStart=/bin/bash /home/pyl/Documents/astrobatch/server/astro-sync.sh
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
