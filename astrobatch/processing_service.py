@@ -1804,8 +1804,12 @@ def _recover_queued_jobs():
         log.error("Job recovery failed: %s", exc)
 
 
-# Run recovery after a short delay so Flask has fully started
-threading.Timer(2.0, _recover_queued_jobs).start()
+# Run recovery after a short delay so Flask has fully started.
+# Mark as daemon so the timer is killed automatically if Flask fails to bind
+# (prevents a failed restart attempt from spuriously wiping in-progress results).
+_recovery_timer = threading.Timer(2.0, _recover_queued_jobs)
+_recovery_timer.daemon = True
+_recovery_timer.start()
 
 # ── Flask routes ───────────────────────────────────────────────────────────────
 
