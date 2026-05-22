@@ -3,7 +3,7 @@
 # Runs as a daemon: polls every 30s, rsyncs any new/updated files.
 
 SRC="/mnt/astropc/"
-DST="/mnt/nas/input/pyl/astro/"
+DST="/mnt/nas/input/pyl/astro/input/"
 LOG="/home/pyl/Documents/astrobatch/server/logs/astro-sync.log"
 LOCKFILE="/tmp/astro-sync.lock"
 

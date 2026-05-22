@@ -1802,6 +1802,28 @@ class PlateSolver:
 
         self.temp_dir = '/tmp/plate_solving'
         os.makedirs(self.temp_dir, exist_ok=True)
+
+        # User-writable index directory (populated at install time)
+        self.index_dir = os.path.expanduser('~/astrometry-index')
+        if os.path.isdir(self.index_dir) and any(
+            f.startswith('index-') for f in os.listdir(self.index_dir)
+        ):
+            self._extra_index_args = ['--backend-config', self._write_user_cfg()]
+        else:
+            self._extra_index_args = []
+
+    def _write_user_cfg(self):
+        """Write a temporary astrometry.net backend config that includes the user index dir."""
+        import tempfile
+        cfg = (
+            f"add_path {self.index_dir}\nautoindex\n"
+            f"add_path /usr/share/astrometry\nautoindex\n"
+        )
+        path = os.path.join(self.temp_dir, 'astrometry.cfg')
+        os.makedirs(self.temp_dir, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(cfg)
+        return path
     
     def solve_field(self, fits_path, initial_guess=None):
         """Solve astrometry for a single field using solve-field and extract sources"""
@@ -1830,7 +1852,7 @@ class PlateSolver:
             '--scale-high', '1.3',
             '--downsample', '2',    # Downsample for faster solving
             '--cpulimit', '60',     # 60 second CPU limit
-        ]
+        ] + self._extra_index_args
         
         # Add initial guess if available
         if initial_guess and 'ra' in initial_guess and 'dec' in initial_guess:

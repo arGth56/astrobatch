@@ -683,7 +683,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
             "register pp_i -interp=cu",
-            f"stack r_pp_i rej 3 3 -norm=addscale -framing=min{stack_filters}",
+            f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
             "load r_pp_i_stacked",
             "save res",
         ]
@@ -712,7 +712,7 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
                     retry_lines = [
                         "requires 1.2.0", f'cd "{folder}"',
                         f"register pp_i -interp=cu -ref={ref_n}",
-                        f"stack r_pp_i rej 3 3 -norm=addscale -framing=min{stack_filters}",
+                        f"stack r_pp_i rej 3 3 -norm=addscale{stack_filters}",
                         "load r_pp_i_stacked",
                         "save res",
                     ]
@@ -832,7 +832,14 @@ def plate_solve(res_fit: Path, jlog: JobLogger) -> bool:
         from astropy.io import fits as _fits
 
         solver = PlateSolver()
-        result = solver.solve_field(str(res_fit))
+
+        # Pass telescope pointing as initial guess if available in FITS header
+        ra_hint, dec_hint = _read_fits_radec(res_fit)
+        initial_guess = {"ra": ra_hint, "dec": dec_hint} if ra_hint is not None else None
+        if initial_guess:
+            jlog.info(f"  Plate solve hint: RA={ra_hint:.3f} Dec={dec_hint:.3f}")
+
+        result = solver.solve_field(str(res_fit), initial_guess=initial_guess)
 
         # solve_field returns (WCS, source_data) or (None, None) on failure
         solved_wcs = result[0] if isinstance(result, tuple) else result

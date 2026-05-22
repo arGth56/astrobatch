@@ -10,6 +10,8 @@ const nodemailer = require("nodemailer");
 const alerts = require("./alerts");
 
 const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
+const TOO_MOSAIC_THRESHOLD_DEG = parseFloat(process.env.TOO_MOSAIC_THRESHOLD_DEG || "0.5");
+const TOO_MOSAIC_MAX_SIDE = Math.max(1, parseInt(process.env.TOO_MOSAIC_MAX_SIDE || "8", 10));
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
 const PYTHON_BIN_CANDIDATE = process.env.PYTHON_BIN || path.join(__dirname, "..", ".venv", "bin", "python");
@@ -609,6 +611,8 @@ const SETTING_DEFAULTS = {
   frameCheckEnabled:    "false",
   frameCheckThreshold:  "5",
   morning_park_hour:    "8",
+  daily_reset_hour:     "12",
+  alert_notify_email:   "true",
   // Focuser temperature model: pos ≈ slope × (FOCTEMP − 15) + ref15
   af_slope_G:           "10.83",
   af_slope_BP:          "9.73",
@@ -2324,6 +2328,14 @@ async function checkMountSafetyForFrame(target, { minAlt = 20, meridianGap = 10,
   if (watchdog.enabled && (watchdog.state === "bad" || watchdog.state === "recovering")) {
     seqLog("  Safety check: watchdog reports bad sky — holding frame until sky clears", "warn");
     while (watchdog.state === "bad" || watchdog.state === "recovering") {
+      checkAbort();
+      const morningParkHour = parseInt(getSetting("morning_park_hour") ?? "8", 10);
+      const localHour = new Date().getHours();
+      if (localHour >= morningParkHour && localHour < 14) {
+        seqLog(`🌅 Morning cutoff (${morningParkHour}:00 local) — ending sequence, mount already parked`, "warn");
+        seqState.aborted = true;
+        checkAbort();
+      }
       await new Promise(r => setTimeout(r, 60_000));
     }
     seqLog("  Safety check: watchdog cleared — proceeding with frame");
@@ -4352,31 +4364,68 @@ async function runAlertPrep(ninaConfig, seqConfig) {
 // sequence. Implements a mosaic strategy based on the error box vs FOV.
 //
 // Mosaic rules:
-//   err_deg <= FOV/2      → single pointing (target inside one frame)
-//   err_deg <= FOV * 1.5  → 2×2 spiral (4 pointings, each offset by FOV/2)
-//   err_deg > FOV * 1.5   → 4 pointings centered on the alert, loop them
+//   err_deg <= TOO_MOSAIC_THRESHOLD_DEG (default 0.5°) → single center pointing
+//   err_deg >  threshold → n×n grid covering ~2×err diameter, tile spacing = FOV
+//                          tiles visited in center-out spiral order; one full
+//                          filter cycle per tile per epoch (epochs interleaved)
 //
-function computeMosaicGrid(raDeg, decDeg, errDeg, fovDeg) {
-  const halfFov = fovDeg / 2;
-  const cosDec = Math.cos(decDeg * Math.PI / 180) || 1;
+/** Center-out spiral visitation order for an n×n tile grid */
+function orderTilesSpiral(tiles, side) {
+  const cr = (side - 1) / 2;
+  const cc = (side - 1) / 2;
+  return [...tiles].sort((a, b) => {
+    const drA = a.row - cr;
+    const dcA = a.col - cc;
+    const drB = b.row - cr;
+    const dcB = b.col - cc;
+    const da = drA * drA + dcA * dcA;
+    const db = drB * drB + dcB * dcB;
+    if (da !== db) return da - db;
+    return Math.atan2(drA, dcA) - Math.atan2(drB, dcB);
+  });
+}
 
-  if (!Number.isFinite(errDeg) || errDeg <= halfFov) {
-    return [{ ra: raDeg, dec: decDeg, label: "center" }];
+function computeMosaicGrid(raDeg, decDeg, errDeg, fovDeg) {
+  const threshold = TOO_MOSAIC_THRESHOLD_DEG;
+
+  if (!Number.isFinite(errDeg) || errDeg <= threshold) {
+    return {
+      grid: [{ ra: raDeg, dec: decDeg, label: "center" }],
+      mode: "single",
+      side: 1,
+      requestedSide: 1,
+      capped: false,
+    };
   }
 
-  // Spiral: NE, NW, SW, SE — each offset by half a FOV from center
-  const offsets = [
-    { dra: +halfFov, ddec: +halfFov, label: "NE" },
-    { dra: -halfFov, ddec: +halfFov, label: "NW" },
-    { dra: -halfFov, ddec: -halfFov, label: "SW" },
-    { dra: +halfFov, ddec: -halfFov, label: "SE" },
-  ];
+  const requestedSide = Math.max(1, Math.ceil((2 * errDeg) / fovDeg));
+  const side = Math.min(requestedSide, TOO_MOSAIC_MAX_SIDE);
+  const capped = requestedSide > side;
+  const cosDec = Math.cos(decDeg * Math.PI / 180) || 1;
+  const step = fovDeg;
 
-  return offsets.map(o => ({
-    ra:  raDeg  + o.dra / cosDec,
-    dec: decDeg + o.ddec,
-    label: o.label,
-  }));
+  const tiles = [];
+  for (let row = 0; row < side; row++) {
+    for (let col = 0; col < side; col++) {
+      const dra = ((col - (side - 1) / 2) * step) / cosDec;
+      const ddec = (row - (side - 1) / 2) * step;
+      tiles.push({
+        ra: raDeg + dra,
+        dec: decDeg + ddec,
+        row,
+        col,
+        label: `T${row + 1}-${col + 1}`,
+      });
+    }
+  }
+
+  return {
+    grid: orderTilesSpiral(tiles, side),
+    mode: "spiral",
+    side,
+    requestedSide,
+    capped,
+  };
 }
 
 async function runTooSequence(ninaConfig, alertData, seqConfig) {
@@ -4400,9 +4449,21 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
   seqLog(`  Strategy: mode=${strat.mode} exp=${rapidExposure}s gain=${rapidGain} filters=[${filterCycle}] rapid=${rapidCount} AF=${doAf} guide=${doGuiding} center=${doCenter}`);
 
   try {
-    const grid = computeMosaicGrid(ra, dec, err_deg || 0, TOO_FOV_DEG);
-    const needsLoop = grid.length > 1 && (err_deg || 0) > TOO_FOV_DEG * 1.5;
-    seqLog(`  Mosaic: ${grid.length} pointing(s)${needsLoop ? " (looped)" : " (spiral)"} — ${grid.map(g => g.label).join(", ")}`);
+    const mosaic = computeMosaicGrid(ra, dec, err_deg || 0, TOO_FOV_DEG);
+    const grid = mosaic.grid;
+    const useSpiral = mosaic.mode === "spiral";
+    const coverDeg = (mosaic.side * TOO_FOV_DEG).toFixed(2);
+    let mosaicMsg = `  Mosaic: ${grid.length} tile(s)`;
+    if (useSpiral) {
+      mosaicMsg += ` ${mosaic.side}×${mosaic.side} spiral (~${coverDeg}°×${coverDeg}° for err=${(err_deg || 0).toFixed(2)}°)`;
+      if (mosaic.capped) {
+        mosaicMsg += ` [capped from ${mosaic.requestedSide}×${mosaic.requestedSide}]`;
+      }
+      mosaicMsg += ` — ${grid.map(g => g.label).join(" → ")}`;
+    } else {
+      mosaicMsg += " — center";
+    }
+    seqLog(mosaicMsg);
 
     const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
     const availFilters = equipmentInfo?.FilterWheel?.AvailableFilters || [];
@@ -4470,43 +4531,68 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
     const totalEpochs = rapidCycles;              // one epoch per complete filter cycle
     seqLog(`  Phase 1: ${rapidCycles} × [${validCycleFilters.join(",")}] = ${rapidCount} frames → ${totalEpochs} epoch(s) (AF=${doAf}, guide=${doGuiding}, center=${doCenter})`);
 
-    for (const pt of grid) {
-      if (seqState.aborted) break;
-      seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
-      await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
-      if (!doCenter) await new Promise(r => setTimeout(r, 2000));
+    const captureRapidFrame = async (pt, epochNum, epochTag, cycleFilter, frameIdx) => {
+      const epochName = `${tooName}-${pt.label}-${epochTag}`;
+      const cFilter = findFilterByName(availFilters, cycleFilter);
+      if (cFilter) await changeFilterVerified(ninaConfig, cFilter);
+      seqState.currentStep = `ToO ${pt.label} ${epochTag} ${cycleFilter}: ${frameIdx}/${rapidCount} [RAPID]`;
+      seqState.progress = { filter: cycleFilter, frame: frameIdx, frames: rapidCount, epoch: epochNum, totalEpochs };
+      seqLog(`  ${pt.label} ${epochTag} ${cycleFilter} ${frameIdx}/${rapidCount}: ${rapidExposure}s`);
+      await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+        { duration: rapidExposure, gain: rapidGain, save: true, targetName: epochName, filter: cycleFilter }, 30000);
+      await waitExposure(rapidExposure);
+      try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+    };
 
-      // Fix 2: start guiding after slew if strategy requires it
-      if (doGuiding) {
-        seqLog(`  Starting PHD2 guiding for ToO...`);
-        const gOk = await stepStartGuiding(ninaConfig);
-        if (!gOk) seqLog("  ⚠ Guiding did not settle for ToO — proceeding without guiding", "warn");
-      }
-
-      let currentEpoch = 0;
-      for (let i = 1; i <= rapidCount; i++) {
+    if (useSpiral) {
+      // Spiral: one filter cycle per tile per epoch (epochs interleaved across the mosaic)
+      for (let ep = 1; ep <= rapidCycles; ep++) {
         if (seqState.aborted) break;
-        const cycleFilter = validCycleFilters[(i - 1) % cycleLen] || fastFilter;
-        const epochNum    = Math.ceil(i / cycleLen);
-        const epochTag    = `E${String(epochNum).padStart(2, "0")}`;
-        // Each complete filter cycle is a separate NINA target → separate directory → pipeline processes each epoch independently
-        const epochName   = `${tooName}-${pt.label}-${epochTag}`;
-
-        if (epochNum !== currentEpoch) {
-          seqLog(`  ── Epoch ${epochTag} (frames ${(epochNum - 1) * cycleLen + 1}–${Math.min(epochNum * cycleLen, rapidCount)}) ──`);
-          currentEpoch = epochNum;
+        const epochTag = `E${String(ep).padStart(2, "0")}`;
+        seqLog(`  ── Epoch ${epochTag} — spiral ${grid.length} tiles × [${validCycleFilters.join(",")}] ──`);
+        for (let ti = 0; ti < grid.length; ti++) {
+          const pt = grid[ti];
+          if (seqState.aborted) break;
+          seqLog(`  → Slewing to ${tooName} [${pt.label}] (${ti + 1}/${grid.length})`);
+          await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
+          if (!doCenter) await new Promise(r => setTimeout(r, 2000));
+          if (doGuiding) {
+            seqLog(`  Starting PHD2 guiding for ToO...`);
+            const gOk = await stepStartGuiding(ninaConfig);
+            if (!gOk) seqLog("  ⚠ Guiding did not settle for ToO — proceeding without guiding", "warn");
+          }
+          for (let fi = 0; fi < cycleLen; fi++) {
+            if (seqState.aborted) break;
+            const cycleFilter = validCycleFilters[fi] || fastFilter;
+            const frameIdx = (ep - 1) * grid.length * cycleLen + ti * cycleLen + fi + 1;
+            await captureRapidFrame(pt, ep, epochTag, cycleFilter, frameIdx);
+          }
         }
-
-        const cFilter = findFilterByName(availFilters, cycleFilter);
-        if (cFilter) await changeFilterVerified(ninaConfig, cFilter);
-
-        seqState.currentStep = `ToO ${pt.label} ${epochTag} ${cycleFilter}: ${i}/${rapidCount} [RAPID]`;
-        seqState.progress = { filter: cycleFilter, frame: i, frames: rapidCount, epoch: epochNum, totalEpochs };
-        seqLog(`  ${pt.label} ${epochTag} ${cycleFilter} ${i}/${rapidCount}: ${rapidExposure}s`);
-        await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
-          { duration: rapidExposure, gain: rapidGain, save: true, targetName: epochName, filter: cycleFilter }, 30000);
-        await waitExposure(rapidExposure);
-        try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+      }
+    } else {
+      // Single pointing: all epochs at center before moving on
+      for (const pt of grid) {
+        if (seqState.aborted) break;
+        seqLog(`  → Slewing to ${tooName} [${pt.label}]`);
+        await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: doCenter });
+        if (!doCenter) await new Promise(r => setTimeout(r, 2000));
+        if (doGuiding) {
+          seqLog(`  Starting PHD2 guiding for ToO...`);
+          const gOk = await stepStartGuiding(ninaConfig);
+          if (!gOk) seqLog("  ⚠ Guiding did not settle for ToO — proceeding without guiding", "warn");
+        }
+        let currentEpoch = 0;
+        for (let i = 1; i <= rapidCount; i++) {
+          if (seqState.aborted) break;
+          const cycleFilter = validCycleFilters[(i - 1) % cycleLen] || fastFilter;
+          const epochNum = Math.ceil(i / cycleLen);
+          const epochTag = `E${String(epochNum).padStart(2, "0")}`;
+          if (epochNum !== currentEpoch) {
+            seqLog(`  ── Epoch ${epochTag} (frames ${(epochNum - 1) * cycleLen + 1}–${Math.min(epochNum * cycleLen, rapidCount)}) ──`);
+            currentEpoch = epochNum;
+          }
+          await captureRapidFrame(pt, epochNum, epochTag, cycleFilter, i);
+        }
       }
     }
 
@@ -4519,46 +4605,58 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
       const p2EpochOffset = totalEpochs;
       seqLog(`  Phase 2: multi-filter follow-up — ${remainingCount} more epoch(s) × [${tooFilters.join(", ")}] (epochs E${String(p2EpochOffset + 1).padStart(2,"0")}+)`);
 
-      for (const pt of grid) {
-        if (seqState.aborted) break;
-        seqLog(`  → Slewing to ${tooName} [${pt.label}] (Phase 2)`);
+      const runPhase2AtTile = async (pt, ep, epochNum, epochTag, epochName, ti, tileCount) => {
+        seqLog(`  → Slewing to ${tooName} [${pt.label}] (Phase 2${tileCount ? ` ${ti + 1}/${tileCount}` : ""})`);
         await stepSlewToTarget(ninaConfig, pt.ra, pt.dec, `${tooName}-${pt.label}`, { center: false });
         await new Promise(r => setTimeout(r, 2000));
-
-        // Start guiding for Phase 2 if required
         if (doGuiding) {
           const gOk2 = await stepStartGuiding(ninaConfig);
           if (!gOk2) seqLog("  ⚠ Guiding did not settle (Phase 2) — proceeding", "warn");
         }
+        seqLog(`  ── Epoch ${epochTag} (Phase 2, pass ${ep}/${remainingCount}) ──`);
+        for (const filterName of tooFilters) {
+          if (seqState.aborted) break;
+          const filter = findFilterByName(availFilters, filterName);
+          if (!filter) continue;
+          if (ep === 1 && doAf) {
+            const fullAfRan = await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
+            if (fullAfRan && doGuiding) {
+              seqLog(`  AF [${filterName}] complete — restarting guiding (Phase 2)`);
+              await stepStartGuiding(ninaConfig);
+            }
+          }
+          await changeFilterVerified(ninaConfig, filter);
+          seqState.currentStep = `ToO ${pt.label} ${epochTag} ${filterName}: ${ep}/${remainingCount}`;
+          seqState.progress = { filter: filterName, frame: ep, frames: remainingCount, epoch: epochNum };
+          seqLog(`  ${pt.label} ${epochTag} ${filterName} ${ep}/${remainingCount}: ${duration}s`);
+          await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
+            { duration, gain, save: true, targetName: epochName, filter: filterName }, 30000);
+          await waitExposure(duration);
+          try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+        }
+      };
 
-        // Outer loop: epochs (one complete filter pass per epoch)
+      if (useSpiral) {
         for (let ep = 1; ep <= remainingCount; ep++) {
           if (seqState.aborted) break;
-          const epochNum  = p2EpochOffset + ep;
-          const epochTag  = `E${String(epochNum).padStart(2, "0")}`;
-          const epochName = `${tooName}-${pt.label}-${epochTag}`;
-          seqLog(`  ── Epoch ${epochTag} (Phase 2, pass ${ep}/${remainingCount}) ──`);
-
-          for (const filterName of tooFilters) {
+          const epochNum = p2EpochOffset + ep;
+          const epochTag = `E${String(epochNum).padStart(2, "0")}`;
+          for (let ti = 0; ti < grid.length; ti++) {
             if (seqState.aborted) break;
-            const filter = findFilterByName(availFilters, filterName);
-            if (!filter) continue;
-            // Fix 3: only run AF in Phase 2 if doAf is true
-            if (ep === 1 && doAf) {
-              const fullAfRan = await stepAutofocusForFilter(ninaConfig, filterName, availFilters);
-              if (fullAfRan && doGuiding) {
-                seqLog(`  AF [${filterName}] complete — restarting guiding (Phase 2)`);
-                await stepStartGuiding(ninaConfig);
-              }
-            }
-            await changeFilterVerified(ninaConfig, filter);
-            seqState.currentStep = `ToO ${pt.label} ${epochTag} ${filterName}: ${ep}/${remainingCount}`;
-            seqState.progress = { filter: filterName, frame: ep, frames: remainingCount, epoch: epochNum };
-            seqLog(`  ${pt.label} ${epochTag} ${filterName} ${ep}/${remainingCount}: ${duration}s`);
-            await callNinaLong(ninaConfig, "/v2/api/equipment/camera/capture",
-              { duration, gain, save: true, targetName: epochName, filter: filterName }, 30000);
-            await waitExposure(duration);
-            try { await waitForCameraIdle(ninaConfig, 120000); } catch { await new Promise(r => setTimeout(r, 20000)); }
+            const pt = grid[ti];
+            const epochName = `${tooName}-${pt.label}-${epochTag}`;
+            await runPhase2AtTile(pt, ep, epochNum, epochTag, epochName, ti, grid.length);
+          }
+        }
+      } else {
+        for (const pt of grid) {
+          if (seqState.aborted) break;
+          for (let ep = 1; ep <= remainingCount; ep++) {
+            if (seqState.aborted) break;
+            const epochNum = p2EpochOffset + ep;
+            const epochTag = `E${String(epochNum).padStart(2, "0")}`;
+            const epochName = `${tooName}-${pt.label}-${epochTag}`;
+            await runPhase2AtTile(pt, ep, epochNum, epochTag, epochName, null, null);
           }
         }
       }
@@ -6084,16 +6182,8 @@ app.delete("/api/pipeline/jobs/:id", async (req, res) => {
     await fetch(`${PROC_URL}/cancel/${jobId}`, { method: "POST", signal: AbortSignal.timeout(5000) });
   } catch { /* non-fatal — maybe already finished or service unreachable */ }
 
-  // Mark incomplete results as cancelled
-  db.prepare(
-    `UPDATE pipeline_results SET status='error', error='Cancelled by user', updated_at=datetime('now')
-     WHERE job_id = ? AND status NOT IN ('done', 'error')`
-  ).run(jobId);
-
-  // Mark the job itself
-  db.prepare(
-    "UPDATE pipeline_jobs SET status='error', error='Cancelled by user', updated_at=datetime('now') WHERE id = ?"
-  ).run(jobId);
+  // Delete the job (pipeline_results cascade-deleted via FK ON DELETE CASCADE)
+  db.prepare("DELETE FROM pipeline_jobs WHERE id = ?").run(jobId);
 
   res.json({ success: true });
 });
