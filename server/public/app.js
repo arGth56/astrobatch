@@ -1596,6 +1596,7 @@ async function loadArbiterConfig() {
       "minStars", "maxCloudRecoveryWaitMin",
       "frameCheckEnabled", "frameCheckThreshold",
       "daily_reset_hour",
+      "telescope_fov_deg",
       "af_slope_G", "af_slope_BP", "af_slope_RP",
       "af_ref15_G", "af_ref15_BP", "af_ref15_RP",
     ];
@@ -1604,6 +1605,7 @@ async function loadArbiterConfig() {
     ));
     const [minAlt, zenithLimit, meridianGap, minStars, maxCloudRecoveryWaitMin,
            frameCheckEnabled, frameCheckThreshold, dailyResetHour,
+           telescopeFovDeg,
            afSlopeG, afSlopeBP, afSlopeRP,
            afRef15G, afRef15BP, afRef15RP] = results;
     if (minAlt          != null) document.getElementById("set-minalt").value                   = minAlt.value          ?? 20;
@@ -1614,6 +1616,11 @@ async function loadArbiterConfig() {
     if (frameCheckEnabled != null) document.getElementById("set-frame-check-enable").checked  = frameCheckEnabled.value === "true";
     if (frameCheckThreshold != null) document.getElementById("set-frame-check-threshold").value = frameCheckThreshold.value ?? 5;
     if (dailyResetHour  != null) { const el = document.getElementById("set-daily-reset-hour"); if (el) el.value = dailyResetHour.value ?? 12; }
+    if (telescopeFovDeg != null) {
+      const el = document.getElementById("set-telescope-fov-deg");
+      if (el) el.value = telescopeFovDeg.value ?? "0.86";
+    }
+    updateTelescopeFovPreview();
     if (afSlopeG  != null) { const el = document.getElementById("set-af-slope-G");  if (el) el.value = afSlopeG.value  ?? 10.83; }
     if (afSlopeBP != null) { const el = document.getElementById("set-af-slope-BP"); if (el) el.value = afSlopeBP.value ?? 9.73; }
     if (afSlopeRP != null) { const el = document.getElementById("set-af-slope-RP"); if (el) el.value = afSlopeRP.value ?? 12.08; }
@@ -1623,6 +1630,61 @@ async function loadArbiterConfig() {
     _updateAfModelPreview();
   } catch { /* non-fatal */ }
 }
+
+function updateTelescopeFovPreview() {
+  const el = document.getElementById("telescope-fov-preview");
+  const input = document.getElementById("set-telescope-fov-deg");
+  if (!el || !input) return;
+  const fov = parseFloat(input.value);
+  if (!Number.isFinite(fov) || fov <= 0) {
+    el.textContent = "";
+    return;
+  }
+  const maxSide = 8;
+  const capSpan = ((maxSide - 1) * fov).toFixed(2);
+  const capWidth = (maxSide * fov).toFixed(2);
+  const singleThreshold = (fov / 2).toFixed(2);
+  const exampleErr = 1.0;
+  const n = Math.min(maxSide, Math.max(1, Math.ceil((2 * exampleErr) / fov)));
+  const exSpan = ((n - 1) * fov).toFixed(2);
+  el.textContent =
+    `Single pointing when err ≤ ${singleThreshold}° (FOV/2). ` +
+    `Max mosaic (8×8 cap): ~${capSpan}° between outer tile centers, ~${capWidth}° full width. ` +
+    `Example: err=1.0° → ${n}×${n} tiles (~${exSpan}° between outer centers).`;
+}
+
+document.getElementById("set-telescope-fov-deg")?.addEventListener("input", updateTelescopeFovPreview);
+
+document.getElementById("telescope-fov-save")?.addEventListener("click", async () => {
+  const input = document.getElementById("set-telescope-fov-deg");
+  const status = document.getElementById("telescope-fov-status");
+  const btn = document.getElementById("telescope-fov-save");
+  const val = parseFloat(input?.value);
+  if (!Number.isFinite(val) || val <= 0.05 || val > 30) {
+    if (status) status.textContent = "Enter a value between 0.05 and 30°";
+    return;
+  }
+  try {
+    const resp = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "telescope_fov_deg", value: String(val) }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.success) {
+      if (status) status.textContent = data.error || "Save failed";
+      return;
+    }
+    if (status) status.textContent = "Saved ✓";
+    updateTelescopeFovPreview();
+    const orig = btn.textContent;
+    btn.textContent = "Saved ✓";
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; if (status) status.textContent = ""; }, 2000);
+  } catch (e) {
+    if (status) status.textContent = e.message;
+  }
+});
 
 document.getElementById("arbiter-save")?.addEventListener("click", async () => {
   const settings = {

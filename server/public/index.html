@@ -962,6 +962,29 @@
             <span id="email-status" style="font-size:12px;color:#94a3b8;"></span>
           </div>
 
+          <!-- Telescope FOV (ToO mosaics) -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Telescope field of view</h3>
+          <p class="hint" style="margin-bottom:10px;max-width:720px;line-height:1.45;">
+            Diameter in degrees of the <strong>largest circle that fits entirely inside your image</strong>
+            (the inscribed circle on the sensor). For a rectangular chip this is the circle that touches the
+            short sides — on a square sensor (e.g. IMX533) it equals the short-side field width.
+            ToO mosaics offset each pointing by this amount; tile centers on an <em>n×n</em> grid are
+            <em>(n−1)×FOV</em> apart (e.g. 8×8 → ~7×FOV between outer centers).
+            A single pointing is used when the alert error radius is ≤ <em>FOV/2</em> (localization fits
+            in one inscribed circle); larger errors tile with <em>n = ceil(2×err / FOV)</em> (max 8×8).
+          </p>
+          <div class="inline-form" style="margin-bottom:8px;align-items:flex-end;gap:10px;">
+            <label title="Inscribed-circle diameter on the sensor, in degrees">FOV (°)
+              <input id="set-telescope-fov-deg" type="number" min="0.1" max="15" step="0.01" value="0.86" style="width:80px;" autocomplete="off" />
+            </label>
+            <div class="buttons">
+              <button id="telescope-fov-save" type="button">Save FOV</button>
+            </div>
+            <span id="telescope-fov-status" style="font-size:12px;color:#94a3b8;"></span>
+          </div>
+          <p id="telescope-fov-preview" class="hint" style="margin:0 0 12px;font-size:12px;color:#64748b;"></p>
+
           <!-- Arbiter & Safety Limits -->
           <hr style="border-color:#1e293b;margin:18px 0;" />
           <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Arbiter &amp; Safety Limits</h3>

@@ -9,8 +9,6 @@ const Database = require("better-sqlite3");
 const nodemailer = require("nodemailer");
 const alerts = require("./alerts");
 
-const TOO_FOV_DEG = parseFloat(process.env.TOO_FOV_DEG || "0.5");
-const TOO_MOSAIC_THRESHOLD_DEG = parseFloat(process.env.TOO_MOSAIC_THRESHOLD_DEG || "0.5");
 const TOO_MOSAIC_MAX_SIDE = Math.max(1, parseInt(process.env.TOO_MOSAIC_MAX_SIDE || "8", 10));
 const PROCESSING_SERVICE_URL = process.env.PROCESSING_SERVICE_URL || "http://127.0.0.1:5200";
 const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/input";
@@ -636,6 +634,8 @@ const SETTING_DEFAULTS = {
   morning_park_hour:    "8",
   daily_reset_hour:     "12",
   alert_notify_email:   "true",
+  // Inscribed-circle FOV (°) on sensor — used for ToO mosaic tile spacing
+  telescope_fov_deg:    "0.86",
   // Focuser temperature model: pos ≈ slope × (FOCTEMP − 15) + ref15
   af_slope_G:           "10.83",
   af_slope_BP:          "9.73",
@@ -655,9 +655,38 @@ app.get("/api/settings/:key", (req, res) => {
 app.post("/api/settings", (req, res) => {
   const { key, value } = req.body || {};
   if (!key) return res.status(400).json({ success: false, error: "key required" });
+  if (key === "telescope_fov_deg") {
+    const n = parseFloat(value);
+    if (!Number.isFinite(n) || n <= 0.05 || n > 30) {
+      return res.status(400).json({
+        success: false,
+        error: "telescope_fov_deg must be a number between 0.05 and 30 (degrees)",
+      });
+    }
+    setSetting(key, String(n));
+    return res.json({ success: true });
+  }
   setSetting(key, value ?? "");
   res.json({ success: true });
 });
+
+/** User-configured inscribed-circle FOV (°); env TOO_FOV_DEG overrides only if DB unset. */
+function getTooFovDeg() {
+  const fromDb = parseFloat(getSetting("telescope_fov_deg", ""));
+  if (Number.isFinite(fromDb) && fromDb > 0.05 && fromDb <= 30) return fromDb;
+  const fromEnv = parseFloat(process.env.TOO_FOV_DEG || "");
+  if (Number.isFinite(fromEnv) && fromEnv > 0.05) return fromEnv;
+  return parseFloat(SETTING_DEFAULTS.telescope_fov_deg || "0.86");
+}
+
+/** Single pointing when err ≤ threshold; default threshold = FOV/2 (2×err fits in one field). */
+function getTooMosaicThresholdDeg(fovDeg = getTooFovDeg()) {
+  if (process.env.TOO_MOSAIC_THRESHOLD_DEG != null && process.env.TOO_MOSAIC_THRESHOLD_DEG !== "") {
+    const env = parseFloat(process.env.TOO_MOSAIC_THRESHOLD_DEG);
+    if (Number.isFinite(env) && env > 0) return env;
+  }
+  return fovDeg / 2;
+}
 
 // ── Secrets ──────────────────────────────────────────────────────────────────
 // GET  /api/secrets/:key  — returns { set: bool } only, never the value
@@ -860,7 +889,9 @@ app.get("/api/alerts/config", (req, res) => {
     success: true,
     alertReady: seqState.alertReady,
     tooRunning: seqState.tooRunning,
-    tooFovDeg: TOO_FOV_DEG,
+    tooFovDeg: getTooFovDeg(),
+    tooMosaicThresholdDeg: getTooMosaicThresholdDeg(),
+    tooMosaicMaxSide: TOO_MOSAIC_MAX_SIDE,
     alertPrepRunning: seqState.alertPrepRunning,
     alertPrepStep: seqState.alertPrepStep,
   });
@@ -4391,11 +4422,10 @@ async function runAlertPrep(ninaConfig, seqConfig) {
 // Runs when an alert interrupt fires. Uses the same camera settings as the main
 // sequence. Implements a mosaic strategy based on the error box vs FOV.
 //
-// Mosaic rules:
-//   err_deg <= TOO_MOSAIC_THRESHOLD_DEG (default 0.5°) → single center pointing
-//   err_deg >  threshold → n×n grid covering ~2×err diameter, tile spacing = FOV
-//                          tiles visited in center-out spiral order; one full
-//                          filter cycle per tile per epoch (epochs interleaved)
+// Mosaic rules (see computeMosaicGrid):
+//   err_deg ≤ FOV/2  → single center pointing (localization fits in one inscribed circle)
+//   err_deg > FOV/2  → n×n grid with side = ceil(2×err/FOV), tile spacing = FOV
+//                      center-out spiral; one filter cycle per tile per epoch
 //
 /** Center-out spiral visitation order for an n×n tile grid */
 function orderTilesSpiral(tiles, side) {
@@ -4414,7 +4444,7 @@ function orderTilesSpiral(tiles, side) {
 }
 
 function computeMosaicGrid(raDeg, decDeg, errDeg, fovDeg) {
-  const threshold = TOO_MOSAIC_THRESHOLD_DEG;
+  const threshold = getTooMosaicThresholdDeg(fovDeg);
 
   if (!Number.isFinite(errDeg) || errDeg <= threshold) {
     return {
@@ -4473,17 +4503,21 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
   const doCenter       = Boolean(strat.do_center);
 
   seqLog(`🚨 ═══ ToO SUB-SEQUENCE: ${tooName} ═══`);
-  seqLog(`  RA=${ra.toFixed(4)}° Dec=${dec.toFixed(4)}° err=${(err_deg || 0).toFixed(3)}° FOV=${TOO_FOV_DEG}°`);
+  seqLog(`  RA=${ra.toFixed(4)}° Dec=${dec.toFixed(4)}° err=${(err_deg || 0).toFixed(3)}° FOV=${getTooFovDeg()}°`);
   seqLog(`  Strategy: mode=${strat.mode} exp=${rapidExposure}s gain=${rapidGain} filters=[${filterCycle}] rapid=${rapidCount} AF=${doAf} guide=${doGuiding} center=${doCenter}`);
 
   try {
-    const mosaic = computeMosaicGrid(ra, dec, err_deg || 0, TOO_FOV_DEG);
+    const fovDeg = getTooFovDeg();
+    const mosaicThreshold = getTooMosaicThresholdDeg(fovDeg);
+    const mosaic = computeMosaicGrid(ra, dec, err_deg || 0, fovDeg);
     const grid = mosaic.grid;
     const useSpiral = mosaic.mode === "spiral";
-    const coverDeg = (mosaic.side * TOO_FOV_DEG).toFixed(2);
+    const centerSpanDeg = ((mosaic.side - 1) * fovDeg).toFixed(2);
+    const outerExtentDeg = (mosaic.side * fovDeg).toFixed(2);
     let mosaicMsg = `  Mosaic: ${grid.length} tile(s)`;
     if (useSpiral) {
-      mosaicMsg += ` ${mosaic.side}×${mosaic.side} spiral (~${coverDeg}°×${coverDeg}° for err=${(err_deg || 0).toFixed(2)}°)`;
+      mosaicMsg += ` ${mosaic.side}×${mosaic.side} spiral (err=${(err_deg || 0).toFixed(2)}°, FOV=${fovDeg}°, single if err≤${mosaicThreshold.toFixed(2)}°`;
+      mosaicMsg += ` → ~${centerSpanDeg}° between outer centers, ~${outerExtentDeg}° full width)`;
       if (mosaic.capped) {
         mosaicMsg += ` [capped from ${mosaic.requestedSide}×${mosaic.requestedSide}]`;
       }
