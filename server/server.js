@@ -17,13 +17,30 @@ const NAS_WATCH_PATH = process.env.NAS_WATCH_PATH || "/mnt/nas/input/pyl/astro/i
 const PYTHON_BIN_CANDIDATE = process.env.PYTHON_BIN || path.join(__dirname, "..", ".venv", "bin", "python");
 const PYTHON_BIN = fs.existsSync(PYTHON_BIN_CANDIDATE) ? PYTHON_BIN_CANDIDATE : "python3";
 
-function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false, force_fresh = false) {
+/** ToO-Fermi-801108913 → "Fermi"; non-ToO → null (TNS/manual). */
+function parseTooBroker(name) {
+  const m = String(name || "").trim().match(/^ToO-([^-]+)-/i);
+  return m ? m[1] : null;
+}
+
+/** Alerts default to transient detection (no STDWeb target); TNS/SN always use target photometry. */
+function stdwebUseTargetForObject(objectName) {
+  const broker = parseTooBroker(objectName);
+  if (!broker) return 1;
+  const strat = getStrategy(broker);
+  return strat.stdweb_use_target ? 1 : 0;
+}
+
+function callProcessingService(job_id, fits_dir, target, selected_files = null, target_filter = null, manual_selection = false, force_fresh = false, stdweb_use_target = null) {
   return new Promise((resolve, reject) => {
     const payload = { job_id, fits_dir, target };
     if (selected_files && selected_files.length) payload.selected_files = selected_files;
     if (target_filter) payload.target_filter = target_filter;
     if (manual_selection) payload.manual_selection = true;
     if (force_fresh) payload.force_fresh = true;
+    if (stdweb_use_target !== null && stdweb_use_target !== undefined) {
+      payload.stdweb_use_target = !!stdweb_use_target;
+    }
     // When the fits_dir is a SNAPSHOT folder, pass the target name as object_filter
     // so only frames matching that OBJECT header are processed (not all mixed targets).
     if (fits_dir && path.basename(fits_dir).toUpperCase() === "SNAPSHOT" && target) {
@@ -251,6 +268,7 @@ try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN frame_previews TEXT").
 try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN target_filter TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN use_color INTEGER DEFAULT 0").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN refine_wcs INTEGER DEFAULT 1").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_jobs ADD COLUMN stdweb_use_target INTEGER").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN stdweb_state TEXT").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN obs_date TEXT").run(); } catch { /* already exists */ }
 // seq_queue source column: "manual" (user-added) or "alert" (pushed from alert broker)
@@ -366,10 +384,15 @@ for (const s of ALERT_STRATEGY_SEEDS) _stratSeedStmt.run(s);
 try {
   db.prepare("ALTER TABLE alert_strategies ADD COLUMN notify_email INTEGER NOT NULL DEFAULT 1").run();
 } catch { /* column already exists */ }
+// STDWeb: 0 = transient detection (default for alerts); 1 = fill target field (TNS-style)
+try {
+  db.prepare("ALTER TABLE alert_strategies ADD COLUMN stdweb_use_target INTEGER NOT NULL DEFAULT 0").run();
+} catch { /* column already exists */ }
 
 const STRATEGY_DEFAULTS = {
   enabled: 1, mode: "too", exposure: 30, gain: 10, filter_cycle: "G,RP,BP",
   rapid_count: 15, do_af: 0, do_guiding: 0, do_center: 0, min_alt: 25, max_err_deg: 1.0, notes: "",
+  stdweb_use_target: 0,
 };
 
 function getStrategy(broker) {
@@ -974,6 +997,7 @@ app.put("/api/alert-strategies/:broker", (req, res) => {
     min_alt:      v => { const n = parseFloat(v); return (n >= 0 && n <= 90) ? n : undefined; },
     max_err_deg:  v => { const n = parseFloat(v); return (n > 0 && n <= 180) ? n : undefined; },
     notes:        v => (typeof v === "string") ? v.slice(0, 500) : undefined,
+    stdweb_use_target: v => { const n = parseInt(v); return (n === 0 || n === 1) ? n : undefined; },
   };
 
   for (const [key, validate] of Object.entries(allowed)) {
@@ -1490,7 +1514,7 @@ app.post("/api/nina/devices/connect", async (req, res) => {
   if (!selectedDevices) {
     return res.status(400).json({
       success: false,
-      error: "Device must be one of: all, mount, camera, filterwheel, focuser",
+      error: "Device must be one of: all, mount, camera, filterwheel, focuser, flatdevice",
     });
   }
 
@@ -1507,7 +1531,7 @@ app.post("/api/nina/devices/connect", async (req, res) => {
       }),
     );
 
-    const { result: infoResult, statuses } = await getEquipmentInfo(target);
+    const { result: infoResult, equipmentInfo, statuses } = await getEquipmentInfo(target);
 
     const allSuccess = connectionResults.every((result) => result.success);
     return res.status(allSuccess ? 200 : 502).json({
@@ -1515,6 +1539,7 @@ app.post("/api/nina/devices/connect", async (req, res) => {
       target,
       results: connectionResults,
       devices: statuses,
+      equipment: equipmentInfo,
       infoStatus: infoResult.status,
     });
   } catch (error) {
@@ -1751,7 +1776,7 @@ async function flatDeviceAction(req, res, action) {
       success: confirmed,
       action,
       coverState,
-      coverStateLabel: stateNames[coverState] ?? String(coverState),
+      coverStateLabel: stateNames[coverStateNum] ?? String(coverState ?? coverStateNum),
       ...(!confirmed && { error: `Cover did not reach ${action === "open" ? "Open" : "Closed"} state within 30 s` }),
     });
   } catch (e) {
@@ -1768,9 +1793,12 @@ app.post("/api/nina/actions/flatdevice/connect", async (req, res) => {
   try {
     const cr = await callNinaLong(target, "/v2/api/equipment/flatdevice/connect", {}, 15000);
     const { equipmentInfo } = await getEquipmentInfo(target);
-    return res.status(isNinaApiSuccess(cr) ? 200 : 502).json({
-      success: isNinaApiSuccess(cr),
+    const ok = isNinaApiSuccess(cr);
+    return res.status(ok ? 200 : 502).json({
+      success: ok,
       flatDevice: equipmentInfo?.FlatDevice ?? null,
+      devices: equipmentInfo ? deviceStatusFromEquipmentInfo(equipmentInfo) : null,
+      error: ok ? undefined : (cr.body?.Error || cr.body?.error || `NINA connect failed (${cr.status})`),
     });
   } catch (e) {
     return res.status(502).json({ success: false, error: normalizeNinaError(e) });
@@ -5920,14 +5948,18 @@ app.post("/api/pipeline/trigger", async (req, res) => {
 
   const useColorVal    = use_color    === false ? 0 : 1;
   const refineWcsVal   = refine_wcs   === false ? 0 : 1;
+  const filterName     = target_filter || target || null;
+  const stdwebTargetVal = req.body?.stdweb_use_target !== undefined
+    ? (req.body.stdweb_use_target ? 1 : 0)
+    : stdwebUseTargetForObject(filterName);
 
   const result = db.prepare(
-    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(target || null, filter || null, exposure || null, fits_dir, "queued", target_filter || null, useColorVal, refineWcsVal);
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs, stdweb_use_target) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(target || null, filter || null, exposure || null, fits_dir, "queued", target_filter || null, useColorVal, refineWcsVal, stdwebTargetVal);
 
   const job_id = result.lastInsertRowid;
 
-  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null, !!manual_selection, !!force_fresh)
+  callProcessingService(job_id, fits_dir, target || "Unknown", selected_files || null, target_filter || null, !!manual_selection, !!force_fresh, !!stdwebTargetVal)
     .then((svc) => {
       if (!svc.success) {
         db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")
@@ -5947,13 +5979,17 @@ app.post("/api/pipeline/rerun/:id", async (req, res) => {
   const oldJob = db.prepare("SELECT * FROM pipeline_jobs WHERE id=?").get(req.params.id);
   if (!oldJob) return res.status(404).json({ success: false, error: "Job not found" });
 
+  const stdwebTargetVal = oldJob.stdweb_use_target != null
+    ? oldJob.stdweb_use_target
+    : stdwebUseTargetForObject(oldJob.target_filter || oldJob.target);
+
   const result = db.prepare(
-    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).run(oldJob.target, oldJob.filter, oldJob.exposure, oldJob.fits_dir, "queued", oldJob.target_filter || null, oldJob.use_color ? 1 : 0, oldJob.refine_wcs != null ? oldJob.refine_wcs : 1);
+    "INSERT INTO pipeline_jobs (target, filter, exposure, fits_dir, status, target_filter, use_color, refine_wcs, stdweb_use_target) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(oldJob.target, oldJob.filter, oldJob.exposure, oldJob.fits_dir, "queued", oldJob.target_filter || null, oldJob.use_color ? 1 : 0, oldJob.refine_wcs != null ? oldJob.refine_wcs : 1, stdwebTargetVal);
 
   const job_id = result.lastInsertRowid;
 
-  callProcessingService(job_id, oldJob.fits_dir, oldJob.target || "Unknown", null, oldJob.target_filter || null)
+  callProcessingService(job_id, oldJob.fits_dir, oldJob.target || "Unknown", null, oldJob.target_filter || null, false, false, !!stdwebTargetVal)
     .then((svc) => {
       if (!svc.success)
         db.prepare("UPDATE pipeline_jobs SET status='error', error=? WHERE id=?")

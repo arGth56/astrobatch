@@ -164,6 +164,32 @@ def _ensure_selection_columns():
 _ensure_selection_columns()
 
 
+def _ensure_stdweb_job_columns():
+    with _db() as conn:
+        try:
+            conn.execute("ALTER TABLE pipeline_jobs ADD COLUMN stdweb_use_target INTEGER")
+        except Exception:
+            pass
+
+
+_ensure_stdweb_job_columns()
+
+_TOO_BROKER_RE = re.compile(r"^ToO-([^-]+)-", re.I)
+
+
+def _job_stdweb_use_target(job: dict, raw_obj: str) -> bool:
+    """True → pass target= to STDWeb (TNS photometry); False → transient detection only."""
+    if job.get("stdweb_use_target") is not None:
+        return bool(job["stdweb_use_target"])
+    return not bool(_TOO_BROKER_RE.match(str(raw_obj or "").strip()))
+
+
+def _stdweb_upload_target(raw_obj: str, use_target: bool) -> str | None:
+    if not use_target:
+        return None
+    return raw_obj.replace(" ", "")
+
+
 def compute_frame_stats(fits_path: Path) -> dict:
     """Return per-frame quality metrics (FWHM, roundness, star count) using sep."""
     try:
@@ -323,6 +349,37 @@ def _obj_slug(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
 
+def _too_base_slug(object_filter: str) -> str | None:
+    """ToO-Fermi-801108913 [NE] [(all tiles)] → slug too-fermi-801108913."""
+    raw = re.sub(r"\s*\(all\s+tiles\)\s*", "", object_filter or "", flags=re.I).strip()
+    if not re.match(r"^ToO-", raw, re.I):
+        return None
+    parts = raw.replace(" ", "-").split("-")
+    if len(parts) >= 3 and parts[0].lower() == "too":
+        return _obj_slug("-".join(parts[:3]))
+    return _obj_slug(raw)
+
+
+def _object_matches_filter(obj_slug: str, filter_slug: str, object_filter: str | None) -> bool:
+    """Exact match for TNS/SN; prefix/tile match for ToO mosaic epochs."""
+    if not filter_slug:
+        return True
+    if obj_slug == filter_slug:
+        return True
+    base = _too_base_slug(object_filter or "")
+    if not base:
+        return False
+    if obj_slug == base or obj_slug.startswith(base + "_") or obj_slug.startswith(base + "-"):
+        return True
+    if filter_slug.startswith(base):
+        tile = filter_slug[len(base):].lstrip("_-")
+        if tile:
+            for sep in ("_", "-"):
+                if obj_slug.startswith(base + sep + tile):
+                    return True
+    return False
+
+
 def scan_fits(fits_dir: Path, jlog: JobLogger,
               selected_files: list[str] | None = None,
               object_filter: str | None = None) -> tuple[dict, dict]:
@@ -356,8 +413,7 @@ def scan_fits(fits_dir: Path, jlog: JobLogger,
             if not raw_obj or raw_obj.lower() in ("snapshot", "unknown", "none", ""):
                 raw_obj = folder_fallback
             obj = _obj_slug(raw_obj)
-            # Skip if we're filtering to a specific target and this file doesn't match
-            if filter_slug and obj != filter_slug:
+            if filter_slug and not _object_matches_filter(obj, filter_slug, object_filter):
                 return
             groups[(obj, filt, exp_str)].append(f)
             raw_names.setdefault(obj, raw_obj)   # keep first occurrence
@@ -1200,10 +1256,14 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
         jlog.info("Uploading to STDWeb…")
         fits_path  = Path(job["fits_dir"])
         _, raw_names = scan_fits(fits_path, jlog, object_filter=obj)
-        raw_obj     = raw_names.get(obj, obj.replace('_', ' ').title())
-        target_clean = raw_obj.replace(' ', '')
+        raw_obj      = raw_names.get(obj, obj.replace('_', ' ').title())
+        use_target   = _job_stdweb_use_target(job, raw_obj)
+        target_clean = _stdweb_upload_target(raw_obj, use_target)
         title        = f"{raw_obj} {filt} {exp_str}s {date_str}"
-        jlog.info(f"  STDWeb target: '{target_clean}'")
+        if use_target:
+            jlog.info(f"  STDWeb target photometry: '{target_clean}'")
+        else:
+            jlog.info("  STDWeb transient detection (no target field)")
         task_id = stdweb_upload(res_fit, title, jlog, target=target_clean)
         if not task_id:
             update_result(result_id, "error", error="STDWeb upload failed")
@@ -1393,12 +1453,15 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
             pass
     use_color = True
     refine_wcs = True
+    job_row: dict = {}
     try:
         with _db() as conn:
             row = conn.execute(
-                "SELECT use_color, refine_wcs FROM pipeline_jobs WHERE id=?", (job_id,)
+                "SELECT use_color, refine_wcs, stdweb_use_target FROM pipeline_jobs WHERE id=?",
+                (job_id,),
             ).fetchone()
             if row:
+                job_row = dict(row)
                 use_color = bool(row["use_color"])
                 refine_wcs = bool(row["refine_wcs"]) if row["refine_wcs"] is not None else True
     except Exception:
@@ -1553,12 +1616,14 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         update_job(job_id, "uploading")
         update_result(result_id, "uploading")
         jlog.info("Step 5: Uploading to STDWeb...")
-        # Use original OBJECT header so STDWeb gets the proper TNS name
-        # e.g. raw "SN 2026fvx" → target "SN2026fvx",  "AT 2026fuh" → "AT2026fuh"
         raw_obj = raw_names.get(obj, obj.replace('_', ' ').title())
         title = f"{raw_obj} {filt} {exp_str}s {date_str}"
-        target_clean = raw_obj.replace(' ', '')   # "SN 2026fvx" → "SN2026fvx"
-        jlog.info(f"  STDWeb target: '{target_clean}'")
+        use_target = _job_stdweb_use_target(job_row, raw_obj)
+        target_clean = _stdweb_upload_target(raw_obj, use_target)
+        if use_target:
+            jlog.info(f"  STDWeb target photometry: '{target_clean}'")
+        else:
+            jlog.info("  STDWeb transient detection (no target field)")
         task_id = stdweb_upload(res_fit, title, jlog, target=target_clean)
 
         if not task_id:
@@ -1874,6 +1939,16 @@ def trigger():
         return jsonify({"success": False, "error": f"Directory not found: {fits_dir}"}), 400
 
     manual_sel = bool(data.get("manual_selection"))
+
+    if data.get("stdweb_use_target") is not None and job_id:
+        try:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE pipeline_jobs SET stdweb_use_target=? WHERE id=?",
+                    (1 if data.get("stdweb_use_target") else 0, int(job_id)),
+                )
+        except Exception:
+            pass
 
     enqueued = _enqueue_job(
         int(job_id),

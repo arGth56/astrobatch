@@ -801,6 +801,7 @@
                     <th style="text-align:center;padding:6px;">Center</th>
                     <th style="text-align:right;padding:6px;">Min Alt</th>
                     <th style="text-align:right;padding:6px;">Max Err</th>
+                    <th style="text-align:center;padding:6px;" title="When checked, STDWeb upload uses target photometry (TNS name). Off = transient detection (default for alerts).">STDWeb target</th>
                     <th style="text-align:left;padding:6px;">Notes</th>
                     <th style="padding:6px;"></th>
                   </tr>
@@ -894,7 +895,9 @@
           <!-- Connections -->
           <h3 style="font-size:14px;color:#93c5fd;margin:0 0 10px;">Connections</h3>
           <form id="config-form" class="inline-form" style="margin-bottom:10px;">
-            <label>NINA Host<input id="host" name="host" type="text" placeholder="192.168.1.174" value="192.168.1.174" required  autocomplete="off" /></label>
+            <label>NINA Host<input id="host" name="host" type="text" placeholder="192.168.1.174" value="192.168.1.174" required  autocomplete="off" />
+              <span class="hint" style="display:block;font-size:11px;color:#6b7280;margin-top:2px;">Windows PC running NINA (e.g. 192.168.1.174), not this server’s VPN IP.</span>
+            </label>
             <label>Port<input id="port" name="port" type="number" min="1" max="65535" placeholder="1888" required  autocomplete="off" /></label>
             <label>Protocol
               <select id="protocol" name="protocol">

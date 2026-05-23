@@ -53,6 +53,7 @@ const ocsSafetyDetailEl = document.getElementById("detail-safetymonitor");
 
 let lastEquipment = null;
 let ocsHost = "192.168.1.220";
+const NINA_CONFIG_STORAGE_KEY = "ninaConfig";
 let ocsConnected = false;
 let stdwebConnected = false;
 let observerLocation = { lat: null, lon: null, elevation: null };
@@ -81,6 +82,35 @@ function currentConfig() {
     port: document.getElementById("port").value.trim(),
     protocol: document.getElementById("protocol").value,
   };
+}
+
+function saveNinaConfigToStorage() {
+  try {
+    localStorage.setItem(NINA_CONFIG_STORAGE_KEY, JSON.stringify(currentConfig()));
+  } catch { /* private browsing / quota */ }
+}
+
+function loadNinaConfigFromStorage() {
+  try {
+    const raw = localStorage.getItem(NINA_CONFIG_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function applyNinaConfigFields(cfg) {
+  if (!cfg?.host) return;
+  const hostEl = document.getElementById("host");
+  const portEl = document.getElementById("port");
+  const protoEl = document.getElementById("protocol");
+  if (hostEl) hostEl.value = cfg.host;
+  if (portEl && cfg.port) portEl.value = cfg.port;
+  if (protoEl && cfg.protocol) protoEl.value = cfg.protocol;
+}
+
+function applyNinaConfigFromStorage() {
+  applyNinaConfigFields(loadNinaConfigFromStorage());
 }
 
 function setLog(value) {
@@ -554,7 +584,7 @@ async function refreshStatus() {
     lastEquipment = payload.equipment || null;
     updateFilterOptions(lastEquipment);
     updateFwCurrentBadge(lastEquipment);
-    updateCoverBadge(lastEquipment?.FlatDevice ?? null);
+    updateCoverBadge(lastEquipment?.FlatDevice ?? null, payload.devices?.flatdevice);
 
     // Store site coordinates when mount is connected and has real coordinates
     const mount = lastEquipment?.Mount;
@@ -572,6 +602,9 @@ async function refreshStatus() {
     connectionStatus.textContent = `Connection failed: ${ninaResult.reason?.message}`;
     connectionStatus.classList.add("offline");
     connectionStatus.classList.remove("online");
+    lastEquipment = null;
+    setDeviceStatuses({});
+    updateCoverBadge(null);
     setLog({ success: false, error: ninaResult.reason?.message });
   }
 
@@ -725,6 +758,7 @@ async function moveFocuser(direction) {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  saveNinaConfigToStorage();
   // Update NINA host display in connect-bar
   const ninaHostEl = document.getElementById("nina-host-display");
   if (ninaHostEl) {
@@ -1001,19 +1035,44 @@ function normCoverStateClient(raw) {
 const COVER_STATE_LABELS = { 0: "Not Present", 1: "Closed", 2: "Moving…", 3: "Open", 100: "Unknown", 101: "Error" };
 const COVER_STATE_COLORS = { 0: "#6b7280", 1: "#4ade80", 2: "#fbbf24", 3: "#34d399", 100: "#9ca3af", 101: "#f87171" };
 
-function updateCoverBadge(fd) {
+function updateCoverBadge(fd, flatdeviceConnected) {
   const stateEl  = document.getElementById("cover-state-label");
   const detailEl = document.getElementById("detail-flatdevice");
-  if (!fd) { if (stateEl) { stateEl.textContent = "—"; stateEl.style.color = ""; } return; }
+  const statusEl = deviceStatusEls.flatdevice;
+  if (!fd) {
+    if (stateEl) { stateEl.textContent = "—"; stateEl.style.color = ""; }
+    if (detailEl) { detailEl.textContent = ""; detailEl.style.color = ""; }
+    if (statusEl && flatdeviceConnected === undefined) {
+      statusEl.textContent = "Unknown";
+      statusEl.className = "offline";
+    }
+    return;
+  }
   const stateNum = normCoverStateClient(fd.CoverState);
   const label    = COVER_STATE_LABELS[stateNum] ?? String(fd.CoverState ?? "Unknown");
   const color    = COVER_STATE_COLORS[stateNum] ?? "#9ca3af";
   if (stateEl)  { stateEl.textContent = label; stateEl.style.color = color; }
-  if (detailEl) { detailEl.textContent = fd.Connected ? label : "Not connected"; detailEl.style.color = fd.Connected ? color : "#6b7280"; }
+  if (detailEl) {
+    const name = fd.DisplayName || fd.Name || "";
+    detailEl.textContent = fd.Connected
+      ? (name ? `${name} · ${label}` : label)
+      : (name ? `${name} · not connected` : "Not connected");
+    detailEl.style.color = fd.Connected ? color : "#6b7280";
+  }
+  if (statusEl) {
+    if (fd.Connected) {
+      statusEl.textContent = label;
+      statusEl.className = "online";
+    } else {
+      statusEl.textContent = "Disconnected";
+      statusEl.className = "offline";
+    }
+  }
 }
 
 async function coverAction(action) {
   const msgEl = document.getElementById("cover-result-msg");
+  saveNinaConfigToStorage();
   if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">${action === "open" ? "Opening" : "Closing"} cover…</span>`;
   try {
     const resp = await fetch(`/api/nina/actions/flatdevice/${action}`, {
@@ -1044,14 +1103,25 @@ document.getElementById("cover-close-btn").addEventListener("click", () => cover
 document.getElementById("cover-connect-btn").addEventListener("click", async () => {
   const msgEl = document.getElementById("cover-result-msg");
   if (msgEl) msgEl.innerHTML = `<span style="color:#6b7280">Connecting…</span>`;
+  saveNinaConfigToStorage();
   try {
-    const r = await postJson("/api/nina/actions/flatdevice/connect", currentConfig());
-    if (msgEl) msgEl.innerHTML = r.success
-      ? `<span style="color:#34d399">✔ Connected</span>`
-      : `<span style="color:#f87171">✘ ${r.error || "Failed"}</span>`;
+    const resp = await fetch("/api/nina/actions/flatdevice/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentConfig()),
+    });
+    const r = await resp.json();
+    if (msgEl) {
+      msgEl.innerHTML = r.success
+        ? `<span style="color:#34d399">✔ Connected</span>`
+        : `<span style="color:#f87171">✘ ${r.error || "Failed"}</span>`;
+    }
+    if (!r.success) setLog(r);
+    if (r.flatDevice) updateCoverBadge(r.flatDevice, r.devices?.flatdevice);
     await refreshStatus();
   } catch (err) {
     if (msgEl) msgEl.innerHTML = `<span style="color:#f87171">✘ ${err.message}</span>`;
+    setLog({ success: false, action: "cover-connect", error: err.message });
   }
 });
 
@@ -1062,6 +1132,7 @@ async function loadDefaults() {
     document.getElementById("host").value = defaults.host || "192.168.1.174";
     document.getElementById("port").value = defaults.port || "1888";
     document.getElementById("protocol").value = defaults.protocol || "http";
+    applyNinaConfigFromStorage();
     ocsHost = defaults.ocsHost || "192.168.1.220";
     syncOcsHostInputs(ocsHost);
     if (defaults.tns?.botId) document.getElementById("tns-bot-id").value = defaults.tns.botId;
@@ -1076,6 +1147,7 @@ async function loadDefaults() {
     document.getElementById("host").value = "192.168.1.174";
     document.getElementById("port").value = "1888";
     document.getElementById("protocol").value = "http";
+    applyNinaConfigFromStorage();
     syncOcsHostInputs("192.168.1.220");
   }
   // Restore tonight search settings from localStorage
@@ -3661,7 +3733,19 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
 })();
 
 setActiveTab("devices");
-loadDefaults().then(refreshStatus);
+loadDefaults().then(() => {
+  refreshStatus();
+  startNinaStatusPolling();
+});
+
+let _ninaStatusPollTimer = null;
+function startNinaStatusPolling() {
+  if (_ninaStatusPollTimer) return;
+  _ninaStatusPollTimer = setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    refreshStatus().catch(() => {});
+  }, 12_000);
+}
 loadWatchdogConfig();
 loadArbiterConfig();
 loadHistory();
@@ -4521,6 +4605,9 @@ function renderStrategies() {
       <td style="padding:5px 6px;text-align:center;"><input type="checkbox" class="strat-cb" data-field="do_center" ${s.do_center ? "checked" : ""} /></td>
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="min_alt" value="${s.min_alt}" min="0" max="90" step="1" style="width:42px;" /></td>
       <td style="padding:5px 6px;"><input type="number" class="strat-inp" data-field="max_err_deg" value="${s.max_err_deg}" min="0.01" max="180" step="0.1" style="width:50px;" /></td>
+      <td style="padding:5px 6px;text-align:center;" title="STDWeb target photometry (TNS-style). Off = transient detection.">
+        <input type="checkbox" class="strat-cb" data-field="stdweb_use_target" ${s.stdweb_use_target ? "checked" : ""} />
+      </td>
       <td style="padding:5px 6px;"><input type="text" class="strat-inp" data-field="notes" value="${(s.notes||"").replace(/"/g,"&quot;")}" style="width:160px;font-size:11px;" /></td>
       <td style="padding:5px 6px;"><button class="btn-small strat-reset-btn" data-broker="${s.broker}" title="Reset to defaults">↺</button></td>
     </tr>`;
