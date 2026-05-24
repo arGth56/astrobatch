@@ -87,7 +87,7 @@ const TNS_API_KEY = process.env.TNS_API_KEY || "";
 const STDWEB_TOKEN = process.env.STDWEB_TOKEN || "";
 // Runtime helper — checks DB first so the UI save takes effect without restart
 const getStdwebToken = () => getSetting("secret_stdweb_token") || process.env.STDWEB_TOKEN || "";
-const DEVICE_TYPES = ["mount", "camera", "filterwheel", "focuser", "flatdevice"];
+const DEVICE_TYPES = ["mount", "camera", "filterwheel", "focuser", "flatdevice", "guider"];
 const STATUS_DEVICE_MAP = {
   mount: ["Mount", "Connected"],
   camera: ["Camera", "Connected"],
@@ -1545,7 +1545,7 @@ app.post("/api/nina/devices/connect", async (req, res) => {
   if (!selectedDevices) {
     return res.status(400).json({
       success: false,
-      error: "Device must be one of: all, mount, camera, filterwheel, focuser, flatdevice",
+      error: "Device must be one of: all, mount, camera, filterwheel, focuser, flatdevice, guider",
     });
   }
 
@@ -1953,6 +1953,80 @@ function scheduleNoonReset() {
     setInterval(dailyReset, 24 * 60 * 60 * 1000); // every 24 h after first fire
   }, msUntil);
 }
+
+/**
+ * Full morning shutdown: disable tracking → close dust cover → park mount.
+ * Called either by the scheduled morning timer or the /api/sequence/morning-shutdown endpoint.
+ * Skips silently if the sequence is currently running (it handles its own teardown)
+ * or if the mount is already parked.
+ */
+async function runMorningShutdown(reason = "morning cutoff") {
+  if (seqState.running) {
+    console.log(`[morning-shutdown] Sequence running — skipping (it handles its own teardown)`);
+    return { skipped: true, reason: "sequence running" };
+  }
+
+  const cfg = seqState.ninaConfig ?? {
+    host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL,
+  };
+
+  seqLog(`🌅 Morning shutdown — ${reason}`);
+  const results = {};
+
+  // 1. Disable tracking
+  try {
+    await callNinaLong(cfg, "/v2/api/equipment/mount/tracking", { on: false }, 15000);
+    seqLog("  Tracking off ✓");
+    results.tracking = "off";
+  } catch (e) {
+    seqLog(`  Tracking disable failed: ${e.message}`, "warn");
+    results.tracking = `failed: ${e.message}`;
+  }
+
+  // 2. Close dust cover
+  try {
+    const confirmed = await stepCloseCover(cfg, { strict: false });
+    seqLog(confirmed ? "  Dust cover closed ✓" : "  ⚠ Dust cover close unconfirmed — verify manually", confirmed ? "info" : "warn");
+    results.cover = confirmed ? "closed" : "unconfirmed";
+  } catch (e) {
+    seqLog(`  Cover close failed: ${e.message} — verify manually`, "warn");
+    results.cover = `failed: ${e.message}`;
+  }
+
+  // 3. Check if already parked before issuing park command
+  try {
+    const { equipmentInfo } = await getEquipmentInfo(cfg);
+    if (equipmentInfo?.Mount?.AtPark === true) {
+      seqLog("  Mount already parked ✓");
+      results.park = "already parked";
+    } else {
+      await stepParkMount(cfg);
+      results.park = "parked";
+    }
+  } catch (e) {
+    seqLog(`  Park failed: ${e.message} — verify mount is safe`, "warn");
+    results.park = `failed: ${e.message}`;
+  }
+
+  seqLog("🌅 Morning shutdown complete.");
+  return results;
+}
+
+/** Schedule runMorningShutdown to fire once at morning_park_hour each day. */
+function scheduleMorningShutdown() {
+  const parkHour = parseInt(getSetting("morning_park_hour") ?? "8", 10);
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(parkHour, 0, 5, 0); // 5 s past the hour to avoid edge races
+  if (next <= now) next.setDate(next.getDate() + 1);
+  const msUntil = next - now;
+  console.log(`[morning-shutdown] Scheduled for ${next.toLocaleString()} (in ${Math.round(msUntil / 60000)} min)`);
+  setTimeout(async () => {
+    await runMorningShutdown("morning cutoff timer");
+    scheduleMorningShutdown(); // reschedule for next day
+  }, msUntil);
+}
+scheduleMorningShutdown();
 scheduleNoonReset();
 
 // ── Per-filter autofocus cache (DB-backed) ────────────────────────────────────
@@ -2813,6 +2887,45 @@ async function stepStartGuiding(target, opts = {}) {
     }
   }
   return false;
+}
+
+/** Pre-flight: ensure PHD2/guider is connected in NINA before slewing to science targets. */
+async function stepGuiderPreflight(target) {
+  seqLog("── Guider (PHD2) checklist ──────────────────────────");
+  let { equipmentInfo } = await getEquipmentInfo(target);
+  let guider = equipmentInfo?.Guider;
+  const label = guider?.Name || "PHD2";
+
+  if (!guider?.Connected) {
+    seqLog(`  Guider not connected — trying NINA connect...`, "warn");
+    const cr = await callNinaLong(target, "/v2/api/equipment/guider/connect", {}, 15_000);
+    if (!isNinaApiSuccess(cr)) {
+      seqLog(`  Guider connect API: ${JSON.stringify(cr.body)}`, "warn");
+    }
+    ({ equipmentInfo } = await getEquipmentInfo(target));
+    guider = equipmentInfo?.Guider;
+  }
+
+  const state = guider?.State ?? "Unknown";
+  if (!guider?.Connected) {
+    seqLog(`  ✗ ${label}: NOT CONNECTED (state: ${state})`, "error");
+    seqLog("  ✗ No PHD2 — sequence aborted. In NINA: Equipment → Guider → Connect (PHD2 must be running).", "error");
+    seqLog("────────────────────────────────────────────────────");
+    return false;
+  }
+
+  seqLog(`  ✓  ${label} connected  (state: ${state})`);
+  seqLog("────────────────────────────────────────────────────");
+  return true;
+}
+
+async function assertGuiderReady(target) {
+  const ok = await stepGuiderPreflight(target);
+  if (!ok) {
+    const err = new Error("PHD2 guider not connected in NINA — connect Guider before starting the sequence");
+    err.code = "GUIDER_NOT_CONNECTED";
+    throw err;
+  }
 }
 
 // ── Dust Cover (Alnitak Flip-Flat / NINA FlatDevice) ─────────────────────────
@@ -3852,6 +3965,13 @@ async function runSequence(ninaConfig, seqConfig) {
       seqLog(`Filter switch warning: ${err.message} — continuing anyway`, "warn");
     }
 
+    // ── Step 1d: Guider (PHD2) must be connected before first slew ───────────
+    if (!(await stepGuiderPreflight(ninaConfig))) {
+      await stepCloseCover(ninaConfig, { strict: false });
+      await safeHome();
+      return;
+    }
+
     await waitForConfirmation("Camera cooled — proceed to first target?");
     checkAbort();
 
@@ -4177,20 +4297,39 @@ async function runSequence(ninaConfig, seqConfig) {
       }
     }
 
-    // ── Final: Home → close cover → park ─────────────────────────────────────
+    // ── Final: Home, then either stay alert-ready or do full shutdown ────────
     seqLog("All targets complete. Homing mount...");
     await safeHome();
     seqLog("Mount at home ✓");
+
+    // Disable tracking regardless of posture
     try {
-      const confirmed = await stepCloseCover(ninaConfig, { strict: false });
-      if (!confirmed) seqLog("⚠ Verify dust cover is closed before leaving!", "warn");
-    } catch (err) {
-      seqLog(`⚠ Cover close error: ${err.message} — verify manually`, "warn");
-    }
-    try {
-      await stepParkMount(ninaConfig);
-    } catch (err) {
-      seqLog(`⚠ Park failed: ${err.message} — verify mount is safe`, "warn");
+      await callNinaLong(ninaConfig, "/v2/api/equipment/mount/tracking", { on: false }, 15000);
+    } catch { /* non-fatal */ }
+
+    const _morningHour = parseInt(getSetting("morning_park_hour") ?? "8", 10);
+    const _localHour   = new Date().getHours();
+    const _beforeCutoff = !(_localHour >= _morningHour && _localHour < 14);
+    const _stayAlertReady = seqState.alertReady && _beforeCutoff;
+
+    if (_stayAlertReady) {
+      seqLog("Queue done — staying in alert-ready posture (home, tracking off, cover open)");
+      seqLog("  Automated morning shutdown will close cover + park at " +
+             `${_morningHour}:00 local (or on bad weather).`, "warn");
+      // Alert-Ready flag stays armed; morning shutdown handles final close/park
+    } else {
+      if (!_beforeCutoff) seqLog(`Past morning cutoff (${_morningHour}:00) — running full shutdown`);
+      try {
+        const confirmed = await stepCloseCover(ninaConfig, { strict: false });
+        if (!confirmed) seqLog("⚠ Verify dust cover is closed before leaving!", "warn");
+      } catch (err) {
+        seqLog(`⚠ Cover close error: ${err.message} — verify manually`, "warn");
+      }
+      try {
+        await stepParkMount(ninaConfig);
+      } catch (err) {
+        seqLog(`⚠ Park failed: ${err.message} — verify mount is safe`, "warn");
+      }
     }
     seqLog("=== Sequence complete ===");
 
@@ -4527,6 +4666,11 @@ async function runTooSequence(ninaConfig, alertData, seqConfig) {
     }
     seqLog(mosaicMsg);
 
+    if (!(await stepGuiderPreflight(ninaConfig))) {
+      seqLog("  ToO aborted — PHD2 not connected", "error");
+      return;
+    }
+
     const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
     const availFilters = equipmentInfo?.FilterWheel?.AvailableFilters || [];
 
@@ -4860,7 +5004,23 @@ app.get("/api/sequence/daily-reset/info", (req, res) => {
   res.json({ success: true, resetHour: hour, alertTargets, manualTargets });
 });
 
-app.post("/api/sequence/run", (req, res) => {
+/**
+ * POST /api/sequence/morning-shutdown
+ * Manually trigger the morning shutdown routine (tracking off → close cover → park).
+ * Use this to test the routine at any time without waiting until morning_park_hour.
+ * Safe to call when idle; skips if a sequence is running.
+ */
+app.post("/api/sequence/morning-shutdown", async (req, res) => {
+  const reason = String(req.body?.reason || "manual trigger");
+  try {
+    const results = await runMorningShutdown(reason);
+    res.json({ success: true, reason, results });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/sequence/run", async (req, res) => {
   if (seqState.running) {
     return res.status(409).json({ success: false, error: "Sequence already running" });
   }
@@ -4872,6 +5032,16 @@ app.post("/api/sequence/run", (req, res) => {
   let ninaConfig;
   try { ninaConfig = normalizeTargetConfig(req.body); }
   catch (err) { return res.status(400).json({ success: false, error: err.message }); }
+
+  try {
+    await assertGuiderReady(ninaConfig);
+  } catch (err) {
+    return res.status(400).json({
+      success: false,
+      error: err.message,
+      code: err.code || "GUIDER_NOT_CONNECTED",
+    });
+  }
 
   const seqConfig = {
     duration:       Number(req.body?.duration)       || 120,
