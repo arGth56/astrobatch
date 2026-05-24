@@ -1983,7 +1983,16 @@ async function runMorningShutdown(reason = "morning cutoff") {
     results.tracking = `failed: ${e.message}`;
   }
 
-  // 2. Close dust cover
+  // 2. Warm camera to ambient
+  try {
+    await stepWarmCamera(cfg);
+    results.camera = "warmed";
+  } catch (e) {
+    seqLog(`  Camera warm-up failed: ${e.message}`, "warn");
+    results.camera = `failed: ${e.message}`;
+  }
+
+  // 4. Close dust cover
   try {
     const confirmed = await stepCloseCover(cfg, { strict: false });
     seqLog(confirmed ? "  Dust cover closed ✓" : "  ⚠ Dust cover close unconfirmed — verify manually", confirmed ? "info" : "warn");
@@ -1993,7 +2002,7 @@ async function runMorningShutdown(reason = "morning cutoff") {
     results.cover = `failed: ${e.message}`;
   }
 
-  // 3. Check if already parked before issuing park command
+  // 5. Check if already parked before issuing park command
   try {
     const { equipmentInfo } = await getEquipmentInfo(cfg);
     if (equipmentInfo?.Mount?.AtPark === true) {
@@ -2261,6 +2270,69 @@ async function stepCoolCamera(target, targetTempC = -5) {
     10000,
   );
   seqLog(`Camera cooled to ${targetTempC}°C ✓`);
+}
+
+/**
+ * Gently warm the camera back to near-ambient before shutdown.
+ * Ramps the setpoint up over `rampMin` minutes then disables the cooler.
+ * Safe to call even if the camera is not connected (skips silently).
+ */
+async function stepWarmCamera(target, { rampMin = 5, timeoutMin = 15 } = {}) {
+  seqState.currentStep = "Warming camera to ambient...";
+  let camera;
+  try {
+    const { equipmentInfo } = await getEquipmentInfo(target);
+    camera = equipmentInfo?.Camera;
+  } catch { /* NINA unreachable — skip */ }
+
+  if (!camera?.Connected) {
+    seqLog("Camera not connected — skipping warm-up");
+    return;
+  }
+
+  const currentTemp = Number(camera.Temperature);
+  seqLog(`Warming camera (currently ${currentTemp.toFixed(1)}°C) — ramp ${rampMin} min then cooler off...`);
+
+  // Ask NINA to ramp to +20 °C over rampMin minutes (well above any ambient)
+  try {
+    await callNinaLong(target, "/v2/api/equipment/camera/cool", {
+      temperature: 20,
+      minutes: rampMin,
+    }, 15000);
+  } catch (e) {
+    seqLog(`  Warm-up ramp command failed: ${e.message} — trying cooler off directly`, "warn");
+  }
+
+  // Poll until temperature rises above currentTemp+3 °C or timeout, then turn cooler off
+  const deadline = Date.now() + timeoutMin * 60 * 1000;
+  const warmTarget = currentTemp + 3;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 15000));
+    try {
+      const { equipmentInfo } = await getEquipmentInfo(target);
+      const t = Number(equipmentInfo?.Camera?.Temperature);
+      seqState.currentStep = `Warming: ${t.toFixed(1)}°C`;
+      if (t >= warmTarget) break;
+    } catch { break; }
+  }
+
+  // Disable TEC
+  try {
+    await callNinaLong(target, "/v2/api/equipment/camera/cool", {
+      temperature: 20,
+      minutes: 0,
+      coolerOn: false,
+    }, 15000);
+    seqLog("  Camera cooler OFF ✓");
+  } catch (e) {
+    seqLog(`  Cooler-off command failed: ${e.message}`, "warn");
+  }
+
+  try {
+    const { equipmentInfo } = await getEquipmentInfo(target);
+    const finalTemp = Number(equipmentInfo?.Camera?.Temperature);
+    seqLog(`  Camera warm-up complete — ${finalTemp.toFixed(1)}°C ✓`);
+  } catch { /* ignore */ }
 }
 
 /**
@@ -4314,11 +4386,12 @@ async function runSequence(ninaConfig, seqConfig) {
 
     if (_stayAlertReady) {
       seqLog("Queue done — staying in alert-ready posture (home, tracking off, cover open)");
-      seqLog("  Automated morning shutdown will close cover + park at " +
+      seqLog("  Automated morning shutdown will warm camera, close cover + park at " +
              `${_morningHour}:00 local (or on bad weather).`, "warn");
-      // Alert-Ready flag stays armed; morning shutdown handles final close/park
+      // Alert-Ready flag stays armed; morning shutdown handles final warm/close/park
     } else {
       if (!_beforeCutoff) seqLog(`Past morning cutoff (${_morningHour}:00) — running full shutdown`);
+      await stepWarmCamera(ninaConfig);
       try {
         const confirmed = await stepCloseCover(ninaConfig, { strict: false });
         if (!confirmed) seqLog("⚠ Verify dust cover is closed before leaving!", "warn");
@@ -4342,6 +4415,7 @@ async function runSequence(ninaConfig, seqConfig) {
       seqState.error = err.message;
       // Error teardown only (not user abort)
       try { await safeHome(); } catch { /* ignore */ }
+      try { await stepWarmCamera(ninaConfig); } catch { /* ignore */ }
       try { await stepCloseCover(ninaConfig, { strict: false }); } catch { /* ignore */ }
       try { await stepParkMount(ninaConfig); } catch { /* ignore */ }
     }
