@@ -1,0 +1,9 @@
+[Unit]
+Description=Run AstroBatch light-curve generation daily at noon
+
+[Timer]
+OnCalendar=*-*-* 12:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

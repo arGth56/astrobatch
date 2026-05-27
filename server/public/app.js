@@ -2593,6 +2593,8 @@ const JOB_STATUS_STEPS = {
 
 // ── NAS date / target picker ──────────────────────────────────────────────────
 
+const _nasTargetCache = {};   // date → targets array, so re-selecting a date skips the scan
+
 async function loadNasDates() {
   const dateSel    = document.getElementById("pipeline-date-select");
   const targetSel  = document.getElementById("pipeline-target-select");
@@ -2624,38 +2626,13 @@ async function loadNasDates() {
   }
   dateSel.disabled = false;
 
-  // ── Step 2: when a night is chosen, scan that folder for targets ──────────
-  dateSel.addEventListener("change", async () => {
-    const date = dateSel.value;
-    targetSel.innerHTML = '<option value="">⏳ Scanning night…</option>';
-    targetSel.style.display = "";
-    targetSel.disabled = true;
-    fitsInput.value = "";
-
-    if (!date) {
-      targetSel.style.display = "none";
-      targetSel.disabled = false;
-      return;
-    }
-
-    let targets = [];
-    try {
-      const res  = await fetch(`/api/pipeline/nas-dates/${date}`);
-      const data = await res.json();
-      targets = data.targets || [];
-    } catch {
-      targetSel.innerHTML = '<option value="">Scan failed</option>';
-      targetSel.disabled = false;
-      return;
-    }
-
+  function populateTargets(targets) {
     targetSel.innerHTML = '<option value="">— pick a target —</option>';
     if (!targets.length) {
       targetSel.innerHTML = '<option value="">No FITS data found</option>';
       targetSel.disabled = false;
       return;
     }
-
     const hasRealTargets = targets.some((t) => t.name !== "SNAPSHOT");
     for (const t of targets) {
       if (t.name === "SNAPSHOT" && hasRealTargets) continue;
@@ -2674,6 +2651,43 @@ async function loadNasDates() {
       fitsInput.value = targets[0].path;
       if (targets[0].name !== "SNAPSHOT") targetInput.value = targets[0].name;
     }
+  }
+
+  // ── Step 2: when a night is chosen, scan that folder for targets ──────────
+  dateSel.addEventListener("change", async () => {
+    const date = dateSel.value;
+    fitsInput.value = "";
+
+    if (!date) {
+      targetSel.style.display = "none";
+      targetSel.disabled = false;
+      return;
+    }
+
+    targetSel.style.display = "";
+
+    // Use cached result if available (avoids re-scanning after queuing a job)
+    if (_nasTargetCache[date]) {
+      populateTargets(_nasTargetCache[date]);
+      return;
+    }
+
+    targetSel.innerHTML = '<option value="">⏳ Scanning night…</option>';
+    targetSel.disabled = true;
+
+    let targets = [];
+    try {
+      const res  = await fetch(`/api/pipeline/nas-dates/${date}`);
+      const data = await res.json();
+      targets = data.targets || [];
+      _nasTargetCache[date] = targets;   // cache for this session
+    } catch {
+      targetSel.innerHTML = '<option value="">Scan failed</option>';
+      targetSel.disabled = false;
+      return;
+    }
+
+    populateTargets(targets);
   });
 
   // ── Step 3: when a target is chosen, fill in the path/name fields ─────────
@@ -2873,6 +2887,7 @@ const _photCache = {};
 const PIPELINE_STEPS = [
   { key: "calibrate",   label: "Calibrate & Stack",  statuses: ["calibrating"] },
   { key: "solve",       label: "Plate Solve",         statuses: ["solving"] },
+  { key: "mpc_check",   label: "MPC Check",           statuses: [] },
   { key: "upload",      label: "Upload to STDWeb",    statuses: ["uploading", "uploaded"] },
   { key: "inspect",     label: "Inspect",             statuses: ["inspecting"] },
   { key: "photometry",  label: "Photometry",          statuses: ["photometry"] },
@@ -2926,6 +2941,13 @@ function _getStepState(step, result) {
   const curIdx  = STATUS_ORDER.indexOf(result.status);
   const stepIdx = Math.max(...step.statuses.map(s => STATUS_ORDER.indexOf(s)));
   const isActive = step.statuses.includes(result.status);
+  // mpc_check has no status of its own — mark done when mpc_objects is set,
+  // or when the pipeline has advanced past "solving" (upload or later)
+  if (step.key === "mpc_check") {
+    const pastSolve = curIdx >= STATUS_ORDER.indexOf("uploading");
+    const ran = result.mpc_objects != null;
+    return { isDone: ran || pastSolve, isActive: false, isError: false };
+  }
   const isDone   = !isActive && curIdx > stepIdx;
   return { isDone, isActive, isError: false };
 }
@@ -3071,6 +3093,11 @@ function renderPipelineJobs(jobs) {
     Array.from(tbody.querySelectorAll("tr[data-steps-for]"))
       .filter(r => r.style.display !== "none")
       .map(r => r.dataset.stepsFor)
+  );
+  const openMpcRows = new Set(
+    Array.from(tbody.querySelectorAll("tr[data-mpc-for]"))
+      .filter(r => r.style.display !== "none")
+      .map(r => r.dataset.mpcFor)
   );
   // Map: resultId → Set of source paths that are UNCHECKED
   const uncheckedSources = {};
@@ -3219,6 +3246,21 @@ function renderPipelineJobs(jobs) {
            </a>` : "";
       const fitsBtn = stackDownload + previewThumb;
 
+      // MPC asteroid badge — shown when SkyBoT found objects in the field
+      let mpcObjects = [];
+      try { mpcObjects = r.mpc_objects ? JSON.parse(r.mpc_objects) : []; } catch { /* ignore */ }
+      const nNeo = mpcObjects.filter(o => {
+        const cls = (o.class || "").toUpperCase().replace(/[>\s]/g, "");
+        return ["AMOR","APOLLO","ATEN","IEO","AMO","APO","ATE","NEA","NEO"].some(c => cls.includes(c));
+      }).length;
+      const mpcBadge = mpcObjects.length > 0
+        ? `<button class="btn-small btn-mpc-toggle" data-result-id="${r.id}"
+                   style="margin-left:4px;color:${nNeo > 0 ? '#ff9500' : '#00e5ff'};
+                          border-color:${nNeo > 0 ? '#7c3f00' : '#004d5c'};" type="button"
+                   title="Solar system objects in field (SkyBoT)">
+             &#x25CE; ${mpcObjects.length}${nNeo > 0 ? ' (' + nNeo + ' NEO)' : ''}
+           </button>` : "";
+
       const rtr = document.createElement("tr");
       rtr.dataset.resultId = r.id;
       rtr.style.background = "#0d1929";
@@ -3232,7 +3274,7 @@ function renderPipelineJobs(jobs) {
         </td>
         <td></td>
         <td><span class="job-status ${rcls}"${retitle} style="font-size:11px;">${rlabel}</span></td>
-        <td>${link}${framesBtn}${photBtn}${fitsBtn}</td>
+        <td>${link}${framesBtn}${photBtn}${fitsBtn}${mpcBadge}</td>
         <td></td>
       `;
       tbody.appendChild(rtr);
@@ -3265,6 +3307,71 @@ function renderPipelineJobs(jobs) {
         photRow.style.display = "";
         const toggle = tbody.querySelector(`.btn-phot-toggle[data-result-id="${r.id}"]`);
         if (toggle) toggle.style.opacity = "1";
+      }
+
+      // MPC asteroid row (hidden until badge clicked)
+      if (mpcObjects.length > 0) {
+        const mpcRow = document.createElement("tr");
+        mpcRow.dataset.mpcFor = r.id;
+        mpcRow.style.cssText = "background:#040d18;display:none;";
+
+        const mpcPreviewHtml = r.mpc_preview_url
+          ? `<div style="display:flex;gap:12px;align-items:flex-start;">
+               <div>
+                 <div style="font-size:11px;color:#6b7280;margin-bottom:4px;">Annotated preview</div>
+                 <a href="${r.mpc_preview_url}" target="_blank">
+                   <img src="${r.mpc_preview_url}" alt="MPC preview"
+                        style="max-height:260px;max-width:480px;border-radius:4px;
+                               border:1px solid #1e3a5f;display:block;" />
+                 </a>
+               </div>
+               <div style="min-width:220px;">{TABLE}</div>
+             </div>`
+          : `<div>{TABLE}</div>`;
+
+        const tableRows = mpcObjects.map(o => {
+          const isNeo = ["AMOR","APOLLO","ATEN","IEO","AMO","APO","ATE","NEA","NEO"]
+            .some(c => (o.class||"").toUpperCase().replace(/[>\s]/g,"").includes(c));
+          const magStr = o.mag != null ? o.mag.toFixed(1) : "—";
+          const uncStr = o.uncertainty_arcsec != null ? o.uncertainty_arcsec.toFixed(0) + '"' : "—";
+          const nameColor = isNeo ? "#ff9500" : "#00e5ff";
+          const tag = isNeo
+            ? `<span style="color:#ff9500;font-size:10px;border:1px solid #7c3f00;
+                            border-radius:3px;padding:0 3px;margin-left:4px;">NEO</span>` : "";
+          return `<tr style="border-bottom:1px solid #0d2040;">
+            <td style="padding:3px 6px;color:${nameColor};font-weight:${isNeo?'bold':'normal'};">${o.name}${tag}</td>
+            <td style="padding:3px 6px;color:#6b7280;font-size:11px;">${o.class || "?"}</td>
+            <td style="padding:3px 6px;color:#9ca3af;font-size:11px;">V=${magStr}</td>
+            <td style="padding:3px 6px;color:#6b7280;font-size:11px;">±${uncStr}</td>
+          </tr>`;
+        }).join("");
+
+        const tableHtml = `<table style="border-collapse:collapse;font-size:12px;width:100%;">
+          <thead>
+            <tr style="color:#4b5563;font-size:10px;border-bottom:1px solid #1e3a5f;">
+              <th style="padding:2px 6px;text-align:left;">Object</th>
+              <th style="padding:2px 6px;text-align:left;">Type</th>
+              <th style="padding:2px 6px;text-align:left;">Mag</th>
+              <th style="padding:2px 6px;text-align:left;">Uncert.</th>
+            </tr>
+          </thead>
+          <tbody>${tableRows}</tbody>
+        </table>`;
+
+        mpcRow.innerHTML = `<td colspan="6" style="padding:6px 16px 12px 36px;">
+          <div style="font-size:11px;color:#6b7280;margin-bottom:6px;">
+            Solar system objects in field (SkyBoT) — ${mpcObjects.length} object(s)
+          </div>
+          ${mpcPreviewHtml.replace("{TABLE}", tableHtml)}
+        </td>`;
+        tbody.appendChild(mpcRow);
+
+        // Restore open state after re-render
+        if (openMpcRows.has(String(r.id))) {
+          mpcRow.style.display = "";
+          const badge = rtr.querySelector(`.btn-mpc-toggle[data-result-id="${r.id}"]`);
+          if (badge) badge.style.opacity = "1";
+        }
       }
 
       // Hidden frame preview row — checkboxes + re-process button
@@ -3420,6 +3527,18 @@ function renderPipelineJobs(jobs) {
       _renderPhotRow(photRow, _photCache[taskId], resultObj);
       photRow.style.display = "";
       btn.style.opacity = "1";
+    });
+  }
+
+  // ── MPC asteroid badge toggle ─────────────────────────────────────────────
+  for (const btn of tbody.querySelectorAll(".btn-mpc-toggle")) {
+    btn.addEventListener("click", () => {
+      const rid = btn.dataset.resultId;
+      const row = tbody.querySelector(`tr[data-mpc-for="${rid}"]`);
+      if (!row) return;
+      const hidden = row.style.display === "none";
+      row.style.display = hidden ? "" : "none";
+      btn.style.opacity = hidden ? "1" : "0.5";
     });
   }
 
@@ -3617,8 +3736,11 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
       refine_wcs: !!refineWcsCb?.checked,
     });
     setLog(result);
+    // Keep the date + target list in place so the next target can be queued
+    // immediately without re-scanning — just reset the target selection fields.
     document.getElementById("pipeline-target").value = "";
-    document.getElementById("pipeline-date-select").value = "";
+    if (targetSel) targetSel.value = "";
+    document.getElementById("pipeline-fits-dir").value = "";
     loadPipelineJobs();
   } catch (err) {
     setLog({ success: false, error: err.message });

@@ -56,7 +56,37 @@ NIGHTMANAGER_DB (Python):   /home/pyl/Documents/astrobatch/nightmanager.db
 
 ## Systemd Services
 
-Two service unit files are included in the repo root.
+Four service/unit files are included in the repo root (or `server/`).
+
+### `mnt-astropc.mount` + `mnt-astropc.automount` — NINA PC share
+
+Mounts `//192.168.1.174/d` (NINA PC D: USB drive) at `/mnt/astropc`.
+The automount unit keeps it permanently mounted and **reconnects automatically** whenever the Windows PC reboots or the network recovers.
+
+Credentials file: `/etc/astropc/credentials` (root-owned, mode 600):
+```
+username=pyl
+password=
+```
+
+**One-time install** (run from repo root):
+```bash
+sudo bash server/setup-astro-sync.sh
+```
+
+This creates the credentials file, installs the units, enables them, and starts everything. After this the mount and sync survive every reboot automatically.
+
+### `astro-sync.service` — FITS sync (NINA PC → NAS)
+
+Runs `server/astro-sync.sh` continuously. Polls every 5 s; syncs the two most recent date folders on fast cycles and the full D: tree once per hour.
+
+| Path | Role |
+|------|------|
+| Source | `/mnt/astropc/` (NINA PC, `//192.168.1.174/d`) |
+| Destination | `/mnt/nas/input/pyl/astro/input/` |
+| Log | `server/logs/astro-sync.log` |
+
+Live log: `journalctl -fu astro-sync.service`
 
 ### `nina-control.service` — Night Manager
 
@@ -109,6 +139,29 @@ sudo systemctl daemon-reload
 sudo systemctl enable nina-control astrobatch-processing
 sudo systemctl start nina-control astrobatch-processing
 ```
+
+### `astrobatch-lightcurves.timer` — daily light curves (noon)
+
+Builds aperture and subtraction PNGs for every target with `pipeline_results` updated in the last 24 hours.
+
+```bash
+sudo cp astrobatch-lightcurves.service astrobatch-lightcurves.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now astrobatch-lightcurves.timer
+# manual run:
+systemctl start astrobatch-lightcurves.service
+```
+
+Output: `data/lightcurves/YYYY-MM-DD/{target}_aperture.png` and `{target}_subtraction.png`, plus `index.json`.
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `NIGHTMANAGER_DB` | `nightmanager.db` | Same DB as processing service |
+| `LIGHTCURVE_OUTPUT` | `data/lightcurves` | Root directory for dated folders |
+| `NOTION_TOKEN` | (unset) | Notion integration secret — set in `config/notion.env` |
+| `NOTION_LIGHTCURVES_PAGE_ID` | `36c8e68e17a880f6a89be6ab3731d873` | Parent page ([Lightcurves](https://www.notion.so/bretagne-sud-observatory/Lightcurves-36c8e68e17a880f6a89be6ab3731d873)) |
+
+**Notion setup:** copy `config/notion.env.example` → `config/notion.env`, paste your integration token, then in Notion open the Lightcurves page → **⋯** → **Connections** → add the integration. Each noon run creates a dated sub-page with embedded PNGs.
 
 ---
 

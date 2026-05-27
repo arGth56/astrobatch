@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount NINA PC D: drive (//192.168.1.174/d) via CIFS
+Documentation=https://github.com/pyl/astrobatch
+After=network-online.target
+Wants=network-online.target
+
+[Mount]
+What=//192.168.1.174/d
+Where=/mnt/astropc
+Type=cifs
+Options=credentials=/etc/astropc/credentials,uid=pyl,gid=pyl,file_mode=0755,dir_mode=0755,iocharset=utf8,soft,vers=3.0,_netdev,nofail
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=AstroBatch daily light-curve generation
+After=network.target
+
+[Service]
+Type=oneshot
+User=pyl
+WorkingDirectory=/home/pyl/Documents/astrobatch
+ExecStart=/home/pyl/Documents/astrobatch/.venv/bin/python3 tools/generate_daily_lightcurves.py
+Environment=NIGHTMANAGER_DB=/home/pyl/Documents/astrobatch/nightmanager.db
+Environment=LIGHTCURVE_OUTPUT=/home/pyl/Documents/astrobatch/data/lightcurves
+EnvironmentFile=-/home/pyl/Documents/astrobatch/config/notion.env
+Environment=NOTION_LIGHTCURVES_PAGE_ID=36c8e68e17a880f6a89be6ab3731d873
+
+StandardOutput=append:/var/log/astrobatch-lightcurves.log
+StandardError=append:/var/log/astrobatch-lightcurves.log

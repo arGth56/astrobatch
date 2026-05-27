@@ -53,11 +53,16 @@ STDWEB_URL   = os.environ.get("STDWEB_URL",   "http://86.253.141.183:7000")
 STDWEB_TOKEN = os.environ.get("STDWEB_TOKEN", "")
 SIRIL_BIN    = os.environ.get("SIRIL_BIN",    "siril")
 
-# IMX533 @ NINA gain=10 → ~2.8 e/ADU (14-bit ADC, scaled ×4 to 16-bit by NINA,
-# then Siril normalises to [0,1] by dividing by 65535).
-# Effective gain for STDWeb = real_gain × 2^14 = 2.8 × 16384 ≈ 45875
-# Override with STDWEB_GAIN env var if camera/gain changes.
-STDWEB_GAIN  = int(os.environ.get("STDWEB_GAIN", str(int(2.8 * 16384))))
+# IMX533 @ NINA gain=10 → ~2.8 e/ADU  (14-bit ADC, scaled ×4 to 16-bit by NINA).
+# After rescale_siril_to_adu() restores the 14-bit ADU scale, the gain passed to
+# STDWeb is the real physical gain.  Override with STDWEB_GAIN env var if needed.
+STDWEB_GAIN  = float(os.environ.get("STDWEB_GAIN", "2.8"))
+
+# Siril's calibration pipeline always normalises pixels to [0, 1] by dividing by
+# 65535.  NINA's IMX533 uses a 14-bit ADC and stores values as 16-bit ints by
+# multiplying by 4, so the inverse scale factor to recover 14-bit ADU is:
+#   14-bit ADU = siril_float × (65535 / 4)
+_SIRIL_TO_ADU = 65535.0 / 4.0   # ≈ 16383.75
 
 # ── Filter name → flat lookup key mapping ─────────────────────────────────────
 # Maps NINA filter name → key in astrobatch calib/flats/ discovery dict.
@@ -326,13 +331,27 @@ class JobLogger:
 
 # ── Calibration frame discovery ───────────────────────────────────────────────
 
+def _register_dark(darks: dict[str, str], exp: str, path: Path) -> None:
+    """Prefer dark_{exp}s.fit over suffixed names like dark_{exp}s_gain10_temp-5.fit."""
+    prev = darks.get(exp)
+    if prev is None:
+        darks[exp] = str(path)
+        return
+    exact = lambda pth: Path(pth).name.lower() == f"dark_{exp}s.fit"
+    if exact(path) and not exact(prev):
+        darks[exp] = str(path)
+    elif not exact(prev) and not exact(path) and path.stat().st_mtime > Path(prev).stat().st_mtime:
+        darks[exp] = str(path)
+
+
 def discover_cal_frames() -> tuple[dict, dict]:
     """Return (darks, flats) dicts: exposure_str → path, filter_key → path."""
     darks: dict[str, str] = {}
-    for p in (CALIB_DIR / "darks").glob("dark_*s.fit"):
-        m = re.match(r"dark_(\d+)s\.fit", p.name, re.IGNORECASE)
+    _dark_re = re.compile(r"dark_(\d+)s(?:\.fit|_.+\.fit)$", re.IGNORECASE)
+    for p in (CALIB_DIR / "darks").glob("dark_*.fit"):
+        m = _dark_re.match(p.name)
         if m:
-            darks[m.group(1)] = str(p)
+            _register_dark(darks, m.group(1), p)
 
     flats: dict[str, str] = {}
     for p in (CALIB_DIR / "flats").glob("flat_*.fit"):
@@ -734,7 +753,15 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
             cal_cmd += f" -flat={flat_arg}"
         if dark_arg:
             cal_cmd += f" -dark={dark_arg}"
-        stack_filters = "" if skip_quality_filters else " -filter-fwhm=80% -filter-round=80%"
+        # FWHM/roundness percentile filters need several frames; with 2 inputs
+        # they often keep only one image ("at least two images" stack error).
+        use_stack_filters = (
+            not skip_quality_filters
+            and n_images >= 3
+        )
+        if not use_stack_filters and not skip_quality_filters and n_images < 3:
+            jlog.info(f"  Skipping stack quality filters ({n_images} frame{'s' if n_images != 1 else ''} — need ≥3 for FWHM/round cuts)")
+        stack_filters = " -filter-fwhm=80% -filter-round=80%" if use_stack_filters else ""
         lines = [
             "requires 1.2.0", f'cd "{folder}"', "convert i -out=.",
             cal_cmd,
@@ -824,6 +851,37 @@ def run_siril(folder: Path, flat_path: str | None, dark_path: str | None,
 
     jlog.info(f"  res.fit created ({res.stat().st_size / 1_048_576:.1f} MB)")
     return True, []
+
+
+def rescale_siril_to_adu(res_fit: Path, jlog: JobLogger) -> None:
+    """
+    Siril normalises all calibrated frames to float32 [0, 1] by dividing by 65535.
+    This function rescales res.fit back to 14-bit ADU units (float32, 0–16384) so
+    that downstream noise/SNR estimation and STDWeb photometry use physically
+    meaningful pixel values and the real gain (2.8 e/ADU) without any fudge factor.
+
+    Idempotent: if the header already has BUNIT='ADU' the rescale is skipped.
+    """
+    import numpy as np
+    from astropy.io import fits as _afits
+
+    try:
+        with _afits.open(str(res_fit), mode="update") as hdul:
+            hdr = hdul[0].header
+            if hdr.get("BUNIT") == "ADU":
+                jlog.info("  rescale_siril_to_adu: already in ADU — skipped")
+                return
+            data = hdul[0].data
+            if data is None:
+                jlog.info("  rescale_siril_to_adu: no data in primary HDU — skipped")
+                return
+            hdul[0].data = (data * _SIRIL_TO_ADU).astype(np.float32)
+            hdr["BUNIT"]   = ("ADU",    "14-bit ADU (Siril [0,1] rescaled by 65535/4)")
+            hdr["BZERO"]   = 0.0
+            hdr["BSCALE"]  = 1.0
+        jlog.info(f"  res.fit rescaled to 14-bit ADU (×{_SIRIL_TO_ADU:.2f})")
+    except Exception as exc:
+        jlog.info(f"  ⚠️  rescale_siril_to_adu failed: {exc} — continuing with [0,1] scale")
 
 
 def make_preview(fits_path: Path, jlog: JobLogger) -> Path | None:
@@ -1127,7 +1185,7 @@ def run_pipeline(job_id: int, fits_dir: str, target: str,
 
 
 # Steps in order; used by resume to skip already-done work
-PIPELINE_STEP_ORDER = ["calibrate", "solve", "upload", "inspect", "photometry", "subtraction"]
+PIPELINE_STEP_ORDER = ["calibrate", "solve", "mpc_check", "upload", "inspect", "photometry", "subtraction"]
 
 
 def resume_pipeline(result_id: int, from_step: str):
@@ -1226,6 +1284,7 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
             return
 
         res_fit = work_dir / "res.fit"
+        rescale_siril_to_adu(res_fit, jlog)
         make_preview(res_fit, jlog)
         from_step = "solve"
         step_idx  = PIPELINE_STEP_ORDER.index("solve")
@@ -1246,6 +1305,16 @@ def _resume_pipeline(result: dict, job: dict, from_step: str, jlog: JobLogger):
         solve_ok = plate_solve(res_fit, jlog)
         if not solve_ok:
             jlog.info("  Plate solve failed — continuing without WCS")
+        from_step = "mpc_check"
+        step_idx  = PIPELINE_STEP_ORDER.index("mpc_check")
+
+    # ── mpc_check ─────────────────────────────────────────────────────────────
+    if step_idx <= PIPELINE_STEP_ORDER.index("mpc_check"):
+        try:
+            from astrobatch.mpc_checker import run_mpc_check as _run_mpc_check
+            _run_mpc_check(work_dir, res_fit, result_id, DB_PATH, jlog)
+        except Exception as _mpc_exc:
+            jlog.info(f"  MPC check failed (non-fatal): {_mpc_exc}")
         from_step = "upload"
         step_idx  = PIPELINE_STEP_ORDER.index("upload")
 
@@ -1602,6 +1671,7 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
             continue
 
         res_fit = work_dir / "res.fit"
+        rescale_siril_to_adu(res_fit, jlog)
         make_preview(res_fit, jlog)
 
         # ── Step 4: Plate solve ───────────────────────────────────────────────
@@ -1611,6 +1681,13 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
         solve_ok = plate_solve(res_fit, jlog)
         if not solve_ok:
             jlog.info("  Plate solve failed — continuing without WCS")
+
+        # ── Step 4b: MPC asteroid check ───────────────────────────────────────
+        try:
+            from astrobatch.mpc_checker import run_mpc_check as _run_mpc_check
+            _run_mpc_check(work_dir, res_fit, result_id, DB_PATH, jlog)
+        except Exception as _mpc_exc:
+            jlog.info(f"  MPC check failed (non-fatal): {_mpc_exc}")
 
         # ── Step 5: Upload to STDWeb ──────────────────────────────────────────
         update_job(job_id, "uploading")

@@ -279,6 +279,8 @@ try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_ap REAL").run()
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN magerr_sub REAL").run(); } catch { /* already exists */ }
 try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mag_sub_ul REAL").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mpc_objects TEXT").run(); } catch { /* already exists */ }
+try { db.prepare("ALTER TABLE pipeline_results ADD COLUMN mpc_preview TEXT").run(); } catch { /* already exists */ }
 db.exec(`
   CREATE TABLE IF NOT EXISTS ocs_history (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6180,6 +6182,10 @@ app.get("/api/pipeline/jobs", (req, res) => {
         if (!r.preview_url && fs.existsSync(c.previewPath)) r.preview_url = c.previewUrl;
         if (r.stack_url && r.preview_url) break;
       }
+      // MPC annotated preview — stored as absolute path in DB
+      if (r.mpc_preview && fs.existsSync(r.mpc_preview)) {
+        r.mpc_preview_url = `/api/pipeline/result/${r.id}/mpc-preview`;
+      }
     }
   }
   res.json({ success: true, jobs });
@@ -6218,6 +6224,14 @@ app.get("/api/pipeline/result/:id/download", (req, res) => {
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.setHeader("Content-Type", "application/fits");
   res.sendFile(path.resolve(fitsPath));
+});
+
+app.get("/api/pipeline/result/:id/mpc-preview", (req, res) => {
+  const row = db.prepare("SELECT mpc_preview FROM pipeline_results WHERE id=?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "Result not found" });
+  if (!row.mpc_preview) return res.status(404).json({ error: "No MPC preview for this result" });
+  if (!fs.existsSync(row.mpc_preview)) return res.status(404).json({ error: "MPC preview file missing on disk" });
+  res.sendFile(path.resolve(row.mpc_preview));
 });
 
 app.post("/api/pipeline/trigger", async (req, res) => {
@@ -6295,7 +6309,7 @@ app.post("/api/pipeline/results/:id/retry-step", async (req, res) => {
   if (!result) return res.status(404).json({ success: false, error: "Result not found" });
 
   const step = req.body?.step;
-  const VALID_STEPS = ["calibrate", "solve", "upload", "inspect", "photometry", "subtraction"];
+  const VALID_STEPS = ["calibrate", "solve", "mpc_check", "upload", "inspect", "photometry", "subtraction"];
   if (!VALID_STEPS.includes(step)) {
     return res.status(400).json({ success: false, error: `Unknown step: ${step}. Valid: ${VALID_STEPS.join(", ")}` });
   }
@@ -6388,10 +6402,10 @@ function snapshotTargets(folderPath) {
   try {
     const SKIP_OBJECTS = new Set(["snapshot", "dark", "flat", "bias", "test_target",
                                    "test_target_v2", "test", "unknown", "none", ""]);
-    const MAX_FILES    = 200;  // hard cap — covers long nights with many targets
-    const STABLE_STREAK = 30; // only stop early if we haven't found a NEW target in 30 files
-                               // AND we already have at least 2 distinct targets (avoids
-                               // breaking out early when the first target has many frames)
+    const MAX_FILES    = 500;  // hard cap — covers long nights with many targets
+    const STABLE_STREAK = 150; // stop early only after 150 consecutive files with no new target,
+                                // and only once we have ≥2 distinct targets — 150 is safely larger
+                                // than the longest single-target block (120 frames in practice)
     const files = fs.readdirSync(folderPath).filter((f) => /\.(fit|fits)$/i.test(f));
     const seen = new Set();
     let streak = 0;

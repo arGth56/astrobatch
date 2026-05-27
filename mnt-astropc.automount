@@ -1,0 +1,12 @@
+[Unit]
+Description=Automount NINA PC D: drive — reconnects automatically on network recovery
+After=network-online.target
+Wants=network-online.target
+
+[Automount]
+Where=/mnt/astropc
+# TimeoutIdleSec=0 means never unmount while idle — keep the share always mounted
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=multi-user.target

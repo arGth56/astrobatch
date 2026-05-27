@@ -24,7 +24,7 @@ recent_date_dirs() {
 
 rsync_opts=(
   --archive
-  --update
+  --checksum          # compare by checksum, not just timestamp — catches partial/truncated files
   --human-readable
   --exclude 'System Volume Information'
   --exclude '.Trash*'
