@@ -962,6 +962,23 @@
             <span id="email-status" style="font-size:12px;color:#94a3b8;"></span>
           </div>
 
+          <!-- MPC / SkyBoT -->
+          <hr style="border-color:#1e293b;margin:18px 0;" />
+          <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">MPC / SkyBoT asteroid overlay</h3>
+          <p class="hint" style="margin-bottom:10px;">
+            Filter which solar system objects appear in the asteroid table and annotated preview.
+            Objects fainter than the limit are queried but hidden from the display.
+          </p>
+          <div class="inline-form" style="margin-bottom:8px;align-items:flex-end;gap:10px;">
+            <label title="Hide objects fainter than this V magnitude">Magnitude limit (V ≤)
+              <input id="mpc-mag-limit" type="number" min="10" max="30" step="0.5" value="21" style="width:72px;" autocomplete="off" />
+            </label>
+            <div class="buttons">
+              <button id="mpc-settings-save" type="button">Save</button>
+            </div>
+            <span id="mpc-settings-status" style="font-size:12px;color:#94a3b8;"></span>
+          </div>
+
           <!-- Telescope FOV (ToO mosaics) -->
           <hr style="border-color:#1e293b;margin:18px 0;" />
           <h3 style="font-size:14px;color:#93c5fd;margin:0 0 4px;">Telescope field of view</h3>

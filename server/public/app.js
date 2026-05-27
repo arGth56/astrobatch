@@ -927,6 +927,41 @@ tabSettingsBtn.addEventListener("click", () => {
   loadCoverDisabled();
   loadStdwebTokenStatus();
   loadEmailConfig();
+  loadMpcSettings();
+});
+
+// ── MPC / SkyBoT settings ─────────────────────────────────────────────────────
+async function loadMpcSettings() {
+  try {
+    const res = await fetch("/api/settings/mpc_mag_limit");
+    const d   = res.ok ? await res.json() : null;
+    const inp = document.getElementById("mpc-mag-limit");
+    if (d?.success && d.value != null) {
+      _mpcMagLimit = parseFloat(d.value) || 21;
+      if (inp) inp.value = _mpcMagLimit;
+    }
+  } catch {}
+}
+
+document.getElementById("mpc-settings-save")?.addEventListener("click", async () => {
+  const btn = document.getElementById("mpc-settings-save");
+  const st  = document.getElementById("mpc-settings-status");
+  const val = document.getElementById("mpc-mag-limit")?.value;
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "mpc_mag_limit", value: val }),
+    });
+    _mpcMagLimit = parseFloat(val) || 21;
+    if (st) { st.textContent = "Saved ✓"; st.style.color = "#86efac"; }
+  } catch (e) {
+    if (st) { st.textContent = "Error: " + e.message; st.style.color = "#fca5a5"; }
+  } finally {
+    btn.disabled = false; btn.textContent = "Save";
+    setTimeout(() => { if (st) st.textContent = ""; }, 3000);
+  }
 });
 
 async function loadCoverDisabled() {
@@ -2594,6 +2629,7 @@ const JOB_STATUS_STEPS = {
 // ── NAS date / target picker ──────────────────────────────────────────────────
 
 const _nasTargetCache = {};   // date → targets array, so re-selecting a date skips the scan
+let _mpcMagLimit = 21;        // default; overwritten by loadMpcSettings()
 
 async function loadNasDates() {
   const dateSel    = document.getElementById("pipeline-date-select");
@@ -3249,16 +3285,17 @@ function renderPipelineJobs(jobs) {
       // MPC asteroid badge — shown when SkyBoT found objects in the field
       let mpcObjects = [];
       try { mpcObjects = r.mpc_objects ? JSON.parse(r.mpc_objects) : []; } catch { /* ignore */ }
-      const nNeo = mpcObjects.filter(o => {
+      const mpcVisible = mpcObjects.filter(o => o.mag == null || o.mag <= _mpcMagLimit);
+      const nNeo = mpcVisible.filter(o => {
         const cls = (o.class || "").toUpperCase().replace(/[>\s]/g, "");
         return ["AMOR","APOLLO","ATEN","IEO","AMO","APO","ATE","NEA","NEO"].some(c => cls.includes(c));
       }).length;
-      const mpcBadge = mpcObjects.length > 0
+      const mpcBadge = mpcVisible.length > 0
         ? `<button class="btn-small btn-mpc-toggle" data-result-id="${r.id}"
                    style="margin-left:4px;color:${nNeo > 0 ? '#ff9500' : '#00e5ff'};
                           border-color:${nNeo > 0 ? '#7c3f00' : '#004d5c'};" type="button"
-                   title="Solar system objects in field (SkyBoT)">
-             &#x25CE; ${mpcObjects.length}${nNeo > 0 ? ' (' + nNeo + ' NEO)' : ''}
+                   title="Solar system objects in field (SkyBoT) — V ≤ ${_mpcMagLimit}">
+             &#x25CE; ${mpcVisible.length}${nNeo > 0 ? ' (' + nNeo + ' NEO)' : ''}
            </button>` : "";
 
       const rtr = document.createElement("tr");
@@ -3329,7 +3366,9 @@ function renderPipelineJobs(jobs) {
              </div>`
           : `<div>{TABLE}</div>`;
 
-        const tableRows = mpcObjects.map(o => {
+        const tableRows = [...mpcVisible]
+          .sort((a, b) => (a.mag ?? 99) - (b.mag ?? 99))
+          .map(o => {
           const isNeo = ["AMOR","APOLLO","ATEN","IEO","AMO","APO","ATE","NEA","NEO"]
             .some(c => (o.class||"").toUpperCase().replace(/[>\s]/g,"").includes(c));
           const magStr = o.mag != null ? o.mag.toFixed(1) : "—";
@@ -3360,7 +3399,7 @@ function renderPipelineJobs(jobs) {
 
         mpcRow.innerHTML = `<td colspan="6" style="padding:6px 16px 12px 36px;">
           <div style="font-size:11px;color:#6b7280;margin-bottom:6px;">
-            Solar system objects in field (SkyBoT) — ${mpcObjects.length} object(s)
+            Solar system objects in field (SkyBoT) — ${mpcVisible.length} object(s) shown (V ≤ ${_mpcMagLimit}${mpcObjects.length > mpcVisible.length ? ', ' + (mpcObjects.length - mpcVisible.length) + ' filtered' : ''})
           </div>
           ${mpcPreviewHtml.replace("{TABLE}", tableHtml)}
         </td>`;
