@@ -2097,6 +2097,7 @@ function renderSeqQueue(queue) {
     btn.addEventListener("click", async () => {
       await fetch(`/api/sequence/queue/${btn.dataset.idx}`, { method: "DELETE" });
       await refreshSeqState();
+      if (typeof refreshNightPlan === "function") refreshNightPlan();
     });
   }
 
@@ -2351,6 +2352,7 @@ async function addToQueue(target) {
       setLog(`Added "${target.fullName || target.name}" to observation queue`);
       setActiveTab("todo");
       await refreshSeqState();
+      if (typeof refreshNightPlan === "function") refreshNightPlan();
     } else {
       setLog({ success: false, error: result.error });
     }

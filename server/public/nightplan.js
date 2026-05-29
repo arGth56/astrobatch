@@ -1117,6 +1117,12 @@ function initNightPlan() {
     }, 200);
   });
 
+  // Auto-refresh every 60 s when the plan tab is active
+  setInterval(() => {
+    const panel = document.getElementById("panel-todo");
+    if (panel && panel.classList.contains("active")) refreshNightPlan();
+  }, 60_000);
+
   // ── Gantt drag-to-reschedule ──────────────────────────────────────────────
   const canvas = document.getElementById("nightplan-canvas");
 
