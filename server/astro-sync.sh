@@ -4,7 +4,7 @@
 
 SRC="/mnt/astropc/"
 DST="/mnt/nas/input/pyl/astro/input/"
-LOG="/home/pyl/Documents/astrobatch/server/logs/astro-sync.log"
+LOG="/var/www/astrobatch/server/logs/astro-sync.log"
 LOCKFILE="/tmp/astro-sync.lock"
 POLL_SEC=5
 RECENT_FOLDERS=2
