@@ -3587,6 +3587,12 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
       await new Promise(r => setTimeout(r, 20000));
     }
 
+    // Give NINA time to finish star detection after the file save.
+    // NINA computes image statistics asynchronously; when saving to a slow
+    // remote share the statistics endpoint can return stale zeros if polled
+    // immediately after the camera goes idle.
+    await new Promise(r => setTimeout(r, 5000));
+
     // ── Step A: Star count — fast cloud gate ─────────────────────────────
     // NINA already ran star detection; we just fetch the result.
     // If too few stars → clouds → discard frame, wait, retake.
@@ -3625,6 +3631,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
       await waitExposure(duration);
       checkAbort();
       try { await waitForCameraIdle(target, 120_000); } catch { await new Promise(r => setTimeout(r, 20_000)); }
+      await new Promise(r => setTimeout(r, 5000));
       await patchFitsFilterHeaders(retakeBefore, filter.Name);
       return await fetchLastImageStats(target);
     };
@@ -3692,6 +3699,21 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
     let imgStats  = await fetchLastImageStats(target);
     let retakes   = 0;
     let frameGood = true;   // set false only if we exhaust retakes
+
+    // If NINA reports 0 stars, retry the stats query a few times — the
+    // statistics endpoint can lag behind the actual image analysis when
+    // saving to a slow/remote path.
+    if (imgStats !== null && imgStats.stars < MIN_STARS && MIN_STARS > 0) {
+      for (let statRetry = 0; statRetry < 3; statRetry++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const retry = await fetchLastImageStats(target);
+        if (retry && retry.stars >= MIN_STARS) {
+          imgStats = retry;
+          break;
+        }
+        if (retry) imgStats = retry; // keep freshest value
+      }
+    }
 
     if (imgStats !== null && MIN_STARS > 0) {
       while (imgStats !== null && imgStats.stars < MIN_STARS && retakes < MAX_RETAKES) {
