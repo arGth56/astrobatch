@@ -39,6 +39,8 @@ CALIB_DIR    = PROJECT_ROOT / "calib"
 DATA_DIR     = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 LOG_DIR      = PROJECT_ROOT / "logs"
 NAS_OUTPUT   = Path(os.environ.get("NAS_OUTPUT", "/mnt/nas/input/pyl/astro/output"))
+NAS_ARCHIVE  = Path(os.environ.get("NAS_ARCHIVE", "/mnt/nas/input/pyl/astro"))
+NAS_INPUT    = Path(os.environ.get("NAS_INPUT", "/mnt/nas/input/pyl/astro/input"))
 DB_PATH      = Path(os.environ.get(
     "NIGHTMANAGER_DB",
     PROJECT_ROOT / "nightmanager.db"
@@ -511,49 +513,85 @@ def prepare_work_dir(target: str, filt: str, exp_str: str, date_str: str,
     return work_folder
 
 def finalise_work_dir(work_dir: Path, date_str: str, target: str,
-                      filt: str, jlog: JobLogger) -> Path | None:
+                      filt: str, jlog: JobLogger,
+                      source_files: list[Path] | None = None) -> Path | None:
     """
     After a successful pipeline run:
-      1. Move res.fit + res_preview.png to NAS_OUTPUT/<date>/<target>/<filter>/
-      2. Delete all Siril intermediary files (i_*, pp_i_*, r_pp_i_*, *.seq, *.ssf)
-         but keep the raw input .fits, _calib/, _previews/ subdirs intact.
-    Returns the NAS destination folder, or None if the move failed.
+      1. Move raw frames from NAS input → NAS archive: <date>/<target>/<filter>/raws/
+      2. Move res.fit + res_preview.png → same archive folder
+      3. Delete the entire USB processing work dir (all intermediaries + copied raws)
+    Returns the NAS archive folder, or None if the move failed.
     """
-    nas_dest = NAS_OUTPUT / date_str / target / filt
+    archive_dest = NAS_ARCHIVE / date_str / target / filt
+    raws_dest = archive_dest / "raws"
     try:
-        nas_dest.mkdir(parents=True, exist_ok=True)
+        archive_dest.mkdir(parents=True, exist_ok=True)
+        raws_dest.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        jlog.error(f"  Cannot create NAS output dir {nas_dest}: {exc}")
+        jlog.error(f"  Cannot create NAS archive dir {archive_dest}: {exc}")
         return None
 
-    # Move the two result files
-    moved = 0
+    # 1. Move raw frames from NAS input to archive
+    moved_raws = 0
+    if source_files:
+        for src in source_files:
+            if src.exists():
+                dst = raws_dest / src.name
+                try:
+                    shutil.move(str(src), str(dst))
+                    moved_raws += 1
+                except Exception as exc:
+                    jlog.error(f"  Cannot move raw {src.name}: {exc}")
+        jlog.info(f"  Moved {moved_raws} raw frame(s) → {raws_dest}")
+    else:
+        jlog.info("  No source_files list — skipping raw frame move")
+
+    # 2. Move result files to archive
+    moved_results = 0
     for fname in ("res.fit", "res_preview.png"):
         src = work_dir / fname
         if src.exists():
-            dst = nas_dest / fname
-            shutil.move(str(src), dst)
-            moved += 1
+            dst = archive_dest / fname
+            shutil.move(str(src), str(dst))
+            moved_results += 1
             jlog.info(f"  Moved {fname} → {dst}")
 
-    if moved == 0:
+    if moved_results == 0:
         jlog.error("  No result files found to move")
         return None
 
-    # Clean up Siril intermediaries (keep raw .fits and subdirs)
-    cleanup_patterns = (
-        "i_*.fit", "i_*.fits", "i_conversion.txt",
-        "pp_i_*.fit", "pp_i_*.fits",
-        "r_pp_i_*.fit", "r_pp_i_*.fits",
-        "*.seq", "*.ssf", "*.lst",
-    )
-    removed = 0
-    for pattern in cleanup_patterns:
-        for f in work_dir.glob(pattern):
-            f.unlink(missing_ok=True)
-            removed += 1
-    jlog.info(f"  Cleaned {removed} intermediary file(s) from work dir")
-    return nas_dest
+    # Also copy results to NAS_OUTPUT for backward compatibility with web server
+    try:
+        legacy_dest = NAS_OUTPUT / date_str / target / filt
+        legacy_dest.mkdir(parents=True, exist_ok=True)
+        for fname in ("res.fit", "res_preview.png"):
+            src = archive_dest / fname
+            if src.exists():
+                shutil.copy2(str(src), str(legacy_dest / fname))
+    except Exception as exc:
+        jlog.info(f"  Legacy output copy failed (non-fatal): {exc}")
+
+    # 3. Clean up the entire USB processing work dir
+    try:
+        shutil.rmtree(work_dir)
+        jlog.info(f"  Cleaned work dir: {work_dir}")
+    except Exception as exc:
+        jlog.error(f"  Cannot remove work dir {work_dir}: {exc}")
+        # Fallback: at least remove intermediaries
+        cleanup_patterns = (
+            "i_*.fit", "i_*.fits", "i_conversion.txt",
+            "pp_i_*.fit", "pp_i_*.fits",
+            "r_pp_i_*.fit", "r_pp_i_*.fits",
+            "*.seq", "*.ssf", "*.lst",
+        )
+        removed = 0
+        for pattern in cleanup_patterns:
+            for f in work_dir.glob(pattern):
+                f.unlink(missing_ok=True)
+                removed += 1
+        jlog.info(f"  Fallback: cleaned {removed} intermediary file(s)")
+
+    return archive_dest
 
 
 # ── Siril calibration + stacking ──────────────────────────────────────────────
@@ -1757,7 +1795,7 @@ def _run_pipeline(job_id: int, fits_dir: str, target: str, jlog: JobLogger,
 
         # ── Step 9: Move results to NAS, clean intermediaries ─────────────────
         jlog.info("Step 9: Archiving results to NAS...")
-        finalise_work_dir(work_dir, date_str, obj, filt, jlog)
+        finalise_work_dir(work_dir, date_str, obj, filt, jlog, source_files=files)
 
         success_count += 1
 
