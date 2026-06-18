@@ -1217,6 +1217,8 @@ async function loadWatchdogConfig() {
     document.getElementById("watchdog-retention").value     = cfg.retentionMin ?? 10;
     const mph = document.getElementById("watchdog-morning-park");
     if (mph) mph.value = cfg.morningParkHour ?? 8;
+    const iroof = document.getElementById("watchdog-ignore-roof");
+    if (iroof) iroof.checked = !!cfg.ignoreRoof;
     updateWatchdogStatusPanel(cfg);
   } catch {}
 }
@@ -1298,6 +1300,7 @@ document.getElementById("watchdog-save")?.addEventListener("click", async () => 
     sqLimit:      Number(document.getElementById("watchdog-sq").value),
     retentionMin: Number(document.getElementById("watchdog-retention").value),
     morningParkHour: Number(document.getElementById("watchdog-morning-park")?.value ?? 8),
+    ignoreRoof:   document.getElementById("watchdog-ignore-roof")?.checked ?? false,
   };
   try {
     const res = await fetch("/api/watchdog", {
@@ -3675,49 +3678,86 @@ function renderPipelineJobs(jobs) {
 }
 
 // ── Frame in-place magnifier ───────────────────────────────────────────────
-// Zooms into the image under the cursor, clipped to the thumbnail rectangle.
-// Scale factor brings it to 1 image-pixel = 1 screen pixel (naturalWidth/displayWidth).
+// Classic loupe: thumbnail stays still, a square magnifier window appears
+// next to the cursor showing a zoomed crop of the image.
 
 (function setupFrameZoom() {
-  let activeImg = null;
+  const ZOOM = 5;
 
-  function applyZoom(img, e) {
-    const rect = img.getBoundingClientRect();
-    // Cursor position relative to the displayed image
-    const cx = Math.max(0, Math.min(e.clientX - rect.left,  rect.width));
-    const cy = Math.max(0, Math.min(e.clientY - rect.top,   rect.height));
-    // Scale so that 1 image pixel = 1 screen pixel
-    const scale = (img.naturalWidth || 800) / rect.width;
-    img.style.transformOrigin = `${cx}px ${cy}px`;
-    img.style.transform = `scale(${scale})`;
-  }
+  document.addEventListener("mouseenter", (e) => {
+    const img = e.target;
+    if (!img.classList || !img.classList.contains("frame-zoom-img")) return;
+    const wrap = img.closest(".frame-thumb-wrap") || img.parentElement;
+    wrap.style.position = "relative";
 
-  function resetZoom(img) {
-    img.style.transform = "";
-    img.style.transformOrigin = "center center";
-  }
+    const loupe = document.createElement("div");
+    loupe.className = "_frame-loupe";
+    Object.assign(loupe.style, {
+      position: "fixed",
+      width: "240px",
+      height: "240px",
+      border: "2px solid #4fc3f7",
+      borderRadius: "4px",
+      background: `url("${img.src}") no-repeat`,
+      backgroundSize: `${img.clientWidth * ZOOM}px ${img.clientHeight * ZOOM}px`,
+      pointerEvents: "none",
+      zIndex: "9999",
+      boxShadow: "0 4px 20px rgba(0,0,0,0.6)",
+      display: "none",
+    });
+    document.body.appendChild(loupe);
+    img._loupe = loupe;
+
+    img.style.cursor = "crosshair";
+  }, true);
 
   document.addEventListener("mousemove", (e) => {
-    const img = e.target.closest(".frame-zoom-img");
-    if (!img) {
-      if (activeImg) { resetZoom(activeImg); activeImg = null; }
+    const img = e.target.closest ? e.target.closest(".frame-zoom-img") : null;
+    if (!img || !img._loupe) return;
+    const loupe = img._loupe;
+    const rect = img.getBoundingClientRect();
+
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    if (cx < 0 || cy < 0 || cx > rect.width || cy > rect.height) {
+      loupe.style.display = "none";
       return;
     }
-    activeImg = img;
-    applyZoom(img, e);
+
+    const bgX = -(cx * ZOOM - 120);
+    const bgY = -(cy * ZOOM - 120);
+    loupe.style.backgroundPosition = `${bgX}px ${bgY}px`;
+    loupe.style.backgroundSize = `${rect.width * ZOOM}px ${rect.height * ZOOM}px`;
+    loupe.style.display = "block";
+
+    // Position loupe to the right of cursor, or left if near edge
+    let lx = e.clientX + 20;
+    let ly = e.clientY - 120;
+    if (lx + 250 > window.innerWidth) lx = e.clientX - 260;
+    if (ly < 10) ly = 10;
+    if (ly + 240 > window.innerHeight) ly = window.innerHeight - 250;
+    loupe.style.left = lx + "px";
+    loupe.style.top = ly + "px";
   });
 
   document.addEventListener("mouseleave", (e) => {
-    if (activeImg) { resetZoom(activeImg); activeImg = null; }
+    const img = e.target;
+    if (!img._loupe) return;
+    img._loupe.remove();
+    img._loupe = null;
   }, true);
 
-  // Reset when cursor leaves the wrapper div
   document.addEventListener("mouseout", (e) => {
-    const wrap = e.target.closest(".frame-thumb-wrap");
-    if (!wrap) return;
-    if (e.relatedTarget && wrap.contains(e.relatedTarget)) return;
-    const img = wrap.querySelector(".frame-zoom-img");
-    if (img) { resetZoom(img); activeImg = null; }
+    const img = e.target;
+    if (img._loupe) {
+      const rect = img.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      if (cx < 0 || cy < 0 || cx > rect.width || cy > rect.height) {
+        img._loupe.remove();
+        img._loupe = null;
+      }
+    }
   });
 })();
 
@@ -3874,17 +3914,34 @@ document.getElementById("pipeline-trigger-form").addEventListener("submit", asyn
       if (img._zoomAttached) continue;
       img._zoomAttached = true;
       img.addEventListener("mousemove", (e) => {
+        if (!img._loupe) {
+          const loupe = document.createElement("div");
+          Object.assign(loupe.style, {
+            position: "fixed", width: "240px", height: "240px",
+            border: "2px solid #4fc3f7", borderRadius: "4px",
+            background: `url("${img.src}") no-repeat`,
+            pointerEvents: "none", zIndex: "9999",
+            boxShadow: "0 4px 20px rgba(0,0,0,0.6)",
+          });
+          document.body.appendChild(loupe);
+          img._loupe = loupe;
+        }
         const rect = img.getBoundingClientRect();
-        const cx = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
-        const cy = Math.max(0, Math.min(e.clientY - rect.top,  rect.height));
-        const scale = Math.max(2, (img.naturalWidth || 600) / rect.width);
-        img.style.transformOrigin = `${cx}px ${cy}px`;
-        img.style.transform = `scale(${scale})`;
-        img.style.zIndex = "10";
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const Z = 5;
+        img._loupe.style.backgroundSize = `${rect.width * Z}px ${rect.height * Z}px`;
+        img._loupe.style.backgroundPosition = `${-(cx * Z - 120)}px ${-(cy * Z - 120)}px`;
+        img._loupe.style.display = "block";
+        let lx = e.clientX + 20;
+        let ly = e.clientY - 120;
+        if (lx + 250 > window.innerWidth) lx = e.clientX - 260;
+        if (ly < 10) ly = 10;
+        img._loupe.style.left = lx + "px";
+        img._loupe.style.top = ly + "px";
       });
       img.addEventListener("mouseleave", () => {
-        img.style.transform = "";
-        img.style.zIndex = "";
+        if (img._loupe) { img._loupe.remove(); img._loupe = null; }
       });
     }
   }

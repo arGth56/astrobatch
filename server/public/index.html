@@ -1063,6 +1063,10 @@
             <label title="Local hour after which a still-bad sequence is ended and mount stays parked until evening">Morning park (h)
               <input id="watchdog-morning-park" type="number" min="0" max="12" step="1" value="8" style="width:72px;" autocomplete="off" />
             </label>
+            <label class="seq-toggle-label" style="align-self:center;" title="Skip roof status check during recovery (use when roof is in maintenance or not automated)">
+              <input id="watchdog-ignore-roof" type="checkbox" />
+              Ignore roof
+            </label>
             <div class="buttons">
               <button id="watchdog-save" type="button">Save Watchdog</button>
             </div>

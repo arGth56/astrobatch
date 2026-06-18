@@ -159,11 +159,14 @@ app.use(express.static(path.join(__dirname, "public")));
 // ── Processed data browser ────────────────────────────────────────────────────
 const DATA_DIR  = path.join(__dirname, "..", "data");
 const NAS_OUTPUT = process.env.NAS_OUTPUT || "/mnt/nas/input/pyl/astro/output";
+const NAS_ARCHIVE = process.env.NAS_ARCHIVE || "/mnt/nas/input/pyl/astro";
 
 // Serve files for download: GET /data/2026-03-19/SN%202026fvx/G/120s/res.fit
 app.use("/data",       express.static(DATA_DIR,   { dotfiles: "deny" }));
 // Serve NAS output stacks: GET /nas-output/2026-03-31/sn_2026fvx/G/res_preview.png
 app.use("/nas-output", express.static(NAS_OUTPUT, { dotfiles: "deny" }));
+// Serve NAS archive (new layout): GET /nas-archive/2026-06-16/sn_2026mvy/G/res_preview.png
+app.use("/nas-archive", express.static(NAS_ARCHIVE, { dotfiles: "deny" }));
 
 // List all result files: GET /api/data/results
 app.get("/api/data/results", (req, res) => {
@@ -1104,6 +1107,7 @@ const watchdog = {
   skyTempLimit: -4,    // °C  — park if IR sky > this
   sqLimit:      16,    // mag/arcsec² — park if SQ < this (0 = disabled)
   retentionMin: 10,    // minutes of clear sky before resuming
+  ignoreRoof:   false, // skip roof check during recovery (roof in maintenance)
 
   // runtime state
   state:        "off",   // "off" | "clear" | "bad" | "recovering"
@@ -1126,6 +1130,7 @@ const watchdog = {
       if (cfg.skyTempLimit !== undefined) watchdog.skyTempLimit = Number(cfg.skyTempLimit);
       if (cfg.sqLimit      !== undefined) watchdog.sqLimit      = Number(cfg.sqLimit);
       if (cfg.retentionMin !== undefined) watchdog.retentionMin = Number(cfg.retentionMin);
+      if (cfg.ignoreRoof   !== undefined) watchdog.ignoreRoof   = !!cfg.ignoreRoof;
       if (cfg.morningParkHour !== undefined) setSetting("morning_park_hour", String(Number(cfg.morningParkHour)));
     }
   } catch (_) {}
@@ -1186,16 +1191,25 @@ async function runWatchdogCheck() {
 
       // ── Park mount (always, not just when sequence is running) ─────────────
       if (!watchdog.parked) {
-        console.log("[watchdog] Parking mount due to bad conditions...");
-        try {
-          const cfg = seqState.ninaConfig ?? { host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL };
-          await fetch(`http://${cfg.host}:${cfg.port}/v2/api/equipment/mount/park`, {
-            method: "GET", signal: AbortSignal.timeout(15000),
-          }).catch(() => {});
-          watchdog.parked = true;
-          console.log("[watchdog] Mount parked.");
-        } catch (e) {
-          console.error("[watchdog] Park failed:", e.message);
+        if (seqState.homingInProgress) {
+          console.log("[watchdog] Homing in progress — deferring park until FindHome completes");
+        } else {
+          console.log("[watchdog] Parking mount due to bad conditions...");
+          try {
+            const cfg = seqState.ninaConfig ?? { host: DEFAULT_NINA_HOST, port: DEFAULT_NINA_PORT, protocol: DEFAULT_NINA_PROTOCOL };
+            await fetch(`http://${cfg.host}:${cfg.port}/v2/api/equipment/mount/park`, {
+              method: "GET", signal: AbortSignal.timeout(15000),
+            }).catch(() => {});
+            watchdog.parked = true;
+            console.log("[watchdog] Mount parked.");
+            // Validate position after park
+            const safety = await validateMountSafety(cfg, "watchdog-park");
+            if (!safety.safe) {
+              console.error(`[watchdog] 🚨 UNSAFE PARK POSITION: ${safety.reason}`);
+            }
+          } catch (e) {
+            console.error("[watchdog] Park failed:", e.message);
+          }
         }
       }
 
@@ -1255,26 +1269,30 @@ async function runWatchdogCheck() {
         // Retention passed — unpark if we parked it
         watchdog.state = "clear";
         if (watchdog.parked) {
-          console.log("[watchdog] Retention passed — checking roof before unparking...");
-          try {
-            const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
-            if (!ok || !fields) {
-              console.warn("[watchdog] OCS unreachable — staying parked until OCS confirms roof open");
+          if (watchdog.ignoreRoof) {
+            console.log("[watchdog] Retention passed — roof check SKIPPED (ignoreRoof=true), unparking...");
+          } else {
+            console.log("[watchdog] Retention passed — checking roof before unparking...");
+            try {
+              const { ok, fields } = await ocsStatus(DEFAULT_OCS_HOST);
+              if (!ok || !fields) {
+                console.warn("[watchdog] OCS unreachable — staying parked until OCS confirms roof open");
+                watchdog.state = "bad";
+                return;
+              }
+              const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+              if (roofStatus && !roofStatus.includes("open")) {
+                console.warn(`[watchdog] Roof is closed (${ocsClean(fields.roof_sta)}) — skipping unpark, staying parked`);
+                watchdog.state = "bad";
+                return;
+              }
+            } catch {
+              console.warn("[watchdog] OCS error during roof check — staying parked");
               watchdog.state = "bad";
               return;
             }
-            const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
-            if (roofStatus && !roofStatus.includes("open")) {
-              console.warn(`[watchdog] Roof is closed (${ocsClean(fields.roof_sta)}) — skipping unpark, staying parked`);
-              watchdog.state = "bad";
-              return;
-            }
-          } catch {
-            console.warn("[watchdog] OCS error during roof check — staying parked");
-            watchdog.state = "bad";
-            return;
           }
-          console.log("[watchdog] Roof open — unparking mount...");
+          console.log("[watchdog] Unparking mount...");
           try {
             const cfg = seqState.ninaConfig;
             if (cfg) {
@@ -1412,6 +1430,7 @@ app.get("/api/watchdog", (req, res) => {
     skyTempLimit:   watchdog.skyTempLimit,
     sqLimit:        watchdog.sqLimit,
     retentionMin:   watchdog.retentionMin,
+    ignoreRoof:     watchdog.ignoreRoof,
     morningParkHour: parseInt(getSetting("morning_park_hour") ?? "8", 10),
     state:        watchdog.state,
     lastCheck:    watchdog.lastCheck,
@@ -1441,6 +1460,7 @@ app.post("/api/watchdog", (req, res) => {
   watchdog.skyTempLimit = Number(b.skyTempLimit) ?? -4;
   watchdog.sqLimit      = Number(b.sqLimit)      ?? 16;
   watchdog.retentionMin = Math.max(1, Number(b.retentionMin) || 10);
+  if (b.ignoreRoof !== undefined) watchdog.ignoreRoof = !!b.ignoreRoof;
   if (b.morningParkHour !== undefined) setSetting("morning_park_hour", String(Math.max(0, Math.min(12, Number(b.morningParkHour) || 8))));
   // Set state synchronously so the response reflects the new state immediately
   if (!watchdog.enabled) {
@@ -1452,6 +1472,7 @@ app.post("/api/watchdog", (req, res) => {
   setSetting("watchdog_config", JSON.stringify({
     enabled: watchdog.enabled, skyTempLimit: watchdog.skyTempLimit,
     sqLimit: watchdog.sqLimit, retentionMin: watchdog.retentionMin,
+    ignoreRoof: watchdog.ignoreRoof,
   }));
   applyWatchdogInterval();
   res.json({
@@ -1461,6 +1482,7 @@ app.post("/api/watchdog", (req, res) => {
       skyTempLimit:    watchdog.skyTempLimit,
       sqLimit:         watchdog.sqLimit,
       retentionMin:    watchdog.retentionMin,
+      ignoreRoof:      watchdog.ignoreRoof,
       morningParkHour: parseInt(getSetting("morning_park_hour") ?? "8", 10),
       state:           watchdog.state,
       lastCheck:       watchdog.lastCheck,
@@ -1922,6 +1944,8 @@ const seqState = {
   tooInterrupt: null,     // set to { alert } when a ToO fires; checked by checkAbort
   tooRunning: false,      // true while the ToO sub-sequence is executing
   tooResumeState: null,   // saved state of the interrupted target for resume
+  // ── Homing mutex: prevents watchdog from parking while FindHome is running ──
+  homingInProgress: false,
 };
 
 loadQueue();
@@ -2008,8 +2032,43 @@ async function runMorningShutdown(reason = "morning cutoff") {
   try {
     const { equipmentInfo } = await getEquipmentInfo(cfg);
     if (equipmentInfo?.Mount?.AtPark === true) {
-      seqLog("  Mount already parked ✓");
-      results.park = "already parked";
+      // Validate parked position is actually safe
+      const safety = await validateMountSafety(cfg, "morning-shutdown");
+      if (safety.safe) {
+        seqLog("  Mount already parked ✓");
+        results.park = "already parked";
+      } else {
+        seqLog("  ⚠ Mount reports parked but at UNSAFE position — re-homing then parking", "warn");
+        try {
+          // Unpark, home, then park properly
+          await callNinaLong(cfg, "/v2/api/equipment/mount/unpark", {}, 30000);
+          await new Promise(r => setTimeout(r, 3000));
+          seqLog("  Sending FindHome for safe re-park...");
+          seqState.homingInProgress = true;
+          await callNinaLong(cfg, "/v2/api/equipment/mount/home", {}, 15000);
+          const homeDeadline = Date.now() + 5 * 60 * 1000;
+          let homed = false;
+          while (Date.now() < homeDeadline) {
+            await new Promise(r => setTimeout(r, 3000));
+            const { equipmentInfo: ei } = await getEquipmentInfo(cfg);
+            if (ei?.Mount?.AtHome === true && ei?.Mount?.Slewing !== true) { homed = true; break; }
+          }
+          seqState.homingInProgress = false;
+          if (homed) {
+            seqLog("  Mount homed ✓ — now parking safely");
+            await stepParkMount(cfg);
+            results.park = "re-homed and parked";
+          } else {
+            seqLog("  ⚠ FindHome failed during morning shutdown — parking at current position", "warn");
+            await stepParkMount(cfg);
+            results.park = "parked (home failed)";
+          }
+        } catch (reHomeErr) {
+          seqState.homingInProgress = false;
+          seqLog(`  ⚠ Re-home attempt failed: ${reHomeErr.message}`, "error");
+          results.park = `re-home failed: ${reHomeErr.message}`;
+        }
+      }
     } else {
       await stepParkMount(cfg);
       results.park = "parked";
@@ -3100,9 +3159,53 @@ async function stepParkMount(target) {
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 2000));
     const { equipmentInfo } = await getEquipmentInfo(target);
-    if (equipmentInfo?.Mount?.AtPark === true) { seqLog("Mount parked ✓"); return; }
+    if (equipmentInfo?.Mount?.AtPark === true) { seqLog("Mount parked ✓"); break; }
   }
-  seqLog("Park confirmation timed out — verify manually", "warn");
+  // Validate parked position is safe
+  await validateMountSafety(target, "park");
+}
+
+/**
+ * Validate mount is in a physically safe position (not pointing at ground/pier).
+ * For a GEM at lat ~47.75°, safe park means Dec > +70° (near pole, tube up).
+ * If unsafe, logs a CRITICAL warning. Called after any park and during morning shutdown.
+ */
+const MOUNT_SAFE_DEC_MIN = 70; // degrees — mount park should be near celestial pole
+async function validateMountSafety(target, context = "check") {
+  try {
+    const { equipmentInfo } = await getEquipmentInfo(target);
+    const mount = equipmentInfo?.Mount;
+    if (!mount?.Connected) return { safe: true, reason: "mount not connected" };
+
+    const decStr = mount.DeclinationString ?? "";
+    const decMatch = decStr.match(/(-?\d+)[°]\s*(\d+)/);
+    let decDeg = null;
+    if (decMatch) {
+      decDeg = parseInt(decMatch[1], 10) + parseInt(decMatch[2], 10) / 60;
+    } else if (typeof mount.Declination === "number") {
+      decDeg = mount.Declination;
+    }
+
+    if (decDeg === null) {
+      seqLog(`  ⚠ [safety] Cannot read mount Dec for ${context} validation`, "warn");
+      return { safe: false, reason: "cannot read declination" };
+    }
+
+    const raStr = mount.RightAscensionString ?? "?";
+    if (decDeg < MOUNT_SAFE_DEC_MIN) {
+      seqLog(
+        `  🚨 [SAFETY] Mount at UNSAFE position after ${context}: Dec=${decStr} (${decDeg.toFixed(1)}°) RA=${raStr} — ` +
+        `expected Dec > ${MOUNT_SAFE_DEC_MIN}° (near pole). RISK OF PIER COLLISION!`, "error"
+      );
+      return { safe: false, decDeg, reason: `Dec ${decDeg.toFixed(1)}° < ${MOUNT_SAFE_DEC_MIN}°` };
+    }
+
+    seqLog(`  [safety] Mount position OK after ${context}: Dec=${decStr} RA=${raStr}`);
+    return { safe: true, decDeg };
+  } catch (e) {
+    seqLog(`  ⚠ [safety] Validation error during ${context}: ${e.message}`, "warn");
+    return { safe: false, reason: e.message };
+  }
 }
 
 /**
@@ -3873,18 +3976,26 @@ async function runSequence(ninaConfig, seqConfig) {
    * The NINA endpoint is non-blocking — we poll until AtHome=true.
    * If AtHome is already true the driver skips FindHome, so we force
    * an unpark first to clear the flag, then home.
-   * Never throws — always logs and returns.
+   * Returns true if homing succeeded, false otherwise. Never throws.
    */
   async function safeHome() {
     seqState.currentStep = "Homing mount...";
-    await assertRoofOpen("home");
+    seqState.homingInProgress = true;
+    try {
+      await assertRoofOpen("home");
+    } catch (e) {
+      seqLog(`Home aborted: ${e.message}`, "warn");
+      seqState.homingInProgress = false;
+      return false;
+    }
     try {
       const { equipmentInfo: preInfo } = await getEquipmentInfo(ninaConfig);
       const mountPre = preInfo?.Mount;
 
       if (mountPre?.AtHome === true && mountPre?.AtPark !== true) {
         seqLog("Mount already at home ✓");
-        return;
+        seqState.homingInProgress = false;
+        return true;
       }
 
       if (mountPre?.AtPark === true) {
@@ -3905,7 +4016,8 @@ async function runSequence(ninaConfig, seqConfig) {
 
       if (typeof resp === "string" && /already.?hom/i.test(resp)) {
         seqLog("Mount homed ✓ (already at home position)");
-        return;
+        seqState.homingInProgress = false;
+        return true;
       }
 
       const HOME_TIMEOUT = 5 * 60 * 1000;
@@ -3913,20 +4025,25 @@ async function runSequence(ninaConfig, seqConfig) {
       const deadline = Date.now() + HOME_TIMEOUT;
 
       while (Date.now() < deadline) {
-        try { checkAbort(); } catch { seqLog("  Home interrupted by abort — stopping", "warn"); return; }
+        try { checkAbort(); } catch { seqLog("  Home interrupted by abort — stopping", "warn"); seqState.homingInProgress = false; return false; }
         await new Promise(r => setTimeout(r, POLL_INTERVAL));
         const { equipmentInfo } = await getEquipmentInfo(ninaConfig);
         const m = equipmentInfo?.Mount;
         seqState.currentStep = `Homing: slewing=${m?.Slewing}  atHome=${m?.AtHome}`;
         if (m?.AtHome === true && m?.Slewing !== true) {
           seqLog("Mount homed ✓ (FindHome complete)");
-          return;
+          seqState.homingInProgress = false;
+          return true;
         }
       }
 
       seqLog("Home timed out — mount may not have reached home sensors", "warn");
+      seqState.homingInProgress = false;
+      return false;
     } catch (e) {
       seqLog(`Home failed: ${e.message}`, "warn");
+      seqState.homingInProgress = false;
+      return false;
     }
   }
 
@@ -4387,7 +4504,8 @@ async function runSequence(ninaConfig, seqConfig) {
           remaining.delete(t); // hard failure — remove from pool
           seqLog(`✗ ${t.name} failed: ${err.message}`, "error");
           seqLog(`  Homing mount before next target...`);
-          await safeHome();
+          const interHomeOk = await safeHome();
+          if (!interHomeOk) seqLog("  ⚠ Home failed between targets — will park before next slew if needed", "warn");
           seqLog(`  Continuing to next target`);
         }
       }
@@ -4395,8 +4513,17 @@ async function runSequence(ninaConfig, seqConfig) {
 
     // ── Final: Home, then either stay alert-ready or do full shutdown ────────
     seqLog("All targets complete. Homing mount...");
-    await safeHome();
-    seqLog("Mount at home ✓");
+    const homeOk = await safeHome();
+    if (homeOk) {
+      seqLog("Mount at home ✓");
+    } else {
+      seqLog("⚠ FindHome FAILED — force-parking mount at configured park position for safety", "warn");
+      try {
+        await stepParkMount(ninaConfig);
+      } catch (parkErr) {
+        seqLog(`⚠ CRITICAL: Park also failed (${parkErr.message}) — MOUNT MAY BE UNSAFE`, "error");
+      }
+    }
 
     // Disable tracking regardless of posture
     try {
@@ -4408,13 +4535,14 @@ async function runSequence(ninaConfig, seqConfig) {
     const _beforeCutoff = !(_localHour >= _morningHour && _localHour < 14);
     const _stayAlertReady = seqState.alertReady && _beforeCutoff;
 
-    if (_stayAlertReady) {
+    if (_stayAlertReady && homeOk) {
       seqLog("Queue done — staying in alert-ready posture (home, tracking off, cover open)");
       seqLog("  Automated morning shutdown will warm camera, close cover + park at " +
              `${_morningHour}:00 local (or on bad weather).`, "warn");
       // Alert-Ready flag stays armed; morning shutdown handles final warm/close/park
     } else {
-      if (!_beforeCutoff) seqLog(`Past morning cutoff (${_morningHour}:00) — running full shutdown`);
+      if (!homeOk) seqLog("Home failed — running full shutdown to park mount safely");
+      else if (!_beforeCutoff) seqLog(`Past morning cutoff (${_morningHour}:00) — running full shutdown`);
       await stepWarmCamera(ninaConfig);
       try {
         const confirmed = await stepCloseCover(ninaConfig, { strict: false });
@@ -4445,6 +4573,7 @@ async function runSequence(ninaConfig, seqConfig) {
     }
   } finally {
     seqState.running = false;
+    seqState.homingInProgress = false;
     seqState.ninaConfig = null;
     seqState.currentTarget = null;
     seqState.currentStep = null;
@@ -6184,7 +6313,7 @@ app.get("/api/pipeline/jobs", (req, res) => {
     for (const r of j.results) {
       const slug   = (r.target || "").toLowerCase().replace(/\s+/g, "_");
       const enc    = s => encodeURIComponent(s);
-      // Check DATA_DIR first (with exposure subdir), then NAS_OUTPUT (flat)
+      // Check DATA_DIR first (with exposure subdir), then NAS_OUTPUT (flat), then NAS_ARCHIVE
       const candidates = [
         {
           stackPath:   path.join(DATA_DIR, r.obs_date||"", slug, r.filter||"", `${r.exposure||""}s`, "res.fit"),
@@ -6197,6 +6326,12 @@ app.get("/api/pipeline/jobs", (req, res) => {
           previewPath: path.join(NAS_OUTPUT, r.obs_date||"", slug, r.filter||"", "res_preview.png"),
           stackUrl:    `/nas-output/${[r.obs_date, slug, r.filter, "res.fit"].map(enc).join("/")}`,
           previewUrl:  `/nas-output/${[r.obs_date, slug, r.filter, "res_preview.png"].map(enc).join("/")}`,
+        },
+        {
+          stackPath:   path.join(NAS_ARCHIVE, r.obs_date||"", slug, r.filter||"", "res.fit"),
+          previewPath: path.join(NAS_ARCHIVE, r.obs_date||"", slug, r.filter||"", "res_preview.png"),
+          stackUrl:    `/nas-archive/${[r.obs_date, slug, r.filter, "res.fit"].map(enc).join("/")}`,
+          previewUrl:  `/nas-archive/${[r.obs_date, slug, r.filter, "res_preview.png"].map(enc).join("/")}`,
         },
       ];
       for (const c of candidates) {
@@ -6236,10 +6371,12 @@ app.get("/api/pipeline/result/:id/download", (req, res) => {
   const target = (row.target || "unknown").toLowerCase().replace(/\s+/g, "_");
   const filter = (row.filter || "unknown").toUpperCase();
 
-  const fitsPath = path.join(NAS_OUTPUT, dateStr, target, filter, "res.fit");
+  const fitsPathOutput = path.join(NAS_OUTPUT, dateStr, target, filter, "res.fit");
+  const fitsPathArchive = path.join(NAS_ARCHIVE, dateStr, target, filter, "res.fit");
+  const fitsPath = fs.existsSync(fitsPathOutput) ? fitsPathOutput : fitsPathArchive;
 
   if (!fs.existsSync(fitsPath)) {
-    return res.status(404).json({ error: `FITS file not found: ${fitsPath}` });
+    return res.status(404).json({ error: `FITS file not found in output or archive` });
   }
 
   const filename = `${dateStr}_${target}_${filter}.fits`;
