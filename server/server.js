@@ -2296,7 +2296,7 @@ async function pollEquipment(target, condFn, timeoutMs, intervalMs = 5000) {
 
 // ── Sequence step helpers ─────────────────────────────────────────────────────
 
-async function stepCoolCamera(target, targetTempC = -5) {
+async function stepCoolCamera(target, targetTempC = -5, maxWaitMin = 20) {
   seqState.currentStep = "Checking camera temperature...";
   seqLog("Checking camera temperature...");
   const { equipmentInfo } = await getEquipmentInfo(target);
@@ -2313,7 +2313,7 @@ async function stepCoolCamera(target, targetTempC = -5) {
     return;
   }
 
-  seqLog(`Cooling camera to ${targetTempC}°C (currently ${currentTemp.toFixed(1)}°C)...`);
+  seqLog(`Cooling camera to ${targetTempC}°C (currently ${currentTemp.toFixed(1)}°C, max wait ${maxWaitMin} min)...`);
   await callNinaLong(target, "/v2/api/equipment/camera/cool", {
     temperature: targetTempC,
     minutes: 0,
@@ -2327,7 +2327,7 @@ async function stepCoolCamera(target, targetTempC = -5) {
       seqState.currentStep = `Cooling: ${t.toFixed(1)}°C → ${targetTempC}°C`;
       return t <= targetTempC + 0.5;
     },
-    20 * 60 * 1000,
+    maxWaitMin * 60 * 1000,
     10000,
   );
   seqLog(`Camera cooled to ${targetTempC}°C ✓`);
@@ -2399,9 +2399,11 @@ async function stepWarmCamera(target, { rampMin = 5, timeoutMin = 15 } = {}) {
 /**
  * Verify the OCS roof is open before any mount movement.
  * Throws if roof is confirmed closed OR if OCS is unreachable (fail-safe).
+ * Skips entirely if watchdog.ignoreRoof is set (roof in maintenance).
  * @param {string} context  – short label shown in the error/log (e.g. "unpark", "slew")
  */
 async function assertRoofOpen(context = "mount move") {
+  if (watchdog.ignoreRoof) return; // roof in maintenance — skip check
   let ok, fields;
   try {
     ({ ok, fields } = await ocsStatus(DEFAULT_OCS_HOST));
@@ -3933,6 +3935,7 @@ async function stepCaptureFilter(target, targetName, filterName, count, duration
 async function runSequence(ninaConfig, seqConfig) {
   const {
     duration, gain, count, filters: filterNames, solveEnabled,
+    coolEnabled = true, coolTemp = -5, coolWaitMin = 20,
     minAlt = 20, meridianGap = 10, zenithLimit = 70, minStars = 10, maxCloudRecoveryWaitMin = 12,
     frameCheckEnabled = false, frameCheckThresholdArcmin = 5, solveExp = 5,
   } = seqConfig;
@@ -4060,17 +4063,21 @@ async function runSequence(ninaConfig, seqConfig) {
     // ── Step 0b: Check roof, unpark, go home ─────────────────────────────────
     try {
       // Verify OCS roof is open before moving anything
-      const { ok: ocsOk, fields } = await ocsStatus(DEFAULT_OCS_HOST).catch(() => ({ ok: false, fields: {} }));
-      const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
-      const isClosed   = ocsOk && roofStatus && !roofStatus.includes("open");
-      if (isClosed) {
-        seqLog(`✗ Roof appears closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting sequence for safety`, "error");
-        return;
-      }
-      if (!ocsOk) {
-        seqLog("OCS unreachable — cannot verify roof status, proceeding with caution", "warn");
+      if (watchdog.ignoreRoof) {
+        seqLog("Roof check SKIPPED (ignoreRoof enabled — roof in maintenance)");
       } else {
-        seqLog(`Roof status: ${ocsClean(fields.roof_sta)} ✓`);
+        const { ok: ocsOk, fields } = await ocsStatus(DEFAULT_OCS_HOST).catch(() => ({ ok: false, fields: {} }));
+        const roofStatus = ocsClean(fields?.roof_sta ?? "").toLowerCase();
+        const isClosed   = ocsOk && roofStatus && !roofStatus.includes("open");
+        if (isClosed) {
+          seqLog(`✗ Roof appears closed (OCS: "${ocsClean(fields.roof_sta)}") — aborting sequence for safety`, "error");
+          return;
+        }
+        if (!ocsOk) {
+          seqLog("OCS unreachable — cannot verify roof status, proceeding with caution", "warn");
+        } else {
+          seqLog(`Roof status: ${ocsClean(fields.roof_sta)} ✓`);
+        }
       }
 
       // Unpark + go home
@@ -4094,14 +4101,18 @@ async function runSequence(ninaConfig, seqConfig) {
     }
 
     // ── Step 1: Cool camera ──────────────────────────────────────────────────
-    try {
-      await stepCoolCamera(ninaConfig, -5);
-    } catch (err) {
-      if (err.message === "__ABORTED__") throw err;
-      seqLog(`✗ Camera cooling failed: ${err.message} — aborting sequence`, "error");
-      await stepCloseCover(ninaConfig, { strict: false });
-      await safeHome();
-      return;                      // stop sequence, mount is safe
+    if (coolEnabled) {
+      try {
+        await stepCoolCamera(ninaConfig, coolTemp, coolWaitMin);
+      } catch (err) {
+        if (err.message === "__ABORTED__") throw err;
+        seqLog(`✗ Camera cooling failed: ${err.message} — aborting sequence`, "error");
+        await stepCloseCover(ninaConfig, { strict: false });
+        await safeHome();
+        return;                      // stop sequence, mount is safe
+      }
+    } else {
+      seqLog("Camera cooling SKIPPED (disabled in settings)");
     }
 
     // ── Step 1b: Filter checklist — verify all requested filters exist ──────────
@@ -4598,7 +4609,7 @@ async function runAlertPrep(ninaConfig, seqConfig) {
   seqState.alertPrepRunning = true;
   seqState.alertPrepStep = "Starting...";
   seqState.ninaConfig = ninaConfig;
-  const { filters: filterNames = [], gain } = seqConfig;
+  const { filters: filterNames = [], gain, coolTemp } = seqConfig;
 
   seqLog("═══ ALERT PREP: Ready Obs for Alert ═══");
 
@@ -4688,7 +4699,7 @@ async function runAlertPrep(ninaConfig, seqConfig) {
     // ── 5. Cool camera ─────────────────────────────────────────────────────
     prepStep("Cooling camera...");
     try {
-      await stepCoolCamera(ninaConfig, -5);
+      await stepCoolCamera(ninaConfig, coolTemp ?? -5);
     } catch (e) {
       seqLog(`    Camera cooling failed: ${e.message} — continuing`, "warn");
     }
@@ -5275,6 +5286,9 @@ app.post("/api/sequence/run", async (req, res) => {
     gain:           Number(req.body?.gain)           || 10,
     count:          Number(req.body?.count)          || 10,
     filters:        Array.isArray(req.body?.filters) ? req.body.filters : ["G", "BP", "RP"],  // real filterwheel names
+    coolEnabled:               req.body?.coolEnabled !== false,
+    coolTemp:                  Number(req.body?.coolTemp ?? -5),
+    coolWaitMin:               Number(req.body?.coolWaitMin) || 20,
     solveEnabled:              req.body?.solveEnabled !== false,
     solveExp:                  Number(req.body?.solveExp)                  || 5,
     solveThreshold:            Number(req.body?.solveThreshold)            || 60,
