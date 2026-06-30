@@ -2032,43 +2032,13 @@ async function runMorningShutdown(reason = "morning cutoff") {
   try {
     const { equipmentInfo } = await getEquipmentInfo(cfg);
     if (equipmentInfo?.Mount?.AtPark === true) {
-      // Validate parked position is actually safe
-      const safety = await validateMountSafety(cfg, "morning-shutdown");
-      if (safety.safe) {
-        seqLog("  Mount already parked ✓");
-        results.park = "already parked";
-      } else {
-        seqLog("  ⚠ Mount reports parked but at UNSAFE position — re-homing then parking", "warn");
-        try {
-          // Unpark, home, then park properly
-          await callNinaLong(cfg, "/v2/api/equipment/mount/unpark", {}, 30000);
-          await new Promise(r => setTimeout(r, 3000));
-          seqLog("  Sending FindHome for safe re-park...");
-          seqState.homingInProgress = true;
-          await callNinaLong(cfg, "/v2/api/equipment/mount/home", {}, 15000);
-          const homeDeadline = Date.now() + 5 * 60 * 1000;
-          let homed = false;
-          while (Date.now() < homeDeadline) {
-            await new Promise(r => setTimeout(r, 3000));
-            const { equipmentInfo: ei } = await getEquipmentInfo(cfg);
-            if (ei?.Mount?.AtHome === true && ei?.Mount?.Slewing !== true) { homed = true; break; }
-          }
-          seqState.homingInProgress = false;
-          if (homed) {
-            seqLog("  Mount homed ✓ — now parking safely");
-            await stepParkMount(cfg);
-            results.park = "re-homed and parked";
-          } else {
-            seqLog("  ⚠ FindHome failed during morning shutdown — parking at current position", "warn");
-            await stepParkMount(cfg);
-            results.park = "parked (home failed)";
-          }
-        } catch (reHomeErr) {
-          seqState.homingInProgress = false;
-          seqLog(`  ⚠ Re-home attempt failed: ${reHomeErr.message}`, "error");
-          results.park = `re-home failed: ${reHomeErr.message}`;
-        }
-      }
+      // Mount is already parked — DO NOT move it during morning shutdown.
+      // The roof may be closed (or closing), so any unpark/home/park command
+      // risks a collision. Just log the position and leave it alone.
+      const decStr = equipmentInfo?.Mount?.DeclinationString ?? "?";
+      const raStr  = equipmentInfo?.Mount?.RightAscensionString ?? "?";
+      seqLog(`  Mount already parked at Dec=${decStr} RA=${raStr} — leaving it alone (roof may be closed)`);
+      results.park = "already parked (untouched)";
     } else {
       await stepParkMount(cfg);
       results.park = "parked";
